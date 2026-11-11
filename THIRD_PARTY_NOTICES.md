@@ -4,7 +4,7 @@ This project is licensed under GPL-3.0-or-later. It uses or includes the followi
 
 | Component | Use | License |
 |---|---|---|
-| [Eden](https://git.eden-emu.dev/eden-emu/eden) (yuzu fork) | Shader recompiler (`src/shader_recompiler`, `src/common`), fetched by `tools/setup.sh` and patched with `tools/patches/` | GPL-3.0-or-later |
+| [Eden](https://git.eden-emu.dev/eden-emu/eden) | Shader recompiler (`src/shader_recompiler`, `src/common`), fetched by `tools/setup.sh` and patched with `tools/patches/` | GPL-3.0-or-later |
 | [lsfg-vk](https://github.com/PancakeTAS/lsfg-vk) (via Eden) | Frame-generation integration in `runtime/src/nnsdk/nvn/lsfg/` (loads the user's own `Lossless.dll`; no Lossless Scaling code or shaders are included) | GPL-3.0-or-later |
 | [AMD FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) | Upscaling shaders (`runtime/src/nnsdk/nvn/shaders/`, compiled into `spirv.h`) | MIT, Copyright (c) 2021 Advanced Micro Devices, Inc. |
 | [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools) | SPIR-V optimizer, built from the copy shipped in the Android NDK | Apache-2.0 (see `runtime/recompiler/LICENSE.SPIRV-Tools`) |

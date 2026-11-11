@@ -1,0 +1,17 @@
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv.cpp b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+index a903480..617157a 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+@@ -434,8 +434,10 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
+             ctx.AddCapability(spv::Capability::ShaderViewportIndexLayerEXT);
+         }
+     }
+-    if (!profile.support_vertex_instance_id &&
+-        (info.loads[IR::Attribute::InstanceId] || info.loads[IR::Attribute::VertexId])) {
++    if ((!profile.support_vertex_instance_id &&
++         (info.loads[IR::Attribute::InstanceId] || info.loads[IR::Attribute::VertexId])) ||
++        info.loads[IR::Attribute::BaseInstance] || info.loads[IR::Attribute::BaseVertex] ||
++        info.loads[IR::Attribute::DrawID]) {
+         ctx.AddExtension("SPV_KHR_shader_draw_parameters");
+         ctx.AddCapability(spv::Capability::DrawParameters);
+     }

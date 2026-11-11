@@ -1,0 +1,15 @@
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index b562e82..265cded 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -1620,6 +1620,10 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
+     if (runtime_info.convert_depth_mode || info.stores.AnyComponent(IR::Attribute::PositionX) ||
+         stage == Stage::VertexB) {
+         output_position = DefineOutput(*this, F32[4], invocations, spv::BuiltIn::Position);
++        // Mismo cálculo de la posición en todos los shaders: los juegos de Switch hacen un pre-pase de
++        // profundidad y luego dibujan con depth EQUAL desde otro programa; sin esto el compilador del host
++        // puede contraer distinto (FMA) y el EQUAL falla en triángulos enteros.
++        Decorate(output_position, spv::Decoration::Invariant);
+     }
+     if (info.stores[IR::Attribute::PointSize] || runtime_info.fixed_state_point_size) {
+         if (stage == Stage::Fragment) {

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SetupActivity (Java, android/java) finds the user's game files and opens the NativeActivity: libnier.so, which loads
+     the game. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.github.iamwilmar.xenobladeport"
+    android:versionCode="1"
+    android:versionName="0.9.0">
+
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="33" />
+    <!-- Reads the game files wherever the user put them: SetupActivity asks for it (or adb appops, tools/apk.sh). -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <application
+        android:label="Xenoblade DE port"
+        android:icon="@mipmap/ic_launcher"
+        android:extractNativeLibs="true">
+        <activity
+            android:name=".SetupActivity"
+            android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <!-- Exported so tools/apk.sh can open it directly with am start. -->
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+            <meta-data android:name="android.app.lib_name" android:value="nier" />
+        </activity>
+    </application>
+</manifest>

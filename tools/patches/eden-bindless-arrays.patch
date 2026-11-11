@@ -1,0 +1,120 @@
+diff --git a/src/shader_recompiler/environment.h b/src/shader_recompiler/environment.h
+index 184b56e..3ac9693 100644
+--- a/src/shader_recompiler/environment.h
++++ b/src/shader_recompiler/environment.h
+@@ -66,6 +66,10 @@ struct ConstBufferAddr {
+     IR::U32 dynamic_offset;
+     u32 count;
+     bool has_secondary;
++    // Lo que el shader hace con la palabra leída antes de usarla como handle (bindless de un uniform buffer del juego):
++    // (valor & and_mask) | or_imm. MH Rise: (v & 0x7fff) | 0x10b00000, índice del pool con un sampler fijo.
++    u32 and_mask{~0U};
++    u32 or_imm{};
+ };
+ 
+ class Environment {
+diff --git a/src/shader_recompiler/host_translate_info.h b/src/shader_recompiler/host_translate_info.h
+index 9c1838a..17d93d4 100644
+--- a/src/shader_recompiler/host_translate_info.h
++++ b/src/shader_recompiler/host_translate_info.h
+@@ -42,6 +42,10 @@ struct HostTranslateInfo {
+     bool single_lane_geometry_subgroups{};
+     bool support_attribute_texture_handle{}; ///< True when the host binds texture handles that
+                                              ///< arrive as vertex attributes
++    /// Handles bindless de un cbuf con índice dinámico: el tamaño máximo de un cbuf de Maxwell (64 KB) para contar el
++    /// array (antes 16 bytes por descriptor permitido: un array que empieza en c6[0xc83c] se quedaba en 1 y perdía el
++    /// índice), y la máscara y el OR con inmediato del handle se conservan (ConstBufferAddr::and_mask/or_imm).
++    bool bindless_cbuf_arrays{};
+ 
+     void ApplyDescriptorLimitPolicy() noexcept {
+         if (min_ssbo_alignment == 0) {
+diff --git a/src/shader_recompiler/ir_opt/texture_pass.cpp b/src/shader_recompiler/ir_opt/texture_pass.cpp
+index db569ed..0235784 100644
+--- a/src/shader_recompiler/ir_opt/texture_pass.cpp
++++ b/src/shader_recompiler/ir_opt/texture_pass.cpp
+@@ -100,9 +100,10 @@ u32 DynamicDescriptorSizeShift(const IR::U32& dynamic_offset) {
+     return size_shift >= DESCRIPTOR_SIZE_SHIFT && size_shift < 31 ? size_shift : DESCRIPTOR_SIZE_SHIFT;
+ }
+ 
+-u32 DynamicDescriptorCount(u32 base_offset, u32 size_shift, u32 max_descriptors) {
++u32 DynamicDescriptorCount(u32 base_offset, u32 size_shift, u32 max_descriptors, bool cbuf_64k = false) {
+     auto const descriptor_limit = (std::max)(1U, max_descriptors);
+-    auto const max_cbuf_bytes = 16 * descriptor_limit;
++    // Con bindless_cbuf_arrays: lo que cabe hasta el final de un cbuf de 64 KB (el máximo de Maxwell).
++    auto const max_cbuf_bytes = cbuf_64k ? 0x10000U : 16 * descriptor_limit;
+     if (size_shift >= 31 || base_offset >= max_cbuf_bytes)
+         return 1;
+     auto const stride = 1U << size_shift;
+@@ -411,6 +412,20 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
+     default:
+         return std::nullopt;
+     case IR::Opcode::BitwiseOr32: {
++        // Un operando inmediato: el sampler fijo que el compilador ORea al índice de textura leído del cbuf. Sin esto la
++        // búsqueda seguía por debajo del OR y el inmediato se perdía (y con él el sampler).
++        if (host_info.bindless_cbuf_arrays) {
++            for (size_t k = 0; k < 2; ++k) {
++                if (!inst->Arg(k).IsImmediate() || inst->Arg(1 - k).IsImmediate()) {
++                    continue;
++                }
++                std::optional other{TrackCached(inst->Arg(1 - k), env, host_info, block)};
++                if (other) {
++                    other->or_imm |= inst->Arg(k).U32();
++                }
++                return other;
++            }
++        }
+         std::optional lhs{TrackCached(inst->Arg(0), env, host_info, block)};
+         std::optional rhs{TrackCached(inst->Arg(1), env, host_info, block)};
+         if (!lhs || !rhs) {
+@@ -473,6 +488,9 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
+         std::optional lhs{TrackCached(op1, env, host_info, block)};
+         if (lhs) {
+             lhs->shift_left = static_cast<u32>(std::countr_zero(op2.U32()));
++            if (host_info.bindless_cbuf_arrays) {
++                lhs->and_mask &= op2.U32();
++            }
+         }
+         return lhs;
+         break;
+@@ -528,7 +546,8 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
+         .secondary_offset = 0,
+         .secondary_shift_left = 0,
+         .dynamic_offset = dynamic_offset,
+-        .count = DynamicDescriptorCount(base_offset, size_shift, (std::min)({DESCRIPTOR_MAX_COUNT, sampled_limit, resource_limit})),
++        .count = DynamicDescriptorCount(base_offset, size_shift, (std::min)({DESCRIPTOR_MAX_COUNT, sampled_limit, resource_limit}),
++                                        host_info.bindless_cbuf_arrays),
+         .has_secondary = false,
+     };
+ }
+@@ -657,7 +676,8 @@ public:
+                    desc.secondary_cbuf_index == existing.secondary_cbuf_index &&
+                    desc.secondary_cbuf_offset == existing.secondary_cbuf_offset &&
+                    desc.secondary_shift_left == existing.secondary_shift_left &&
+-                   desc.count == existing.count && desc.size_shift == existing.size_shift;
++                   desc.count == existing.count && desc.size_shift == existing.size_shift &&
++                   desc.handle_and_mask == existing.handle_and_mask && desc.handle_or == existing.handle_or;
+         })};
+         // TODO: Read this from TIC
+         texture_descriptors[index].is_multisample |= desc.is_multisample;
+@@ -922,6 +942,8 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
+                     .secondary_shift_left = cbuf.secondary_shift_left,
+                     .count = count,
+                     .size_shift = size_shift,
++                    .handle_and_mask = cbuf.and_mask,
++                    .handle_or = cbuf.or_imm,
+                 });
+                 flags.is_integer.Assign(is_integer ? 1 : 0);
+             }
+diff --git a/src/shader_recompiler/shader_info.h b/src/shader_recompiler/shader_info.h
+index d60be12..8a32017 100644
+--- a/src/shader_recompiler/shader_info.h
++++ b/src/shader_recompiler/shader_info.h
+@@ -223,6 +223,8 @@ struct TextureDescriptor {
+     u32 secondary_shift_left;
+     u32 count;
+     u32 size_shift;
++    u32 handle_and_mask{~0U};  // ver ConstBufferAddr: handle = (valor & handle_and_mask) | handle_or
++    u32 handle_or{};
+ 
+     auto operator<=>(const TextureDescriptor&) const = default;
+ };

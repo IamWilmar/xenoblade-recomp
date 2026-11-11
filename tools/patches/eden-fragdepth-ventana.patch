@@ -1,0 +1,22 @@
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+index 28f9869..c24812f 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+@@ -512,13 +512,10 @@ void EmitSetSampleMask(EmitContext& ctx, Id value) {
+ }
+ 
+ void EmitSetFragDepth(EmitContext& ctx, Id value) {
+-    if (!ctx.runtime_info.convert_depth_mode || ctx.profile.support_native_ndc) {
+-        ctx.OpStore(ctx.frag_depth, value);
+-        return;
+-    }
+-    const Id unit{ctx.Const(0.5f)};
+-    const Id new_depth{ctx.OpFma(ctx.F32[1], value, unit, unit)};
+-    ctx.OpStore(ctx.frag_depth, new_depth);
++    // gl_FragDepth ya está en coordenadas de ventana [0, 1] con cualquier DepthMode de NVN: solo la z de la posición
++    // (clip) cambia de convención. Convertirla aquí (d·0,5 + 0,5) rompía Xenoblade DE: su máscara de materiales escribe
++    // k/65535 en una D16 y los pases de luz dibujan a esa profundidad con EQUAL (todo quedaba sin luz).
++    ctx.OpStore(ctx.frag_depth, value);
+ }
+ 
+ void EmitGetZFlag(EmitContext&) {

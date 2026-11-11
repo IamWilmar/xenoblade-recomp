@@ -1,0 +1,17 @@
+# Game files, keys and dumps never go in this repository.
+work/
+*.keys
+*.nsp
+*.xci
+*.nca
+*.tik
+*.dll
+# Fetched by tools/setup.sh / built by tools/build_apk.sh.
+third_party/
+build/
+*.apk
+*.jks
+*.keystore
+__pycache__/
+.claude/
+.DS_Store

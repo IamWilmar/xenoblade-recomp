@@ -1,0 +1,31 @@
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv.cpp b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+index a903480..09715d7 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+@@ -190,7 +190,11 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
+             ctx.OpReturn();
+             break;
+         case IR::AbstractSyntaxNode::Type::Unreachable:
+-            ctx.OpUnreachable();
++            if (ctx.profile.has_broken_spirv_unreachable) {
++                ctx.OpReturn();
++            } else {
++                ctx.OpUnreachable();
++            }
+             break;
+         }
+         if (node.type != IR::AbstractSyntaxNode::Type::Block) {
+diff --git a/src/shader_recompiler/profile.h b/src/shader_recompiler/profile.h
+index 8e9c83f..33dc217 100644
+--- a/src/shader_recompiler/profile.h
++++ b/src/shader_recompiler/profile.h
+@@ -104,6 +104,9 @@ struct Profile {
+     /// Some drivers have broken support for OpVectorExtractDynamic on subgroup mask inputs
+     bool has_broken_spirv_subgroup_mask_vector_extract_dynamic{};
+     bool has_broken_spirv_subgroup_shuffle{};
++    /// The driver mis-optimizes around OpUnreachable (the fallthrough of an indirect branch with no matching target):
++    /// emit OpReturn instead
++    bool has_broken_spirv_unreachable{};
+     u32 max_subgroup_size{};
+ 
+     u32 gl_max_compute_smem_size{};

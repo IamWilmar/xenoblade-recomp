@@ -1,0 +1,26 @@
+--- a/src/shader_recompiler/environment.h
++++ b/src/shader_recompiler/environment.h
+@@ -86,6 +86,12 @@
+ 
+     [[nodiscard]] virtual bool IsTexturePixelFormatInteger(u32 raw_handle) = 0;
+ 
++    // Un recompilador sin los valores de los cbuf (handle 0) decide por la dirección del handle.
++    [[nodiscard]] virtual bool IsTextureIntegerAt(u32 cbuf_index, u32 cbuf_offset, u32 raw_handle) {
++        (void)cbuf_index, (void)cbuf_offset;
++        return IsTexturePixelFormatInteger(raw_handle);
++    }
++
+     [[nodiscard]] virtual u32 ReadViewportTransformState() = 0;
+ 
+     [[nodiscard]] virtual u32 TextureBoundBuffer() const = 0;
+--- a/src/shader_recompiler/ir_opt/texture_pass.cpp
++++ b/src/shader_recompiler/ir_opt/texture_pass.cpp
+@@ -363,7 +363,7 @@
+     if (IsAttributeHandle(cbuf)) {
+         return false;
+     }
+-    return env.IsTexturePixelFormatInteger(GetTextureHandleCached(env, cbuf));
++    return env.IsTextureIntegerAt(cbuf.index, cbuf.offset, GetTextureHandleCached(env, cbuf));
+ }
+ 
+ 

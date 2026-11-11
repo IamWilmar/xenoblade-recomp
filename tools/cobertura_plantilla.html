@@ -1,0 +1,165 @@
+<title>Mapa del port de Xenoblade</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..100,500..800&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Una sola columna tipo informe técnico: cabecera con la cifra que importa, dos mapas (SDK y NVN) y debajo lo que el mapa no ve. Tema oscuro deliberado, como el de los mapas de decomp. */
+:root {
+  color-scheme: dark;
+  --bg: #0d1117; --panel: #141b24; --line: #263241; --fg: #dbe4ee; --muted: #8b9aab;
+  --hecho: #3fb768; --android: #3a8fd6; --fijo: #c9b44a; --vacio: #e0913a; --aprox: #e8673a; --falta: #e5484d; --datos: #9a7bd8; --nousado: #2b3542;
+  --display: "Archivo", "Arial Narrow", system-ui, sans-serif;
+  --body: "IBM Plex Sans", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+body { background: var(--bg); color: var(--fg); font-family: var(--body); line-height: 1.5; }
+.wrap { max-width: 1100px; margin: 0 auto; padding-block: 28px 56px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); display: grid; gap: 28px; }
+h1, h2 { font-family: var(--display); font-stretch: 80%; letter-spacing: .01em; text-wrap: balance; margin: 0; }
+h1 { font-size: clamp(1.6rem, 4vw, 2.4rem); font-weight: 800; }
+h2 { font-size: 1.25rem; font-weight: 700; }
+p { margin: 0; max-width: 68ch; color: var(--fg); }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); font-size: .85em; }
+header { display: grid; gap: 10px; }
+.cifras { display: flex; flex-wrap: wrap; gap: 12px 28px; margin-top: 6px; }
+.cifra { display: grid; gap: 2px; min-width: 0; }
+.cifra b { font-family: var(--display); font-size: 1.6rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+.cifra span { color: var(--muted); font-size: .85rem; }
+section { display: grid; gap: 12px; min-width: 0; }
+.mapa { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px; display: grid; gap: 8px; min-width: 0; }
+.mapa svg { width: 100%; height: auto; display: block; }
+.leyenda { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: .8rem; color: var(--muted); }
+.leyenda i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+.info { font-family: var(--mono); font-size: .8rem; color: var(--fg); min-height: 1.5em; overflow-wrap: anywhere; }
+.nota { font-size: .78rem; color: var(--muted); }
+.lista { display: grid; gap: 6px; }
+.fila { display: grid; grid-template-columns: 12px minmax(0, 1fr) auto; gap: 10px; align-items: baseline; padding: 6px 0; border-bottom: 1px solid var(--line); }
+.fila i { width: 10px; height: 10px; border-radius: 2px; align-self: center; }
+.fila .mono { overflow-wrap: anywhere; }
+.fila .n { font-family: var(--mono); font-size: .8rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+.dos { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+.dos > div { display: grid; gap: 8px; align-content: start; min-width: 0; }
+ol { margin: 0; padding-left: 1.2em; display: grid; gap: 8px; max-width: 70ch; }
+svg text { font-family: var(--mono); fill: var(--fg); pointer-events: none; }
+svg rect.c { stroke: var(--bg); stroke-width: .6; cursor: pointer; }
+svg rect.c:hover { stroke: var(--fg); stroke-width: 1.2; }
+svg rect.g { fill: none; stroke: var(--bg); stroke-width: 2.4; pointer-events: none; }
+@media (prefers-reduced-motion: no-preference) { svg rect.c { transition: opacity .15s; } }
+</style>
+
+<div class="wrap">
+<header>
+  <p class="muted mono">Xenoblade Chronicles DE · Switch → Retroid Pocket Flip 2 · build 8 nov 2026</p>
+  <h1>Qué le falta al port, medido</h1>
+  <p>El código del juego no se decompila: los 11,2 MB de ARM64 de <span class="mono">main</span> corren tal cual en la Flip. Lo que hay que portar es todo lo que ese código pide de fuera: las funciones del SDK de Nintendo y la API gráfica NVN. Este mapa cruza cada cosa que el juego importa con lo que hace hoy nuestra implementación.</p>
+  <div class="cifras" id="cifras"></div>
+</header>
+
+<section>
+  <h2>SDK de Nintendo y bibliotecas de C</h2>
+  <p class="muted">Cada celda es una función que el juego importa, agrupada por módulo. El tamaño crece con las veces que el código del juego la llama (escala logarítmica, para que se vean también las que se llaman una vez).</p>
+  <div class="mapa"><svg id="m-sdk" viewBox="0 0 1000 520" role="img" aria-label="Mapa de las funciones del SDK"></svg><div class="info" id="i-sdk">Toca o pasa el ratón por una celda.</div><div class="leyenda" id="l-sdk"></div></div>
+</section>
+
+<section>
+  <h2>NVN, la API gráfica</h2>
+  <p class="muted">Las 521 funciones NVN que el juego pide por nombre al arrancar, agrupadas por objeto. Gris: las pide pero ninguna instrucción del juego las llama.</p>
+  <div class="mapa"><svg id="m-nvn" viewBox="0 0 1000 440" role="img" aria-label="Mapa de las funciones NVN"></svg><div class="info" id="i-nvn">Toca o pasa el ratón por una celda.</div><div class="leyenda" id="l-nvn"></div></div>
+</section>
+
+<section class="dos">
+  <div>
+    <h2>Llamadas que caen en un stub</h2>
+    <p class="muted">Devuelven 0 sin hacer nada. Son funciones de C que hay que pasar a la libc de Android.</p>
+    <div class="lista" id="stubs"></div>
+  </div>
+  <div>
+    <h2>NVN a medias o vacío, y se usa</h2>
+    <p class="muted">Funciones que el juego sí llama y que aquí no hacen nada o solo en parte.</p>
+    <div class="lista" id="medias"></div>
+  </div>
+</section>
+
+<section>
+  <h2>Cómo se sabe qué falta</h2>
+  <ol>
+    <li><b>Estático, antes de ejecutar.</b> La tabla de imports del ejecutable dice qué funciones pide; el desensamblado dice desde cuántos sitios las llama. Para NVN, cada nombre que el juego pasa a <span class="mono">nvnDeviceGetProcAddress</span> se sigue hasta su ranura y se cuentan las lecturas. Así salen este mapa y la lista de stubs.</li>
+    <li><b>En ejecución.</b> El cargador cuenta cada llamada a un stub y el ejecutor avisa de lo que no soporta (por ejemplo, transform feedback). Eso dice qué se usa de verdad en cada escena.</li>
+    <li><b>Por comportamiento.</b> Lo que más cuesta no son funciones que faltan, sino funciones implementadas que hacen algo distinto que en la Switch. Hoy fueron tres: los mips a cero de las texturas (ropa negra, iconos y ventanas invisibles), los draws con el rasterizador descartado (personajes sin skinning) y la caché que no avisaba de escrituras de la CPU (película congelada). Ningún mapa estático los ve: salen de comparar trazas del frame con la referencia.</li>
+  </ol>
+  <p class="nota">Un mapa de decompilación como el de Pokémon HeartGold mide otra cosa: cuánto código del juego se ha reescrito en C idéntico al original. Aquí ese código no se toca; el equivalente es cuánta interfaz está implementada y, sobre todo, cuánta se comporta igual.</p>
+</section>
+</div>
+
+<script>
+const D = __DATOS__;
+const COL = { hecho: 'var(--hecho)', android: 'var(--android)', fijo: 'var(--fijo)', vacio: 'var(--vacio)', aprox: 'var(--aprox)', falta: 'var(--falta)', datos: 'var(--datos)', nousado: 'var(--nousado)' };
+const NOMBRE = { hecho: 'implementada', android: 'libc de Android', fijo: 'devuelve un valor fijo', vacio: 'vacía (solo ret)', aprox: 'a medias', falta: 'stub: devuelve 0', datos: 'dato o weak', nousado: 'pedida, no se llama' };
+const peso = c => 1 + Math.log2(1 + c);
+
+function squarify(nodes, x, y, w, h) {
+  const total = nodes.reduce((a, n) => a + n.v, 0);
+  if (!total || w <= 0 || h <= 0) return [];
+  const k = w * h / total;
+  const items = nodes.map(n => ({ n, a: n.v * k })).sort((p, q) => q.a - p.a);
+  const out = []; let row = [], rx = x, ry = y, rw = w, rh = h;
+  const worst = (r, side) => { const s = r.reduce((a, t) => a + t.a, 0); let mx = 0, mn = Infinity; for (const t of r) { mx = Math.max(mx, t.a); mn = Math.min(mn, t.a); } return Math.max(side * side * mx / (s * s), (s * s) / (side * side * mn)); };
+  const flush = () => {
+    if (!row.length) return;
+    const s = row.reduce((a, t) => a + t.a, 0);
+    if (rw >= rh) { const cw = s / rh; let cy = ry; for (const t of row) { const ch = t.a / cw; out.push({ n: t.n, x: rx, y: cy, w: cw, h: ch }); cy += ch; } rx += cw; rw -= cw; }
+    else { const ch = s / rw; let cx = rx; for (const t of row) { const cw = t.a / ch; out.push({ n: t.n, x: cx, y: ry, w: cw, h: ch }); cx += cw; } ry += ch; rh -= ch; }
+    row = [];
+  };
+  let i = 0;
+  while (i < items.length) { const side = Math.min(rw, rh); if (!row.length || worst(row.concat([items[i]]), side) <= worst(row, side)) { row.push(items[i]); i++; } else flush(); }
+  flush();
+  return out;
+}
+
+const NS = 'http://www.w3.org/2000/svg';
+function el(tag, attrs, parent) { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); parent.appendChild(e); return e; }
+
+function mapa(svgId, infoId, legId, items, estado, W, H) {
+  const svg = document.getElementById(svgId), info = document.getElementById(infoId);
+  const grupos = {};
+  for (const it of items) (grupos[it.g] = grupos[it.g] || []).push(it);
+  const gnodes = Object.entries(grupos).map(([g, xs]) => ({ g, xs, v: xs.reduce((a, x) => a + peso(x.c), 0) }));
+  for (const gr of squarify(gnodes, 0, 0, W, H)) {
+    const head = gr.h > 40 && gr.w > 60 ? 14 : 0;
+    const cells = squarify(gr.n.xs.map(x => ({ x, v: peso(x.c) })), gr.x + 1, gr.y + 1 + head, gr.w - 2, gr.h - 2 - head);
+    for (const c of cells) {
+      const s = estado(c.n.x);
+      const r = el('rect', { class: 'c', x: c.x.toFixed(2), y: c.y.toFixed(2), width: Math.max(c.w, .3).toFixed(2), height: Math.max(c.h, .3).toFixed(2), fill: COL[s] }, svg);
+      const txt = `${c.n.x.n} · ${NOMBRE[s]} · ${c.n.x.c} sitio${c.n.x.c === 1 ? '' : 's'} de llamada${c.n.x.nota ? ' · ' + c.n.x.nota : ''}`;
+      el('title', {}, r).textContent = txt;
+      const show = () => { info.textContent = txt; };
+      r.addEventListener('mouseenter', show); r.addEventListener('click', show);
+    }
+    el('rect', { class: 'g', x: gr.x, y: gr.y, width: gr.w, height: gr.h }, svg);
+    if (head) { const t = el('text', { x: gr.x + 4, y: gr.y + 11, 'font-size': 10 }, svg); t.textContent = gr.n.g + ' (' + gr.n.xs.length + ')'; }
+  }
+  const cuenta = {};
+  for (const it of items) { const s = estado(it); cuenta[s] = (cuenta[s] || 0) + 1; }
+  document.getElementById(legId).innerHTML = Object.keys(NOMBRE).filter(s => cuenta[s]).map(s => `<span><i style="background:${COL[s]}"></i>${NOMBRE[s]}: ${cuenta[s]}</span>`).join('');
+}
+
+const estSdk = x => x.s;
+const estNvn = x => (x.c === 0 && x.s !== 'aprox') ? 'nousado' : x.s;
+mapa('m-sdk', 'i-sdk', 'l-sdk', D.sdk, estSdk, 1000, 520);
+mapa('m-nvn', 'i-nvn', 'l-nvn', D.nvn, estNvn, 1000, 440);
+
+const llam = (xs, f) => xs.filter(f).reduce((a, x) => a + x.c, 0);
+const sdkTot = llam(D.sdk, x => true), sdkOk = llam(D.sdk, x => x.s === 'hecho' || x.s === 'android' || x.s === 'datos');
+const nvnUsadas = D.nvn.filter(x => x.c > 0), nvnTot = llam(nvnUsadas, x => true), nvnOk = llam(nvnUsadas, x => x.s === 'hecho');
+const pct = (a, b) => (100 * a / b).toFixed(1).replace('.', ',') + ' %';
+document.getElementById('cifras').innerHTML = [
+  [pct(sdkOk, sdkTot), 'de las llamadas al SDK y a libc van a algo implementado'],
+  [pct(nvnOk, nvnTot), 'de las llamadas a NVN van a algo implementado del todo'],
+  [D.sdk.filter(x => x.s === 'falta').length + ' stubs', 'funciones importadas que devuelven 0'],
+  [nvnUsadas.length + ' de ' + D.nvn.length, 'funciones NVN que el juego llama de verdad'],
+].map(([b, s]) => `<div class="cifra"><b>${b}</b><span>${s}</span></div>`).join('');
+
+const fila = (x, s) => `<div class="fila"><i style="background:${COL[s]}"></i><span class="mono">${x.n.replace(/</g, '&lt;')}${x.nota ? ' <span class="muted">· ' + x.nota + '</span>' : ''}</span><span class="n">${x.c}×</span></div>`;
+document.getElementById('stubs').innerHTML = D.sdk.filter(x => x.s === 'falta').sort((a, b) => b.c - a.c).map(x => fila(x, 'falta')).join('');
+document.getElementById('medias').innerHTML = D.nvn.filter(x => x.c > 0 && (x.s === 'aprox' || x.s === 'vacio' || x.s === 'fijo')).sort((a, b) => b.c - a.c).map(x => fila(x, x.s)).join('');
+</script>

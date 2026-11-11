@@ -37,8 +37,8 @@ issues asking for game files, keys or how to obtain them.
 
 ## Install and first run
 
-1. Get the APK: build it yourself (below) or download the artifact of the latest successful
-   [build](https://github.com/IamWilmar/xenoblade-recomp/actions/workflows/build.yml) run. Install it on the device.
+1. Download `xenobladeport-vX.Y.Z.apk` from the [latest release](https://github.com/IamWilmar/xenoblade-recomp/releases/latest) (or build
+   it yourself, below) and install it on the device.
 2. Copy your extracted game folders to the device, anywhere you like (for example one folder `Xenoblade` with the ExeFS
    and RomFS folders inside).
 3. Open the app, grant *All files access*, browse to that folder with the touch screen or the d-pad and choose
@@ -108,7 +108,8 @@ directo en la CPU y este proyecto reimplementa el SDK de la consola y la API gr�
 - **Necesitas tu propia copia del juego**, versión 1.1.2, con el ExeFS y la RomFS ya extraídos en tu consola, como
   carpetas normales. La app **no acepta NSP/XCI/NCA ni descifra nada**. Este repositorio no tiene código ni archivos del
   juego, ni claves, ni herramientas para volcar o descifrar.
-- Copia esas carpetas al dispositivo, abre la app, dale el permiso de archivos, elige la carpeta y pulsa *Iniciar juego*.
+- Descarga la APK de [Releases](https://github.com/IamWilmar/xenoblade-recomp/releases/latest) e instálala. Copia esas carpetas al
+  dispositivo, abre la app, dale el permiso de archivos, elige la carpeta y pulsa *Iniciar juego*.
   Las partidas y la caché de shaders se guardan en esa misma carpeta.
 - Probado en la Retroid Pocket Flip 2. Proyecto de fans, sin ánimo de lucro, sin relación con Nintendo ni con
   Nintendo, Monolith Soft.

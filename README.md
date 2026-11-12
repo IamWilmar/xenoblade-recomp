@@ -1,10 +1,10 @@
 <p align="center"><img src="docs/icon.png" width="128" alt=""></p>
 
-# Xenoblade Chronicles: Definitive Edition — native Android port
+# Xenoblade Chronicles: Definitive Edition port for Retroid Pocket 5 & Flip 2
 
-Runs the console version of **Xenoblade Chronicles: Definitive Edition** natively on Android handhelds, from **your own copy** of the game.
-The game's own ARM64 code runs directly on the device's CPU, while this project reimplements the parts of the console
-it talks to.
+**Made for the Adreno 650.** A native Android port of the console version of **Xenoblade Chronicles: Definitive Edition**, built exclusively for the
+**Retroid Pocket 5** and the **Retroid Pocket Flip 2** (Snapdragon 865), from **your own copy** of the game. The game's
+own ARM64 code runs directly on the device's CPU, while this project reimplements the parts of the console it talks to.
 
 > **Unofficial, non-commercial fan project.** Not affiliated with, endorsed or sponsored by the console maker or
 > Monolith Soft. All trademarks belong to their owners. This repository contains **no game code and no game assets**. To use
@@ -18,9 +18,29 @@ GPU limit: occasional dips to ~29). Upscaled to 1080p with AMD FSR 1.
 - Known issues: in some battles a thin green or teal line can flicker across the screen; shadows are as soft as in the
   console's handheld mode (an optional `sombras_2x` file doubles their resolution, at a GPU cost).
 
-**Target device:** Retroid Pocket Flip 2 (Snapdragon 865 / Adreno 650, Android 13), where it was developed and tested.
-The Retroid Pocket 5 has the same chip and should behave the same, but it has not been tested. Other Android devices are
-not supported (the graphics code relies on Adreno 650 behaviour and its stock Vulkan driver).
+## Why only the Retroid Pocket 5 and Flip 2
+
+This port was written for one chip, the **Snapdragon 865 with its Adreno 650 GPU**, and tuned to its limits instead of
+trying to run everywhere:
+
+- **Run the game, not a whole console.** Translating the full console system costs CPU, GPU and memory this chip does not
+  have to spare. Here the game's own ARM64 code runs natively and only what it actually calls (files, threads, input,
+  audio, graphics) is reimplemented, so almost the whole device is left for the game.
+- **Built around the Adreno 650 and its stock Qualcomm Vulkan driver** (Vulkan 1.1). The graphics layer uses exactly the
+  features this driver offers and works around its quirks; for example, GPU shader code that relies on features the
+  Adreno 650 only has in compute shaders is rewritten so it renders correctly.
+- **A 33 ms budget per frame.** The GPU usually runs at ~587 MHz, so the target is a **locked 30 fps**: the game renders
+  at its handheld resolution (around 720p) and AMD FSR 1 upscales it to the 1080p screen. Where a game can get heavier
+  than that budget, the internal resolution drops for a moment instead of the frame rate.
+- **About 2.7 GB of free memory** out of 8 GB while a game runs. GPU caches have fixed limits so a big area never
+  pushes the game out of memory, and translated shaders are stored on the device so each one is only built once.
+- **Eight cores, used deliberately.** The game's threads run on the four big Cortex-A77 cores; background work (shader
+  building, pipeline compiling) goes to the small Cortex-A55 cores so it does not steal time from the game.
+- **Optional frame generation** to show ~60 fps, only when the GPU has room left after the real 30.
+
+Developed and tested on the **Retroid Pocket Flip 2** (Android 13). The **Retroid Pocket 5** has the same chip, memory and
+driver, so it should behave the same. Other Snapdragon 865 / Adreno 650 devices might work but are untested; devices
+with other GPUs (other Adreno generations, Mali, PowerVR…) are not supported.
 
 ## What you need
 
@@ -110,5 +130,8 @@ CPU y este proyecto reimplementa el SDK de la consola y la API gráfica NVN sobr
 - Descarga la APK de [Releases](https://github.com/IamWilmar/xenoblade-recomp/releases/latest) e instálala. Copia esas carpetas al
   dispositivo, abre la app, dale el permiso de archivos, elige la carpeta y pulsa *Iniciar juego*.
   Las partidas y la caché de shaders se guardan en esa misma carpeta.
-- Probado en la Retroid Pocket Flip 2. Proyecto de fans, sin ánimo de lucro, sin relación con el fabricante de la consola ni
+- Hecho exclusivamente para la Retroid Pocket 5 y la Retroid Pocket Flip 2 (Snapdragon 865, Adreno 650): todo está
+  ajustado a ese chip y a sus límites (30 fps fijos con presupuesto de 33 ms por frame, ~2,7 GB de memoria libre, núcleos
+  grandes para el juego). Probado en la Flip 2.
+- Proyecto de fans, sin ánimo de lucro, sin relación con el fabricante de la consola ni
   con Monolith Soft.

@@ -51,9 +51,10 @@ with other GPUs (other Adreno generations, Mali, PowerVR…) are not supported.
 
 - Enough free space for the game plus about 1 GB for the shader cache and saves (internal storage or SD card).
 
-Why folders only? The app is deliberately limited to reading game files that are already extracted as plain folders; it
-cannot open packaged or protected files, and it will tell you if the folder is not usable. This project does not explain
-how to obtain the files and will not help with it. Please do not open issues asking for game files or how to get them.
+**Where do the files come from?** From your own copy of the game: if your console runs custom firmware, its homebrew
+tools can extract the ExeFS and RomFS for you. The app only reads those plain folders (it doesn't open packaged or
+protected files), which keeps it simple, and it will tell you exactly what is missing if a folder isn't usable. Questions
+about the app itself are always welcome in the issues; just please don't share or ask for game files there.
 
 ## Install and first run
 
@@ -126,7 +127,9 @@ Port nativo para Android de la versión de consola de **Xenoblade Chronicles: De
 CPU y este proyecto reimplementa el SDK de la consola y la API gráfica NVN sobre Vulkan.
 
 - **Necesitas tu propia copia del juego**, versión 1.1.2, con el ExeFS y la RomFS ya extraídos en tu consola, como
-  carpetas normales: la app solo lee archivos ya extraídos. Este repositorio no tiene código ni archivos del juego.
+  carpetas normales. Salen de tu propia copia: si tu consola tiene firmware modificado, sus herramientas homebrew los
+  extraen. La app solo lee esas carpetas y te dice qué falta si algo no está. Este repositorio no tiene código ni
+  archivos del juego.
 - Descarga la APK de [Releases](https://github.com/IamWilmar/xenoblade-recomp/releases/latest) e instálala. Copia esas carpetas al
   dispositivo, abre la app, dale el permiso de archivos, elige la carpeta y pulsa *Iniciar juego*.
   Las partidas y la caché de shaders se guardan en esa misma carpeta.

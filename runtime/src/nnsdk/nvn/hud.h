@@ -7,6 +7,9 @@
 // desde el borde derecho (el de la flecha) o deslizando un dedo de derecha a izquierda desde la mitad derecha de la
 // pantalla; un toque en una fila cambia su ajuste, y un toque fuera, deslizar hacia la derecha, el mismo gesto del borde
 // u 8 s sin tocarlo lo esconden. Los toques y el gesto los deja el loader en NnsdkInput (host.h).
+// En las apps con pantalla de inicio (NIER_SETUP en el entorno) hay una segunda fila, "Cambiar carpeta": la app arranca el
+// juego directamente si ya tiene su carpeta, y con ese interruptor (el fichero <datos>/elegir_carpeta) la pantalla de inicio
+// vuelve a salir la próxima vez que se abra.
 
 #include <cstdint>
 

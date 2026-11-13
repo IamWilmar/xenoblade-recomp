@@ -67,6 +67,31 @@ public final class SetupActivity extends Activity {
         File folder = savedFolder();
         DumpScanner.Result saved = folder != null ? DumpScanner.load(folder) : null;
         if (saved != null) {
+            // Con la carpeta ya elegida y sus archivos en su sitio, directo al juego, sin pasar por esta pantalla. Vuelve a
+            // salir si falta algo (más abajo), si se pidió desde el panel de ajustes del juego ("Cambiar carpeta" deja el
+            // fichero elegir_carpeta en la carpeta) o si la app se abre dos veces seguidas en 10 segundos, que es la
+            // salida si el juego no llega a arrancar.
+            File ask = new File(folder, "elegir_carpeta");
+            File stamp = new File(getFilesDir(), "ultimo_arranque.txt");
+            long last = 0;
+            try {
+                last = Long.parseLong(new String(Files.readAllBytes(stamp.toPath())).trim());
+            } catch (IOException | NumberFormatException e) {
+                // sin arranque anterior
+            }
+            long now = System.currentTimeMillis();
+            boolean again = now >= last && now - last < 10000;
+            if (saved.ready() && !ask.exists() && !again) {
+                try {
+                    Files.write(stamp.toPath(), Long.toString(now).getBytes());
+                } catch (IOException e) {
+                    // sin la marca solo se pierde la salida de "dos veces seguidas"
+                }
+                startGame();
+                return;
+            }
+            ask.delete();
+            stamp.delete();
             showResult(folder, saved);
         } else if (folder != null && folder.isDirectory()) {
             scan(folder);  // movió algo desde la última vez
@@ -189,16 +214,18 @@ public final class SetupActivity extends Activity {
             Button start = new Button(this);
             start.setText(tr("Iniciar juego", "Start game"));
             start.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
-            start.setOnClickListener(v -> {
-                startActivity(new Intent(this, NativeActivity.class));
-                finish();
-            });
+            start.setOnClickListener(v -> startGame());
             row.addView(start);
             start.requestFocus();
         } else {
             change.requestFocus();
         }
         row.addView(change);
+    }
+
+    private void startGame() {
+        startActivity(new Intent(this, NativeActivity.class));
+        finish();
     }
 
     private File savedFolder() {

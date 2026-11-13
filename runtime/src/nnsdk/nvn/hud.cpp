@@ -165,6 +165,21 @@ private:
         panel_open_ = open;
         panel_at_ = now;
         touched_at_ = now;
+        if (open && has_setup()) {  // por si el fichero cambió desde fuera
+            const bool marked = access(data_file("elegir_carpeta").c_str(), F_OK) == 0;
+            if (marked != choose_folder_) choose_folder_ = marked, panel_dirty_ = true;
+        }
+    }
+    // <datos>/<name>.
+    static std::string data_file(const char* name) {
+        const char* data = getenv("NIER_DATA");
+        return std::string(data ? data : ".") + "/" + name;
+    }
+    // ¿La app tiene pantalla de inicio (la que pide la carpeta del juego)? El loader pone NIER_SETUP cuando la carpeta sale
+    // de ella. Solo entonces tiene sentido la fila "Cambiar carpeta".
+    static bool has_setup() {
+        static const bool setup = getenv("NIER_SETUP") != nullptr;
+        return setup;
     }
     // Los gestos, una vez por frame presentado.
     // Abrir: el gesto de "atrás" del sistema desde el borde derecho (el de la flecha; Android se queda con ese toque y al
@@ -210,7 +225,8 @@ private:
                     } else {
                         touched_at_ = now;
                         const int row = t.y >= kPanelHeader ? (t.y - kPanelHeader) / kPanelRow : -1;
-                        if (row == 0) set_hidden(!hidden_);  // la fila del contador de FPS (las siguientes, aquí)
+                        if (row == 0) set_hidden(!hidden_);  // el contador de FPS
+                        else if (row == 1 && has_setup()) set_choose_folder(!choose_folder_);  // cambiar de carpeta
                     }
                 }
                 touch_handled_ = t.serial;
@@ -221,14 +237,26 @@ private:
     void set_hidden(bool hidden) {
         hidden_ = hidden;
         panel_dirty_ = true;
-        const char* data = getenv("NIER_DATA");
-        const std::string file = std::string(data ? data : ".") + "/sin_fps";
+        const std::string file = data_file("sin_fps");
         if (!hidden) {
             unlink(file.c_str());
         } else if (const int fd = open(file.c_str(), O_WRONLY | O_CREAT, 0644); fd >= 0) {
             close(fd);
         }
         NVN_LOG("hud: contador de FPS %s desde el panel\n", hidden ? "apagado" : "encendido");
+    }
+    // "Cambiar carpeta": con el fichero <datos>/elegir_carpeta, la pantalla de inicio de la app (que normalmente arranca el
+    // juego directamente) vuelve a salir la próxima vez que se abra, para elegir otra carpeta; ella misma borra el fichero.
+    void set_choose_folder(bool on) {
+        choose_folder_ = on;
+        panel_dirty_ = true;
+        const std::string file = data_file("elegir_carpeta");
+        if (!on) {
+            unlink(file.c_str());
+        } else if (const int fd = open(file.c_str(), O_WRONLY | O_CREAT, 0644); fd >= 0) {
+            close(fd);
+        }
+        NVN_LOG("hud: cambiar de carpeta al abrir la app: %s\n", on ? "sí" : "no");
     }
     void record_panel(VkCommandBuffer cmd, VkImage image, VkExtent2D extent, bool bgra, int64_t now) {
         const uint32_t w = extent.width / 3, h = extent.height;
@@ -294,17 +322,27 @@ private:
         rect(0, 0, 4, h, kEdge);  // el canto que da al juego
         text(margin, (kPanelHeader - 7 * 6) / 2, 6, es ? "AJUSTES" : "SETTINGS", kText);
         rect(4, kPanelHeader - 3, w - 4, 3, kEdge);
-        // Fila 0: el contador de FPS.
+        // Fila 0: el contador de FPS. Fila 1 (solo con pantalla de inicio): volver a elegir la carpeta del juego.
         struct Row {
             const char* es;
             const char* en;
+            const char* hint_es;  // una línea pequeña debajo (o nullptr)
+            const char* hint_en;
             bool on;
         };
-        const Row rows[] = {{"CONTADOR DE FPS", "FPS COUNTER", !hidden_}};
+        const Row rows[] = {{"CONTADOR DE FPS", "FPS COUNTER", nullptr, nullptr, !hidden_},
+                            {"CAMBIAR CARPETA", "CHANGE FOLDER", "AL ABRIR LA APP", "AT NEXT START", choose_folder_}};
+        const int count = has_setup() ? 2 : 1;
         int y = kPanelHeader;
-        for (const Row& row : rows) {
+        for (int k = 0; k < count; k++) {
+            const Row& row = rows[k];
             const int sw = 132, sh = 60, sx = w - sw - margin, sy = y + (kPanelRow - sh) / 2;
-            text(margin, y + (kPanelRow - 7 * 4) / 2, 4, es ? row.es : row.en, kText);
+            if (row.hint_es) {
+                text(margin, y + 30, 4, es ? row.es : row.en, kText);
+                text(margin, y + 30 + 7 * 4 + 14, 3, es ? row.hint_es : row.hint_en, kDim);
+            } else {
+                text(margin, y + (kPanelRow - 7 * 4) / 2, 4, es ? row.es : row.en, kText);
+            }
             pill(sx, sy, sw, sh, row.on ? kGood : kOff);
             pill(row.on ? sx + sw - sh + 5 : sx + 5, sy + 5, sh - 10, sh - 10, kKnob);
             rect(margin, y + kPanelRow - 2, w - 2 * margin, 2, kLine);
@@ -383,6 +421,7 @@ private:
     bool hidden_ = false, flag_ = false, flag_seen_ = false;  // el contador apagado; lo último que dijo <datos>/sin_fps
     bool panel_open_ = false, touch_seen_ = false, gesture_seen_ = false;
     bool panel_dirty_ = true, panel_drawn_hidden_ = false;  // hay que redibujarlo; el estado con el que se dibujó
+    bool choose_folder_ = false;                   // la fila "Cambiar carpeta" (el fichero <datos>/elegir_carpeta)
     uint32_t panel_w_ = 0, panel_h_ = 0;           // el tamaño con el que se crearon sus buffers
     float panel_from_ = 0.0f;                     // lo que asomaba cuando se abrió o se cerró por última vez
     int64_t panel_at_ = 0, touched_at_ = 0;       // cuándo fue eso, y la última vez que se tocó

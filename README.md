@@ -64,7 +64,8 @@ about the app itself are always welcome in the issues; just please don't share o
    and RomFS folders inside).
 3. Open the app, grant *All files access*, browse to that folder with the touch screen or the d-pad and choose
    **Use this folder**. The app checks that the files are this game, the right version and not encrypted.
-4. Press **Start game**. Next time the app goes straight to this screen.
+4. Press **Start game**. From then on the app starts the game directly; to choose another folder, switch on
+   *Change folder* in the settings panel (see below) or open the app twice in a row (within ten seconds).
 
 Saves, the shader cache and `log.txt` are written into that same folder. The first time you visit each place the game
 may stutter while its shaders are translated and compiled; they are cached for the next time.
@@ -76,8 +77,9 @@ may stutter while its shaders are translated and compiled; they are cached for t
   Y on the left. You can change the mode from the quick settings while the game is running. Any other controller is read
   by position too.
 - **Settings panel.** Swipe in from the right edge of the screen (the system's back gesture, the one that shows an arrow)
-  and a panel slides out over the game. For now it has one switch, the FPS counter, and your choice is remembered. The
-  same swipe, a tap outside the panel or a few seconds without touching it hide it again.
+  and a panel slides out over the game. It has a switch for the FPS counter (your choice is remembered) and *Change
+  folder*, which brings the folder screen back the next time you open the app. The same swipe, a tap outside the panel
+  or a few seconds without touching it hide it again.
 
 ## Options
 
@@ -149,7 +151,7 @@ CPU y este proyecto reimplementa el SDK de la consola y la API gráfica NVN sobr
   ajustado a ese chip y a sus límites (30 fps fijos con presupuesto de 33 ms por frame, ~2,7 GB de memoria libre, núcleos
   grandes para el juego). Probado en la Flip 2.
 - Los botones quedan donde están en la consola original del juego en los dos modos del mando de la Retroid (Xbox y
-  Retro). Deslizando un dedo desde el borde derecho de la pantalla sale un panel de ajustes; por ahora tiene el
-  interruptor del contador de FPS.
+  Retro). Deslizando un dedo desde el borde derecho de la pantalla sale un panel de ajustes, con el interruptor del
+  contador de FPS y el de volver a elegir la carpeta. Con la carpeta ya elegida, la app abre el juego directamente.
 - Proyecto de fans, sin ánimo de lucro, sin relación con el fabricante de la consola ni
   con Monolith Soft.

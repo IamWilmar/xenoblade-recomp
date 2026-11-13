@@ -2402,7 +2402,7 @@ private:
     VkDeviceSize overlay_used_ = 0;
     // Huecos de overlays tirados (la CPU reescribió su rango, un rango nuevo los solapó…) para los overlays nuevos. Con la
     // arena solo lineal, en una cacería MH Rise rehacía ~16 MB de overlays por frame: la arena (64 MB) se llenaba cada 2-3
-    // frames y cada compactación esperaba a que la GPU acabara todo y leía ~26 MB de memoria no cacheable (will1.log:
+    // frames y cada compactación esperaba a que la GPU acabara todo y leía ~26 MB de memoria no cacheable (cap1.log:
     // 12,8 ms/frame esperando a la GPU, 50 ms/frame en el ejecutor, 14-20 fps). Un hueco se reutiliza cuando la GPU ha
     // terminado el envío en el que se tiró: nada de lo grabado hasta entonces lo vuelve a leer.
     // <datos>/sin_huecos_overlays: solo la arena, como antes.
@@ -10650,7 +10650,7 @@ bool Executor::blit(Texture& t, const VkRect2D& crop, VkImage dst, VkFormat form
     const int32_t y1 = crop.extent.height ? std::min<int32_t>(y0 + static_cast<int32_t>(crop.extent.height), t.desc.height) : t.desc.height;
     // FSR 1: más nítido que el blit lineal (sin_fsr: el blit). Escala una zona que empieza en 0,0.
     // Guarda: el FSR cuesta ~4,4 ms de GPU por frame (en las ventanas limitadas por la GPU, 1000/fps menos la GPU del
-    // frame da 4,4-4,8 ms de mediana en tf1, pk1, st1 y tk2; en will1 el campamento a 27,2 fps con 32,6 ms de frame).
+    // frame da 4,4-4,8 ms de mediana en tf1, pk1, st1 y tk2; en cap1 el campamento a 27,2 fps con 32,6 ms de frame).
     // Con el frame del juego por encima de ~28,5 ms ya no caben los 33,3 ms: entonces el blit lineal (~0,5 ms), con
     // histéresis para no cambiar de nitidez a cada frame. <datos>/fsr_siempre: FSR siempre, como antes.
     // Xenoblade: solo con el solape de frames (activo salvo sin_solapar_frame). Sin él, la GPU espera ~8,3 ms por frame al primer envío del siguiente (el juego no

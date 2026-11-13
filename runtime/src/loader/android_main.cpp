@@ -11,8 +11,10 @@
 #include <android_native_app_glue.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <jni.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
+#include <sys/system_properties.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -21,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 
 #include "loader/crash.h"
@@ -130,13 +133,96 @@ enum : uint64_t {
     kStickRLeft = 1 << 20, kStickRUp = 1 << 21, kStickRRight = 1 << 22, kStickRDown = 1 << 23,
 };
 
-// Por posición, con la disposición de Nintendo: el de abajo es B, el de la derecha A.
-uint64_t button_for(int32_t keycode) {
+// Dos formas de leer los botones. Por nombre: el botón que Android llama A es la A de la consola original. Por posición: en un mando
+// de Xbox BUTTON_A es el de abajo, que en la consola original es la B.
+// La Flip 2 tiene dos modos de mando (se cambian en los ajustes rápidos) y se usan los dos: en los dos, cada botón va
+// donde está en la consola original (el de abajo, la B; el de la derecha, la A). Su mando (USB 2022:3002) se llama "Xbox Wireless
+// Controller" EN LOS DOS MODOS y conserva el id; lo que cambia es la tecla que manda cada botón: en modo Xbox el de abajo
+// manda BUTTON_A (por posición) y en modo Retro manda BUTTON_B (por nombre). El modo lo apunta su servicio de mapeo
+// (com.rp.mapping, al elegir el mando "X-Box", "Retro Gamepad" o "None") en la propiedad persist.sys.gamepad.type: 1, 0
+// o 2. Antes se leía siempre por posición y en modo Retro los botones salían cruzados (el de abajo hacía de A).
+// Cualquier otro mando, y las teclas que inyecta adb: por posición, que es como Android entrega los mandos (BUTTON_A es el
+// botón de abajo también en los mandos de otras consolas). La consola sin esa propiedad (otro firmware): por nombre solo
+// si su mando se presenta como el del modo Retro (2022:3001, "Retroid Pocket Controller").
+// <datos>/botones_xbox y <datos>/botones_retro (en vivo) fuerzan una u otra para todos.
+int forced_layout() {  // 1: Xbox (por posición), 0: Retro (por nombre), -1: sin forzar
+    static const std::string xbox = g_data + "/botones_xbox", retro = g_data + "/botones_retro";
+    static int checks = 0, forced = -1;
+    if (checks++ % 32 == 0) forced = access(xbox.c_str(), F_OK) == 0 ? 1 : access(retro.c_str(), F_OK) == 0 ? 0 : -1;
+    return forced;
+}
+struct PadInfo {
+    std::string name;
+    int vendor = 0, product = 0;
+    int layout = -1;  // el último elegido (para avisar en el log cuando cambia)
+};
+// El nombre y los ids USB del mando por JNI (InputDevice.getDevice(id)), una vez por id.
+PadInfo device_info(ANativeActivity* activity, int32_t id) {
+    PadInfo info;
+    JNIEnv* env = nullptr;
+    JavaVMAttachArgs attach{JNI_VERSION_1_6, "entrada", nullptr};
+    if (!activity || activity->vm->AttachCurrentThread(&env, &attach) != JNI_OK || !env) return info;
+    if (jclass cls = env->FindClass("android/view/InputDevice")) {
+        jmethodID get = env->GetStaticMethodID(cls, "getDevice", "(I)Landroid/view/InputDevice;");
+        jmethodID get_name = env->GetMethodID(cls, "getName", "()Ljava/lang/String;");
+        jmethodID get_vendor = env->GetMethodID(cls, "getVendorId", "()I");
+        jmethodID get_product = env->GetMethodID(cls, "getProductId", "()I");
+        jobject device = get && get_name && get_vendor && get_product ? env->CallStaticObjectMethod(cls, get, id) : nullptr;
+        if (device) {
+            if (auto* str = static_cast<jstring>(env->CallObjectMethod(device, get_name))) {
+                if (const char* chars = env->GetStringUTFChars(str, nullptr)) {
+                    info.name = chars;
+                    env->ReleaseStringUTFChars(str, chars);
+                }
+            }
+            info.vendor = env->CallIntMethod(device, get_vendor);
+            info.product = env->CallIntMethod(device, get_product);
+        }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    activity->vm->DetachCurrentThread();  // el hilo de la app no se queda enganchado (al salir abortaría)
+    return info;
+}
+// El modo del mando de la Retroid (persist.sys.gamepad.type): 1 Xbox, 0 Retro, 2 ninguno; -1 si no existe la propiedad.
+int retroid_pad_mode() {
+    char value[PROP_VALUE_MAX] = "";
+    return __system_property_get("persist.sys.gamepad.type", value) > 0 ? atoi(value) : -1;
+}
+constexpr int kRetroidVendor = 0x2022;
+// true: los botones de ese mando se leen por posición (Xbox). Se mira en cada tecla: el modo de la Flip cambia con el
+// juego abierto y sin que el mando cambie de id.
+bool xbox_layout(ANativeActivity* activity, int32_t device) {
+    static std::map<int32_t, PadInfo> pads;
+    auto it = pads.find(device);
+    if (it == pads.end()) it = pads.emplace(device, device > 0 ? device_info(activity, device) : PadInfo{}).first;
+    PadInfo& pad = it->second;
+    const int forced = forced_layout();
+    const bool console = pad.vendor == kRetroidVendor;
+    const int mode = console ? retroid_pad_mode() : -1;
+    bool xbox;
+    const char* why;
+    if (forced >= 0) xbox = forced == 1, why = "forzado por <datos>/botones_xbox o botones_retro";
+    else if (!console) xbox = true, why = "no es el mando de la consola: Android los entrega por posición";
+    else if (mode == 1) xbox = true, why = "modo Xbox de la consola";
+    else if (mode == 0) xbox = false, why = "modo Retro de la consola";
+    else  // sin la propiedad (otro firmware): en modo Retro el mando se presenta como 2022:3001 "Retroid Pocket Controller"
+        xbox = !(pad.product == 0x3001 || strcasestr(pad.name.c_str(), "retroid")), why = "por cómo se presenta el mando de la consola";
+    if (pad.layout != static_cast<int>(xbox)) {
+        printf("[entrada] mando %d \"%s\" (%04x:%04x): botones %s (%s)\n", device, pad.name.c_str(), pad.vendor, pad.product,
+               xbox ? "por posición, como un mando de Xbox" : "por nombre, como la consola original", why);
+        fflush(stdout);  // que se vea en el log al momento: es lo primero que se mira si los botones salen cruzados
+        // Con otra lectura a medio pulsar, el botón se quedaría puesto: los cuatro, fuera.
+        if (pad.layout >= 0) g_key_buttons &= ~(kA | kB | kX | kY);
+        pad.layout = xbox;
+    }
+    return xbox;
+}
+uint64_t button_for(int32_t keycode, bool xbox) {
     switch (keycode) {
-        case AKEYCODE_BUTTON_A: return kB;
-        case AKEYCODE_BUTTON_B: return kA;
-        case AKEYCODE_BUTTON_X: return kY;
-        case AKEYCODE_BUTTON_Y: return kX;
+        case AKEYCODE_BUTTON_A: return xbox ? kB : kA;
+        case AKEYCODE_BUTTON_B: return xbox ? kA : kB;
+        case AKEYCODE_BUTTON_X: return xbox ? kY : kX;
+        case AKEYCODE_BUTTON_Y: return xbox ? kX : kY;
         case AKEYCODE_BUTTON_L1: return kL;
         case AKEYCODE_BUTTON_R1: return kR;
         case AKEYCODE_BUTTON_L2: return kZL;
@@ -165,7 +251,9 @@ void take_over(AInputEvent* event) {
     // Solo un botón pulsado o un stick movido de verdad: el mando de la Flip manda eventos de ejes en reposo, y eso
     // paraba el paseo automático nada más empezar.
     const bool key = AInputEvent_getType(event) == AINPUT_EVENT_TYPE_KEY && AKeyEvent_getAction(event) == AKEY_EVENT_ACTION_DOWN;
+    // (la pantalla táctil también manda eventos de movimiento, con X e Y en píxeles: solo cuentan los de un joystick)
     const bool stick = AInputEvent_getType(event) == AINPUT_EVENT_TYPE_MOTION &&
+                       (AInputEvent_getSource(event) & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK &&
                        (std::fabs(AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_X, 0)) > 0.5f ||
                         std::fabs(AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_Y, 0)) > 0.5f ||
                         std::fabs(AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_Z, 0)) > 0.5f ||
@@ -339,10 +427,42 @@ void* walk(void*) {
 }
 
 
-int32_t on_input(android_app*, AInputEvent* event) {
+// El último toque que se posó en el borde derecho de la pantalla (su hora de Android, en ns; 0 si no hay): la tecla BACK que
+// llega poco después es el gesto de "atrás" del sistema hecho desde ese borde.
+int64_t g_edge_touch_ns = 0;
+constexpr int32_t kEdgePixels = 160;                // lo que Android cuenta como borde, con margen (hasta 48 dp)
+constexpr int64_t kEdgeGestureNs = 3'000'000'000;  // de posar el dedo a soltarlo con el gesto hecho
+
+int32_t on_input(android_app* app, AInputEvent* event) {
     take_over(event);
     if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_KEY) {
-        uint64_t bit = button_for(AKeyEvent_getKeyCode(event));
+        // El gesto de "atrás" del sistema desde el borde derecho (aparece una flecha): Android se queda con el toque y manda
+        // la tecla BACK. No es el botón del juego (antes hacía de "-"): abre o cierra el panel del HUD (nvn/hud.cpp). Se
+        // reconoce porque llega poco después de un toque que se posó en ese borde; el BACK de un botón físico o del borde
+        // izquierdo sigue siendo "-".
+        if (AKeyEvent_getKeyCode(event) == AKEYCODE_BACK) {
+            static bool swallow_up = false;
+            const int64_t since = AKeyEvent_getEventTime(event) - g_edge_touch_ns;
+            if (AKeyEvent_getAction(event) == AKEY_EVENT_ACTION_DOWN && g_edge_touch_ns && since >= 0 && since < kEdgeGestureNs) {
+                g_edge_touch_ns = 0;
+                swallow_up = true;
+                static uint32_t gestures = 0;
+                g_input.hud_gesture = static_cast<uint64_t>(g_input.touch_serial.load()) << 32 | ++gestures;
+                printf("[entrada] gesto del borde derecho: panel del HUD\n");
+                fflush(stdout);
+                return 1;
+            }
+            if (AKeyEvent_getAction(event) == AKEY_EVENT_ACTION_UP && swallow_up) {
+                swallow_up = false;
+                return 1;
+            }
+        }
+        // La lectura (por posición o por nombre) solo cuenta para A/B/X/Y: las demás teclas (volumen, atrás, las de otros
+        // dispositivos) no preguntan por ella, y así no sueltan los botones de un mando al cambiar la de otro.
+        const int32_t keycode = AKeyEvent_getKeyCode(event);
+        const bool face = keycode == AKEYCODE_BUTTON_A || keycode == AKEYCODE_BUTTON_B || keycode == AKEYCODE_BUTTON_X ||
+                          keycode == AKEYCODE_BUTTON_Y;
+        uint64_t bit = button_for(keycode, face && xbox_layout(app->activity, AInputEvent_getDeviceId(event)));
         static int logged = 0;  // DEPURACIÓN: las primeras teclas que llegan (de qué dispositivo)
         if (logged++ < 12)
             printf("[entrada] tecla %d acción %d dispositivo %d fuente %#x -> %#llx (en %p)\n", AKeyEvent_getKeyCode(event),
@@ -360,6 +480,31 @@ int32_t on_input(android_app*, AInputEvent* event) {
             g_key_buttons &= ~bit;
         publish();
         return 1;  // si no, Android convierte B en "atrás" y cierra la app
+    }
+    // La pantalla táctil: el toque de un dedo, para el panel del HUD (deslizar de derecha a izquierda: nvn/hud.cpp).
+    if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_MOTION &&
+        (AInputEvent_getSource(event) & AINPUT_SOURCE_TOUCHSCREEN) == AINPUT_SOURCE_TOUCHSCREEN) {
+        const int32_t action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
+        const uint64_t point = static_cast<uint64_t>(static_cast<uint32_t>(std::lround(AMotionEvent_getY(event, 0)))) << 32 |
+                               static_cast<uint32_t>(std::lround(AMotionEvent_getX(event, 0)));
+        if (action == AMOTION_EVENT_ACTION_DOWN) {
+            g_input.touch_start = point;
+            g_input.touch_last = point;
+            g_input.touch_state = 1;
+            g_input.touch_serial++;  // lo último: quien lo lea ya tiene el toque entero
+            // ¿Se posó en el borde derecho? (el gesto de "atrás" del sistema: ver la tecla BACK más arriba)
+            const int32_t width = app->window ? ANativeWindow_getWidth(app->window) : 1920;
+            g_edge_touch_ns = AMotionEvent_getX(event, 0) >= static_cast<float>(width - kEdgePixels) ? AMotionEvent_getEventTime(event) : 0;
+        } else if (action == AMOTION_EVENT_ACTION_MOVE || action == AMOTION_EVENT_ACTION_UP) {
+            g_input.touch_last = point;
+            if (action == AMOTION_EVENT_ACTION_UP) {
+                g_input.touch_state = 0;
+                g_edge_touch_ns = 0;  // se levantó como un toque normal: no era el gesto del sistema (ese acaba en CANCEL)
+            }
+        } else if (action == AMOTION_EVENT_ACTION_CANCEL) {
+            g_input.touch_state = 2;
+        }
+        return 1;
     }
     if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_MOTION &&
         (AInputEvent_getSource(event) & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK) {

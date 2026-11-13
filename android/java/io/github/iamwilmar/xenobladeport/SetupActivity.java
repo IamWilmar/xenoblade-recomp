@@ -157,7 +157,7 @@ public final class SetupActivity extends Activity {
                 showResult(dir, r);
                 if (failure != null) text("✗  " + failure);
             });
-        }, "BuscarVolcado").start();
+        }, "BuscarJuego").start();
     }
 
     private void showResult(File dir, DumpScanner.Result r) {
@@ -175,9 +175,9 @@ public final class SetupActivity extends Activity {
             text(r.dlc.isEmpty() ? tr("·  Sin DLC (son opcionales)", "·  No DLC (optional)") : "✓  " + r.dlc.size() + " DLC");
             if (r.unknownDlc > 0)
                 text("·  " + r.unknownDlc + tr(" DLC sin su id de título en el nombre de la carpeta: no los cargo. "
-                        + "Deja las carpetas de los DLC con el nombre que les puso la herramienta de volcado.",
+                        + "Deja las carpetas de los DLC con el nombre que les puso la herramienta con la que los extrajiste.",
                         " DLC without their title ID in the folder name were skipped. "
-                        + "Keep the DLC folders named as your dumping tool created them."));
+                        + "Keep the DLC folders named as your extraction tool created them."));
         }
         LinearLayout row = new LinearLayout(this);
         row.setGravity(Gravity.CENTER_VERTICAL);

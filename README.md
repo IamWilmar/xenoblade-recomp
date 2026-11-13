@@ -12,7 +12,7 @@ own ARM64 code runs directly on the device's CPU, while this project reimplement
 
 ## Status
 
-**Version 0.10 — playable.** Colony 9, the main menus and battles run at ~30 fps on the Flip 2 (battles are at the
+**Version 0.11 — playable.** Colony 9, the main menus and battles run at ~30 fps on the Flip 2 (battles are at the
 GPU limit: occasional dips to ~29). Upscaled to 1080p with AMD FSR 1.
 
 - Known issues: in some battles a thin green or teal line can flicker across the screen; shadows are as soft as in the
@@ -74,8 +74,8 @@ may stutter while its shaders are translated and compiled; they are cached for t
 
 - **The face buttons follow the device's controller mode.** In both of the Retroid's modes (Xbox and Retro) every button
   does what the button in that same place does on the game's original console: B at the bottom, A on the right, X on top,
-  Y on the left. You can change the mode from the quick settings while the game is running. Any other controller is read
-  by position too.
+  Y on the left. You can change the mode from the quick settings while the game is running. Any other controller, over
+  USB or Bluetooth (a DualSense, for example), is read by position too: its bottom button is B.
 - **Settings panel.** Swipe in from the right edge of the screen (the system's back gesture, the one that shows an arrow)
   and a panel slides out over the game. It has a switch for the FPS counter (your choice is remembered) and *Change
   folder*, which brings the folder screen back the next time you open the app. The same swipe, a tap outside the panel
@@ -151,7 +151,8 @@ CPU y este proyecto reimplementa el SDK de la consola y la API gráfica NVN sobr
   ajustado a ese chip y a sus límites (30 fps fijos con presupuesto de 33 ms por frame, ~2,7 GB de memoria libre, núcleos
   grandes para el juego). Probado en la Flip 2.
 - Los botones quedan donde están en la consola original del juego en los dos modos del mando de la Retroid (Xbox y
-  Retro). Deslizando un dedo desde el borde derecho de la pantalla sale un panel de ajustes, con el interruptor del
-  contador de FPS y el de volver a elegir la carpeta. Con la carpeta ya elegida, la app abre el juego directamente.
+  Retro), y cualquier otro mando, por USB o Bluetooth, se lee por posición. Deslizando un dedo desde el borde derecho de
+  la pantalla sale un panel de ajustes, con el interruptor del contador de FPS y el de volver a elegir la
+  carpeta. Con la carpeta ya elegida, la app abre el juego directamente.
 - Proyecto de fans, sin ánimo de lucro, sin relación con el fabricante de la consola ni
   con Monolith Soft.

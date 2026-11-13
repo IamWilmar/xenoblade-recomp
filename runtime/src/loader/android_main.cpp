@@ -197,16 +197,23 @@ bool xbox_layout(ANativeActivity* activity, int32_t device) {
     if (it == pads.end()) it = pads.emplace(device, device > 0 ? device_info(activity, device) : PadInfo{}).first;
     PadInfo& pad = it->second;
     const int forced = forced_layout();
-    const bool console = pad.vendor == kRetroidVendor;
+    // El mando de la consola. El sistema de la Retroid vuelve a crear los mandos externos como dispositivos suyos, con
+    // el vendor de la consola (un DualSense por Bluetooth llega como 2022:3001 "DualSense Wireless Controller") pero
+    // con sus botones por posición, sin el cambio del modo Retro: lo que distingue al de la consola es el nombre,
+    // "Retroid Pocket Controller", o "Xbox Wireless Controller" 2022:3002 (modo Xbox, o recién pasado a Retro sin
+    // volver a enumerarse).
+    const bool console = pad.vendor == kRetroidVendor &&
+                         (strcasestr(pad.name.c_str(), "retroid") ||
+                          (pad.product == 0x3002 && strcasestr(pad.name.c_str(), "xbox wireless controller")));
     const int mode = console ? retroid_pad_mode() : -1;
     bool xbox;
     const char* why;
     if (forced >= 0) xbox = forced == 1, why = "forzado por <datos>/botones_xbox o botones_retro";
-    else if (!console) xbox = true, why = "no es el mando de la consola: Android los entrega por posición";
+    else if (!console) xbox = true, why = "no es el mando de la consola: los externos llegan por posición";
     else if (mode == 1) xbox = true, why = "modo Xbox de la consola";
     else if (mode == 0) xbox = false, why = "modo Retro de la consola";
     else  // sin la propiedad (otro firmware): en modo Retro el mando se presenta como 2022:3001 "Retroid Pocket Controller"
-        xbox = !(pad.product == 0x3001 || strcasestr(pad.name.c_str(), "retroid")), why = "por cómo se presenta el mando de la consola";
+        xbox = !strcasestr(pad.name.c_str(), "retroid"), why = "por cómo se presenta el mando de la consola";
     if (pad.layout != static_cast<int>(xbox)) {
         printf("[entrada] mando %d \"%s\" (%04x:%04x): botones %s (%s)\n", device, pad.name.c_str(), pad.vendor, pad.product,
                xbox ? "por posición, como un mando de Xbox" : "por nombre, como la consola original", why);

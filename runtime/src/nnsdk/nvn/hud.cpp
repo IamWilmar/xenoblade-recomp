@@ -165,10 +165,27 @@ private:
         panel_open_ = open;
         panel_at_ = now;
         touched_at_ = now;
-        if (open && has_setup()) {  // por si el fichero cambió desde fuera
-            const bool marked = access(data_file("elegir_carpeta").c_str(), F_OK) == 0;
+        if (open) {  // por si los ficheros cambiaron desde fuera
+            const bool marked = has_setup() && access(data_file("elegir_carpeta").c_str(), F_OK) == 0;
             if (marked != choose_folder_) choose_folder_ = marked, panel_dirty_ = true;
+            const bool tv = has_tv() && access(data_file("modo_tv").c_str(), F_OK) == 0;
+            if (tv != tv_) tv_ = tv, panel_dirty_ = true;
         }
+    }
+    // Las filas del panel, en orden: el contador de FPS siempre; el modo TV si el port lo tiene; cambiar de carpeta si
+    // la app tiene pantalla de inicio.
+    enum RowId { kRowFps, kRowTv, kRowFolder };
+    static int rows(RowId* out) {
+        int n = 0;
+        out[n++] = kRowFps;
+        if (has_tv()) out[n++] = kRowTv;
+        if (has_setup()) out[n++] = kRowFolder;
+        return n;
+    }
+    // ¿El port tiene modo TV (la consola en la base)? El loader pone NIER_TV_MODE en los que lo traen.
+    static bool has_tv() {
+        static const bool tv = getenv("NIER_TV_MODE") != nullptr;
+        return tv;
     }
     // <datos>/<name>.
     static std::string data_file(const char* name) {
@@ -225,8 +242,12 @@ private:
                     } else {
                         touched_at_ = now;
                         const int row = t.y >= kPanelHeader ? (t.y - kPanelHeader) / kPanelRow : -1;
-                        if (row == 0) set_hidden(!hidden_);  // el contador de FPS
-                        else if (row == 1 && has_setup()) set_choose_folder(!choose_folder_);  // cambiar de carpeta
+                        RowId ids[3];
+                        if (row >= 0 && row < rows(ids)) {
+                            if (ids[row] == kRowFps) set_hidden(!hidden_);
+                            else if (ids[row] == kRowTv) set_tv(!tv_);
+                            else set_choose_folder(!choose_folder_);
+                        }
                     }
                 }
                 touch_handled_ = t.serial;
@@ -257,6 +278,19 @@ private:
             close(fd);
         }
         NVN_LOG("hud: cambiar de carpeta al abrir la app: %s\n", on ? "sí" : "no");
+    }
+    // "Modo TV": con el fichero <datos>/modo_tv el juego cree estar en la base (más resolución, mando Pro) desde la próxima
+    // vez que se abra; el modo se decide al arrancar (nnsdk::tv_mode).
+    void set_tv(bool on) {
+        tv_ = on;
+        panel_dirty_ = true;
+        const std::string file = data_file("modo_tv");
+        if (!on) {
+            unlink(file.c_str());
+        } else if (const int fd = open(file.c_str(), O_WRONLY | O_CREAT, 0644); fd >= 0) {
+            close(fd);
+        }
+        NVN_LOG("hud: modo TV al abrir la app: %s\n", on ? "sí" : "no");
     }
     void record_panel(VkCommandBuffer cmd, VkImage image, VkExtent2D extent, bool bgra, int64_t now) {
         const uint32_t w = extent.width / 3, h = extent.height;
@@ -322,7 +356,7 @@ private:
         rect(0, 0, 4, h, kEdge);  // el canto que da al juego
         text(margin, (kPanelHeader - 7 * 6) / 2, 6, es ? "AJUSTES" : "SETTINGS", kText);
         rect(4, kPanelHeader - 3, w - 4, 3, kEdge);
-        // Fila 0: el contador de FPS. Fila 1 (solo con pantalla de inicio): volver a elegir la carpeta del juego.
+        // Las filas de rows(): el contador de FPS, el modo TV y volver a elegir la carpeta del juego.
         struct Row {
             const char* es;
             const char* en;
@@ -330,12 +364,14 @@ private:
             const char* hint_en;
             bool on;
         };
-        const Row rows[] = {{"CONTADOR DE FPS", "FPS COUNTER", nullptr, nullptr, !hidden_},
-                            {"CAMBIAR CARPETA", "CHANGE FOLDER", "AL ABRIR LA APP", "AT NEXT START", choose_folder_}};
-        const int count = has_setup() ? 2 : 1;
+        const Row all[] = {{"CONTADOR DE FPS", "FPS COUNTER", nullptr, nullptr, !hidden_},
+                           {"MODO TV", "TV MODE", "AL ABRIR LA APP", "AT NEXT START", tv_},
+                           {"CAMBIAR CARPETA", "CHANGE FOLDER", "AL ABRIR LA APP", "AT NEXT START", choose_folder_}};
+        RowId ids[3];
+        const int count = rows(ids);
         int y = kPanelHeader;
         for (int k = 0; k < count; k++) {
-            const Row& row = rows[k];
+            const Row& row = all[ids[k]];
             const int sw = 132, sh = 60, sx = w - sw - margin, sy = y + (kPanelRow - sh) / 2;
             if (row.hint_es) {
                 text(margin, y + 30, 4, es ? row.es : row.en, kText);
@@ -422,6 +458,7 @@ private:
     bool panel_open_ = false, touch_seen_ = false, gesture_seen_ = false;
     bool panel_dirty_ = true, panel_drawn_hidden_ = false;  // hay que redibujarlo; el estado con el que se dibujó
     bool choose_folder_ = false;                   // la fila "Cambiar carpeta" (el fichero <datos>/elegir_carpeta)
+    bool tv_ = false;                              // la fila "Modo TV" (el fichero <datos>/modo_tv)
     uint32_t panel_w_ = 0, panel_h_ = 0;           // el tamaño con el que se crearon sus buffers
     float panel_from_ = 0.0f;                     // lo que asomaba cuando se abrió o se cerró por última vez
     int64_t panel_at_ = 0, touched_at_ = 0;       // cuándo fue eso, y la última vez que se tocó

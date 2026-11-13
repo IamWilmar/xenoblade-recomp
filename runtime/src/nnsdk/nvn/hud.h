@@ -10,6 +10,8 @@
 // En las apps con pantalla de inicio (NIER_SETUP en el entorno) hay una segunda fila, "Cambiar carpeta": la app arranca el
 // juego directamente si ya tiene su carpeta, y con ese interruptor (el fichero <datos>/elegir_carpeta) la pantalla de inicio
 // vuelve a salir la próxima vez que se abra.
+// En los ports con modo TV (NIER_TV_MODE en el entorno) hay otra, "Modo TV" (el fichero <datos>/modo_tv): el juego cree
+// estar en la base (más resolución, mando Pro) desde la próxima vez que se abra.
 
 #include <cstdint>
 

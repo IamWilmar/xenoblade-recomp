@@ -6,7 +6,7 @@ namespace nvn {
 
 namespace {
 
-constexpr FormatInfo kFormats[] = {
+FormatInfo kFormats[] = {  // no constante: adapt_formats_to_gpu cambia el VkFormat de lo que la GPU no tenga
     /* 0x00 */ {VK_FORMAT_UNDEFINED, 0, 1, "NONE"},
     /* 0x01 */ {VK_FORMAT_R8_UNORM, 1, 1, "R8"},
     /* 0x02 */ {VK_FORMAT_R8_SNORM, 1, 1, "R8SN"},
@@ -173,6 +173,26 @@ constexpr FormatInfo kFormats[] = {
 };
 
 }  // namespace
+
+// Profundidad de 24 bits: el Adreno la tiene, las GPU de Apple (MoltenVK, el emulador del Mac) no. Sin sustituto, cada
+// pase con un D24S8 (Catherine: Full Body pinta así toda su escena) se saltaba entero. Se cambia por D32F(+S8), que
+// guarda lo mismo con más precisión; solo afecta a la GPU que no tiene el formato.
+void adapt_formats_to_gpu(VkPhysicalDevice gpu) {
+    auto usable = [&](VkFormat f) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(gpu, f, &fp);
+        return (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+    };
+    for (FormatInfo& f : kFormats) {
+        VkFormat alt = VK_FORMAT_UNDEFINED;
+        if (f.vk == VK_FORMAT_D24_UNORM_S8_UINT) alt = VK_FORMAT_D32_SFLOAT_S8_UINT;
+        if (f.vk == VK_FORMAT_X8_D24_UNORM_PACK32) alt = VK_FORMAT_D32_SFLOAT;
+        if (alt == VK_FORMAT_UNDEFINED || usable(f.vk) || !usable(alt)) continue;
+        NVN_LOG("formato %s sin soporte en esta GPU: se usa %s\n", f.name,
+                alt == VK_FORMAT_D32_SFLOAT ? "D32F" : "D32F_S8");
+        f.vk = alt;
+    }
+}
 
 const FormatInfo* format_info(int nvn_format) {
     if (nvn_format < 0 || nvn_format >= static_cast<int>(sizeof kFormats / sizeof kFormats[0])) {

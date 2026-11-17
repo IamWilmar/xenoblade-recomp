@@ -120,6 +120,14 @@ Result GetFriendList(int* count, Friend*, int, int, const FriendFilter&) {
     return ResultSuccess;
 }
 
+// SDK 8 (Catherine: Full Body): la variante con el usuario explícito, y Initialize, que en la consola abre la sesión
+// con el servicio de amigos.
+void Initialize() {}
+Result GetFriendList(int* count, Friend*, const account::Uid&, int, int, const FriendFilter&) {
+    *count = 0;
+    return ResultSuccess;
+}
+
 Result GetFriendList(int* count, account::NetworkServiceAccountId*, int, int, const FriendFilter&) {
     *count = 0;
     return ResultSuccess;

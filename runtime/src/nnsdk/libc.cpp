@@ -1,6 +1,11 @@
 // Partes de la libc de Nintendo (musl) cuya ABI no coincide con la de bionic. Las de rutas están en
 // libc_file.cpp y los pthreads en libc_thread.cpp.
 
+#include <langinfo.h>
+#include <strings.h>
+#include <vector>
+#include <fenv.h>
+#include <malloc.h>
 #include <arpa/inet.h>
 #include <dlfcn.h>
 
@@ -28,6 +33,37 @@ void on_thread_start() {
 }  // namespace nnsdk
 
 extern "C" void nnsdk_attach(const NnsdkHost* host) { g_host = *host; }
+
+// Destructores de los thread_local del juego (Unreal Engine registra los suyos en más de mil sitios). Corren en orden
+// inverso al acabar la función del hilo (os.cpp: thread_entry), con el TLS del juego todavía vivo; los del hilo
+// principal y los de hilos que no acaban nunca no corren: el proceso muere entero.
+namespace {
+struct ThreadDtor {
+    void (*fn)(void*);
+    void* object;
+};
+thread_local std::vector<ThreadDtor>* t_dtors = nullptr;
+}  // namespace
+extern "C" int __cxa_thread_atexit(void (*fn)(void*), void* object, void*) {
+    if (!t_dtors) t_dtors = new std::vector<ThreadDtor>;
+    t_dtors->push_back({fn, object});
+    return 0;
+}
+void nnsdk::run_thread_atexit() {
+    // Un destructor puede registrar otro (un thread_local que se crea al destruir): se vacía hasta que no quede nada.
+    while (t_dtors && !t_dtors->empty()) {
+        const ThreadDtor d = t_dtors->back();
+        t_dtors->pop_back();
+        d.fn(d.object);
+    }
+    delete t_dtors;
+    t_dtors = nullptr;
+}
+
+// Locale "C" como única locale (la de la musl de la consola): nl_langinfo con lo que da la de bionic, y las *_l como
+// sus versiones sin locale.
+extern "C" char* nngame_nl_langinfo(int item) { return nl_langinfo(item); }
+extern "C" int nngame_strncasecmp_l(const char* a, const char* b, size_t n, void*) { return strncasecmp(a, b, n); }
 
 // El crt0 de cada módulo la llama desde DT_INIT con sus tablas; si no devuelve 1, el
 // propio crt0 recorre el .init_array. Con 0 dejamos que lo haga él.
@@ -60,6 +96,40 @@ extern "C" [[noreturn]] void __assert_fail(const char* expr, const char* file, i
 }
 
 // El juego libera con su propio free: hay que reservar con su malloc.
+// memalign con el allocator del juego (él lo libera con su free): su aligned_alloc exportado.
+extern "C" void* nngame_memalign(size_t align, size_t size) {
+    if (!g_host.game_aligned_alloc) return nullptr;
+    return g_host.game_aligned_alloc(align, (size + align - 1) / align * align);
+}
+
+// Lo que importa el plugin AmplifyTextureNative (NRO) y main no exporta. posix_memalign con el allocator del juego
+// (el plugin libera con el free de main); malloc_usable_size: ese allocator es el malloc de bionic (mem.cpp).
+extern "C" int nngame_posix_memalign(void** out, size_t align, size_t size) {
+    if (!out || align < sizeof(void*) || (align & (align - 1))) return EINVAL;
+    void* p = nngame_memalign(align, size ? size : 1);
+    if (!p) return ENOMEM;
+    *out = p;
+    return 0;
+}
+extern "C" size_t nngame_malloc_usable_size(const void* p) { return p ? malloc_usable_size(p) : 0; }
+extern "C" uint32_t nngame_ntohl(uint32_t v) { return ntohl(v); }
+extern "C" [[noreturn]] void nngame___assert_fail(const char* expr, const char* file, int line, const char* func) {
+    __assert_fail(expr, file, line, func);
+}
+// std::__1::__sort<std::__1::__less<int, int>&, int*>: la instanciación explícita de la libc++ de la consola.
+extern "C" void nngame__ZNSt3__16__sortIRNS_6__lessIiiEEPiEEvT0_S5_T_(int* first, int* last, void*) {
+    std::sort(first, last);
+}
+
+// FE_DFL_ENV de la musl es (const fenv_t*)-1; el de bionic, un puntero de verdad.
+extern "C" int nngame_fesetenv(const fenv_t* env) {
+    return fesetenv(env == reinterpret_cast<const fenv_t*>(-1) ? FE_DFL_ENV : env);
+}
+
+// Los atexit del juego no se corren nunca: la consola no "sale" del programa, y en Android correrlos al morir el
+// proceso solo puede romper cosas a medio destruir.
+extern "C" int nngame_atexit(void (*)()) { return 0; }
+
 extern "C" char* nngame_strdup(const char* s) {
     size_t n = strlen(s) + 1;
     auto* p = static_cast<char*>(g_host.game_malloc(n));
@@ -127,6 +197,22 @@ extern "C" int nngame_iswspace(wint_t wc) {
 // La musl de Nintendo numera los sockets que crea ella como 0x0303xxxx (xxxx = descriptor de nn::socket) y aquí
 // los traduce. El juego no crea ninguno así (no importa socket()): los de nn::socket ya son nativos y pasan.
 extern "C" int _nnmusl_socket_TranslateNnmuslFileDescriptorOrPassThrough(int fd) {
+    if (fd < 0) return errno = EBADF, -1;
+    return fd;
+}
+
+// Castlevania (Unity 2022) importa la API POSIX de sockets de la musl. Consola sin red, como nn::socket: socket()
+// falla con ENETDOWN y el resolver no resuelve nada (EAI_AGAIN de musl es -3; el de bionic es positivo). La tabla
+// de la musl que asocia sus fds a los nativos es la identidad: aquí todos los fds son de bionic.
+extern "C" int nngame_socket(int, int, int) { return errno = ENETDOWN, -1; }
+extern "C" int nngame_getaddrinfo(const char*, const char*, const void*, void** res) {
+    if (res) *res = nullptr;
+    return -3;
+}
+extern "C" void nngame_freeaddrinfo(void*) {}
+extern "C" int nngame_getnameinfo(const void*, socklen_t, char*, socklen_t, char*, socklen_t, int) { return -3; }
+extern "C" int _nnmusl_socket_AddNativeSocketFileDescriptorToNnmuslTable(int fd) { return fd; }
+extern "C" int _nnmusl_socket_TranslateFileDescriptorFromNnmuslToNative(int fd) {
     if (fd < 0) return errno = EBADF, -1;
     return fd;
 }

@@ -223,6 +223,12 @@ String* _ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEP
     set_chars(self, s, strlen(s), false);
     return self;
 }
+// basic_string& assign(const char*, size_type)
+String* _ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKcm(String* self, const char* s,
+                                                                                   size_t n) {
+    set_chars(self, s, n, false);
+    return self;
+}
 
 // basic_string& append(const char*) / append(const char*, size_type)
 String* _ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm(String* self, const char* s,
@@ -245,6 +251,90 @@ String* _ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEm
 
 void _ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc(String* self, char c) {
     replace_chars(self, self->length(), 0, &c, 1);
+}
+
+// ~basic_string()
+void _ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED2Ev(String* self) {
+    if (self->is_long()) nnsdk::host().game_delete(self->l.data);
+}
+
+// void reserve(size_type n): solo crece (libc++ también encoge, pero no hace falta).
+void _ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7reserveEm(String* self, size_t n) {
+    if (n >= 0x7ffffffffffffff0) fail("basic_string::reserve: length_error");
+    if (n > self->capacity()) grow(self, n);
+}
+
+// basic_string& append(size_type n, char c)
+String* _ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEmc(String* self, size_t n, char c) {
+    const size_t len = self->length(), cap = self->capacity();
+    if (len + n > cap) grow(self, std::max(len + n, 2 * cap));
+    memset(self->chars() + len, c, n);
+    set_length(self, len + n);
+    return self;
+}
+
+// void resize(size_type n, char c)
+void _ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEmc(String* self, size_t n, char c) {
+    const size_t len = self->length();
+    if (n <= len)
+        set_length(self, n);
+    else
+        _ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEmc(self, n - len, c);
+}
+
+// basic_string& erase(size_type pos, size_type n)
+String* _ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5eraseEmm(String* self, size_t pos, size_t n) {
+    const size_t len = self->length();
+    if (pos > len) fail("basic_string::erase: out_of_range");
+    replace_chars(self, pos, std::min(n, len - pos), nullptr, 0);
+    return self;
+}
+
+// El crecimiento de libc++ que el código en línea del juego llama antes de escribir: deja sitio para
+// old_cap + delta_cap, copia los n_copy primeros, salta n_del y deja n_add libres antes del resto. No toca el tamaño.
+void _ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9__grow_byEmmmmmm(String* self, size_t old_cap,
+                                                                                    size_t delta_cap, size_t old_sz,
+                                                                                    size_t n_copy, size_t n_del,
+                                                                                    size_t n_add) {
+    const size_t want = std::max(old_cap + delta_cap, 2 * old_cap);
+    const size_t alloc = (std::max(want, kShortMax + 1) + 16) & ~size_t{15};
+    char* old = self->chars();
+    auto* d = static_cast<char*>(nnsdk::host().game_new(alloc));
+    if (n_copy) memcpy(d, old, n_copy);
+    const size_t rest = old_sz - n_del - n_copy;
+    if (rest) memcpy(d + n_copy + n_add, old + n_copy + n_del, rest);
+    if (self->is_long()) nnsdk::host().game_delete(old);
+    self->l.cap = alloc | 1;
+    self->l.data = d;
+}
+
+// size_type find(char c, size_type pos) const
+size_t _ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm(const String* self, char c,
+                                                                               size_t pos) {
+    const size_t len = self->length();
+    if (pos >= len) return ~size_t{0};
+    const void* hit = memchr(self->chars() + pos, c, len - pos);
+    return hit ? static_cast<const char*>(hit) - self->chars() : ~size_t{0};
+}
+
+// size_type rfind(char c, size_type pos) const
+size_t _ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5rfindEcm(const String* self, char c,
+                                                                                size_t pos) {
+    const size_t len = self->length();
+    if (!len) return ~size_t{0};
+    for (size_t k = std::min(pos, len - 1) + 1; k-- > 0;)
+        if (self->chars()[k] == c) return k;
+    return ~size_t{0};
+}
+
+// size_type rfind(const char* s, size_type pos, size_type n) const
+size_t _ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5rfindEPKcmm(const String* self, const char* s,
+                                                                                   size_t pos, size_t n) {
+    const size_t len = self->length();
+    if (n > len) return ~size_t{0};
+    for (size_t k = std::min(pos, len - n) + 1; k-- > 0;)
+        if (memcmp(self->chars() + k, s, n) == 0) return k;
+    return ~size_t{0};
 }
 
 // int compare(size_type pos, size_type n1, const char* s, size_type n2) const
@@ -296,6 +386,11 @@ void _ZNKSt3__121__basic_string_commonILb1EE20__throw_length_errorEv() { fail("b
 void _ZNKSt3__121__basic_string_commonILb1EE20__throw_out_of_rangeEv() { fail("basic_string: out_of_range"); }
 void _ZNKSt3__120__vector_base_commonILb1EE20__throw_length_errorEv() { fail("vector: length_error"); }
 void _ZNKSt3__120__vector_base_commonILb1EE20__throw_out_of_rangeEv() { fail("vector: out_of_range"); }
+// std::system_error (mutex/thread que fallan en libc++): en la consola acabaría en terminate igual.
+void _ZNSt3__120__throw_system_errorEiPKc(int ev, const char* what) {
+    printf("[libc++] system_error %d: %s\n", ev, what ? what : "");
+    fail("system_error");
+}
 
 // to_string: printf en la locale "C", como libc++.
 String _ZNSt3__19to_stringEi(int v) { return from_number("%d", v); }
@@ -346,8 +441,37 @@ void* _ZNSt3__15alignEmmRPvRm(size_t alignment, size_t size, void** ptr, size_t*
     return *ptr;
 }
 
-// operator new(size_t, const nothrow_t&): con el operator new del juego, para que su delete lo libere.
-void* _ZnwmRKSt9nothrow_t(size_t size, const void*) { return nnsdk::host().game_new(size); }
+// ¿La llamada viene de esta librería? Los dos operadores de abajo no están en std::__1: tienen el mismo nombre que los
+// de la libc++ del NDK enlazada aquí dentro, y al exportarlos para el juego también se los queda nuestro propio código.
+// std::stable_sort pide su búfer temporal con new(nothrow) y lo suelta con el operator delete de la libc++ (free): con
+// más de 128 elementos el búfer salía de la memoria del juego y free abortaba ("Scudo ERROR: corrupted chunk header").
+// Pasó en el primer combate de Final Fantasy Resonance, al traducir un shader con 129 lecturas de textura o más
+// (TexturePass ordena sus instrucciones con stable_sort); lo mismo en el validador de SPIRV-Tools y en lsfg/dll.cpp.
+extern "C" {
+extern const char __ehdr_start[] __attribute__((visibility("hidden")));  // los pone el enlazador: principio y final
+extern const char _end[] __attribute__((visibility("hidden")));          // de libnnsdk.so en memoria
+}
+static inline bool from_runtime(const void* caller) {
+    const auto pc = reinterpret_cast<uintptr_t>(caller);
+    return pc >= reinterpret_cast<uintptr_t>(__ehdr_start) && pc < reinterpret_cast<uintptr_t>(_end);
+}
+// operator new(size_t, const nothrow_t&): con el operator new del juego, para que su delete lo libere. Desde nuestro
+// código, malloc: es lo que libera el operator delete de la libc++ de aquí.
+__attribute__((noinline)) void* _ZnwmRKSt9nothrow_t(size_t size, const void*) {
+    if (from_runtime(__builtin_return_address(0))) {
+        static int logged = 0;  // sin cerrojo: como mucho sale alguna línea de más
+        if (logged < 3 && ++logged)
+            printf("[nnsdk] new(nothrow) de libnnsdk: %zu bytes con malloc (búfer temporal de un stable_sort)\n", size);
+        return malloc(size ? size : 1);
+    }
+    return nnsdk::host().game_new(size);
+}
+// operator delete(void*, align_val_t): el new alineado del juego va a su aligned_alloc (main lo exporta junto a
+// malloc/free), así que se libera con su free. Desde nuestro código, el new alineado es el de la libc++ (posix_memalign).
+__attribute__((noinline)) void _ZdlPvSt11align_val_t(void* p, size_t) {
+    if (from_runtime(__builtin_return_address(0))) return free(p);
+    nnsdk::host().game_free(p);
+}
 
 // chrono: steady_clock en nanosegundos, system_clock en microsegundos (libc++).
 int64_t _ZNSt3__16chrono12steady_clock3nowEv() { return clock_ns(CLOCK_MONOTONIC); }
@@ -364,6 +488,18 @@ void _ZNSt3__111this_thread9sleep_forERKNS_6chrono8durationIxNS_5ratioILl1ELl100
 
 // this_thread::get_id(): basta con que sea distinto de 0 y único por hilo vivo (el juego no crea std::thread).
 pthread_t _ZNSt3__130__libcpp_thread_get_current_idEv() { return pthread_self(); }
+// std::__1::__libcpp_verbose_abort(const char*, ...): lo que llama la libc++ del juego cuando falla una de sus
+// comprobaciones internas. Escribe el motivo y aborta, como la de la consola.
+[[noreturn]] void _ZNSt3__122__libcpp_verbose_abortEPKcz(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    printf("[libc++] abort: ");
+    vprintf(format, args);
+    va_end(args);
+    printf("\n");
+    fflush(stdout);
+    abort();
+}
 
 // call_once: el juego mira en línea si la flag ya es ~0 (hecho) y solo llama aquí si no; 1 = otro hilo la está
 // ejecutando. La función corre sin el mutex, como en libc++. Si lanza, la excepción (del juego) atraviesa este
@@ -406,6 +542,7 @@ unsigned _ZNSt3__113random_deviceclEv(void* self) { return (*static_cast<Mt19937
 void _ZNSt3__15mutex4lockEv(os::MutexType* m) { os::LockMutex(m); }
 void _ZNSt3__15mutex6unlockEv(os::MutexType* m) { os::UnlockMutex(m); }
 void _ZNSt3__15mutexD1Ev(os::MutexType* m) { os::FinalizeMutex(m); }
+bool _ZNSt3__15mutex8try_lockEv(os::MutexType* m) { return os::TryLockMutex(m); }
 
 void _ZNSt3__118condition_variable10notify_oneEv(os::ConditionVariableType* c) { os::SignalConditionVariable(c); }
 void _ZNSt3__118condition_variable10notify_allEv(os::ConditionVariableType* c) { os::BroadcastConditionVariable(c); }
@@ -419,6 +556,9 @@ void _ZNSt3__118condition_variable15__do_timed_waitERNS_11unique_lockINS_5mutexE
     int64_t left = deadline_ns - clock_ns(CLOCK_REALTIME);
     os::TimedWaitConditionVariable(c, lock_mutex(lock), TimeSpan{left > 0 ? left : 0});
 }
+
+// std::sort<float*, less<float>> de la libc++ de Nintendo (Xenoblade 3 la importa sin instanciarla).
+void _ZNSt3__16__sortIRNS_6__lessIffEEPfEEvT0_S5_T_(float* first, float* last, void*) { std::sort(first, last); }
 
 }  // extern "C"
 

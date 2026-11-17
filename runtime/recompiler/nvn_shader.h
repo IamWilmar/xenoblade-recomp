@@ -25,6 +25,10 @@ struct Resource {
     // integer_textures (lecturas con texelFetch solo como enteros, imágenes con formato entero o atómicos) y las de
     // Options::integer_handles (la vista enlazada es entera). Va en la caché de SPIR-V (la palabra de reserva).
     bool is_integer = false;
+    // Textura declarada input attachment (>= 0: el adjunto de color con ese índice del pase): Options::
+    // input_attachment_handles. Su descriptor es VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT. Va en la caché de SPIR-V (en la
+    // misma palabra que is_integer).
+    int8_t input_attachment = -1;
     // Texturas con handle partido (textura | sampler leídos de dos sitios y combinados con OR).
     bool has_secondary = false;
     uint32_t secondary_cbuf_index = 0, secondary_cbuf_offset = 0;
@@ -54,6 +58,11 @@ constexpr uint32_t kBindlessPerStage = 16;  // bindings del set 1 por etapa: eta
 // bytes) y desplazamiento en bytes dentro del buffer de captura. El índice capturado es instancia · vértices + vértice.
 constexpr uint32_t kXfbBank = 0x7e;
 constexpr uint32_t kXfbParams = 0x6e0;
+// Captura desde un geometry shader (Options::xfb_gs_capture): cuántos vértices lleva el buffer está en la GPU (el GS
+// puede emitir 0 o varios por entrada), en un contador de 4 bytes con este banco ficticio (el ejecutor lo enlaza a un
+// VkDrawIndirectCommand suyo: DrawTransformFeedback es un draw indirecto con él). c0[kXfbParams] es entonces la
+// capacidad del buffer en vértices; +4, el stride; +8, 0.
+constexpr uint32_t kXfbCountBank = 0x7f;
 
 struct Translated {
     Stage stage = Stage::Vertex;
@@ -65,8 +74,11 @@ struct Translated {
     uint64_t output_generics = 0;  // atributos genéricos que escribe (para la etapa siguiente)
     uint32_t color_outputs = 0;    // fragment: salidas de color escritas (bit por RT)
     bool has_brx = false;          // tiene un switch (BRX): Eden leyó su tabla de c1
+    bool geometry_passthrough = false;  // geometry shader de paso (copia las salidas del vertex shader)
+    bool layer_cull = false;       // variante de tanda de capas que recorta lo de fuera (Options::layer_chunk_cull)
     bool has_bindless_set = false; // tiene arrays de texturas en el set 1 (kBindlessSet)
     int conditional_barriers = 0;  // barreras de grupo dentro de un if/bucle que se quitaron (ver keep_conditional_barriers)
+    int uniform_barriers = 0;      // las que se dejaron por estar en flujo uniforme (Options::uniform_barriers; no va en la caché)
     uint32_t integer_textures = 0; // texturas declaradas U32 porque el shader las lee como enteros (no va en la caché)
     int shared_to_local = 0;       // accesos a memoria compartida privada de cada invocación pasados a memoria local
                                    // (ver Options::shared_to_local; no va en la caché de SPIR-V: 0 si sale de ella)
@@ -76,6 +88,12 @@ struct Translated {
     uint32_t spirv_opt_us = 0;     // lo que tardó (validar, optimizar, validar y comparar la interfaz)
     uint32_t spirv_opt_from = 0;   // palabras del de Eden
     std::string spirv_opt_error;
+    // Capa escrita por el vertex shader (gl_Layer: Unreal Engine 5 pinta así los cortes de sus texturas 3D, la tabla de
+    // color del tonemapper y los volúmenes de luz de los translúcidos, con un draw instanciado). El Adreno 650 no tiene
+    // VK_EXT_shader_viewport_index_layer, así que Eden la saca por un genérico libre (LayerPass) y aquí va el geometry
+    // shader de paso que la pone (GenerateGeometryPassthrough), para triángulos. Vacío si el shader no escribe la capa.
+    // El ejecutor lo mete en la pipeline cuando no hay geometry shader del juego. Va en la caché de SPIR-V.
+    std::vector<uint32_t> layer_gs;
     std::string error;             // vacío si salió bien
 };
 
@@ -89,9 +107,21 @@ struct Options {
     // La sección de control dice compute (+0x714 == 5). En MH Rise (SDK 11.4) el código de compute empieza sin la
     // cabecera 0x12345679 de NieR: directamente en las instrucciones, en el offset del control (0).
     bool compute_hint = false;
+    // Vertex shader en dos programas (VertexA + VertexB de Maxwell): dónde empieza la cabecera SPH del segundo dentro
+    // del código (de la sección de control, +0x754); 0 = un solo programa. Es lo que emite el glslc del SDK 8 (código de
+    // GPU 1.15: Catherine: Full Body): el primero (SPH con tipo 0, en 0x30) calcula la posición y el segundo (tipo 1) lee
+    // el resto de atributos y escribe los genéricos. La GPU los corre seguidos; aquí se traducen los dos y se unen.
+    uint32_t vertex_b_offset = 0;
     // Eden quita las barreras de grupo (BAR) dentro de control de flujo condicional; con esto se dejan (correcto si el
     // flujo es uniforme en el grupo, como un bucle con el mismo número de vueltas para todos).
     bool keep_conditional_barriers = false;
+    // Sin keep_conditional_barriers: se dejan las barreras condicionales que se demuestra que todo el grupo alcanza a la
+    // vez (condiciones hechas solo de constantes, uniforms, el id del grupo y contadores de bucle: UniformBarrierPass de
+    // Eden) y solo se quitan las demás. El radix sort del GPU sort de Unreal Engine 5 (los índices de partículas de
+    // Niagara) lleva 19 en bucles de vueltas fijas: sin ellas la memoria compartida queda en carrera y cada invocación
+    // lee lo que dejó el dispatch anterior; salía bien mientras nada cambiaba y mal el frame en que cambiaba un contador
+    // (todos los fuegos de la primera calle desaparecían un frame cada segundo). Solo en compute.
+    bool uniform_barriers = true;
     uint32_t workgroup[3] = {1, 1, 1};
     // Bindless de los uniform buffers del juego: arrays con índice dinámico contados hasta el final del cbuf (64 KB), con
     // la máscara y el sampler fijo del handle, y movidos al set 1. Sin esto (<datos>/sin_bindless_arrays al traducir), como
@@ -105,6 +135,21 @@ struct Options {
     // (InputTopology de Eden: puntos 0, líneas 1, líneas con adyacencia 2, triángulos 3, con adyacencia 4).
     uint64_t previous_stores = ~0ull;
     int input_topology = 0;
+    // Geometry que elige la capa (gl_Layer) pintando por tandas (el controlador del Adreno 650 se cae al crear un
+    // framebuffer de más de 16 capas; ver Executor::layer_chunks): la capa que escribe pasa a ser relativa a la primera
+    // de la tanda (layer_chunk_base) y las que caen fuera de sus layer_chunk_size capas van a la siguiente, que es de
+    // descarte. -1: la capa tal cual.
+    int layer_chunk_base = -1;
+    uint32_t layer_chunk_size = 15;
+    // Además de mandarlas a la capa de descarte, las primitivas de fuera de la tanda se recortan enteras: delante de cada
+    // EmitVertex se escribe gl_ClipDistance[0] (1 dentro, -1 fuera). Lo que caía en la capa de descarte se rasterizaba
+    // y se sombreaba igual (cada instancia de la niebla de Xenoblade 3, cinco veces: una en su corte y cuatro para
+    // nada); recortado no llega al pixel shader. La capa no cambia: si el recorte no hiciera nada, queda como sin él.
+    // No se aplica (Translated::layer_cull a false, y el SPIR-V es el de sin recorte) si el shader ya escribe distancias
+    // de recorte o si a algún EmitVertex no se le puede poner la condición de su capa (ver nvn_shader.cpp).
+    bool layer_chunk_cull = false;
+    // Un texelFetch con tipo 1D en la instrucción lee una textura 1D y no un buffer (ver NvnEnvironment::Fetch1DIsBuffer).
+    bool fetch_1d_is_texture = false;
     // Subgrupos del dispositivo (VkPhysicalDeviceSubgroupProperties): tamaño, etapas (bits de
     // VkShaderStageFlagBits) y operaciones (VkSubgroupFeatureFlagBits). Sin nada, no se usan.
     uint32_t subgroup_size = 32, subgroup_stages = 0, subgroup_operations = 0;  // NVN NEAR_IS_MINUS_W: z de [-w,w] a [0,w] (Vulkan)
@@ -146,11 +191,35 @@ struct Options {
     // numérico del adjunto). Xenoblade escribe así el RG32UI de las listas de sondas IBL y el R8UI del stencil a media
     // resolución (e300cd99). Lo pone program.cpp (integer_variant) con lo que tiene enlazado el draw. 0: vec4 (como antes).
     uint32_t unsigned_color_targets = 0, signed_color_targets = 0;
+    // Vertex shader: transform feedback emulado aunque tenga control de flujo o escriba la posición (la variante de captura
+    // que pide el ejecutor con una captura activa; ver add_xfb_capture). false: solo los de captura evidentes.
+    bool xfb_capture_always = false;
+    // Geometry shader: transform feedback de lo que emite (add_xfb_capture_gs). Cada EmitVertex del stream 0 reserva un
+    // hueco con un atómico en el contador (kXfbCountBank) y escribe ahí las componentes genéricas que el shader tenga
+    // puestas, seguidas y en el orden de los atributos (como el del vertex shader). Las partículas de Xenoblade 3 se
+    // simulan así: un GS (no de paso) que mata las que acaban (no las emite) y crea las nuevas desde un punto.
+    bool xfb_gs_capture = false;
+    // Vertex shader: atributos enteros del draw (bit k: el genérico k), con el tipo de su formato. uint/sint: entrada
+    // uvec4/ivec4 y los bits tal cual al registro (OpBitcast), que es lo que da Maxwell con un formato _UINT/_SINT;
+    // uscaled/sscaled (los *32_UI2F/_I2F de NVN, que van como UINT/SINT): entrada entera convertida a float en el shader.
+    // Vulkan pide que el tipo de la entrada coincida con el formato numérico del atributo; Eden las declara todas vec4 y
+    // con un formato entero lo que llega es indefinido: el Adreno da los bits, pero MoltenVK convierte (3 → 3.0f) y los
+    // índices de huesos del skinning de Xenoblade 3 (RGBA8UI) salían basura: personajes invisibles en el emulador. Lo pone
+    // program.cpp (vertex_input_variant) con los formatos del draw. 0: vec4 (como antes).
+    uint32_t uint_vertex_inputs = 0, sint_vertex_inputs = 0, uscaled_vertex_inputs = 0, sscaled_vertex_inputs = 0;
     // Texturas e imágenes que se declaran enteras (usampler/uimage) por la dirección de su handle (banco, offset), además
     // de las que deduce integer_textures del propio código: las que el draw tiene enlazadas con una vista entera (stencil
     // de un depth-stencil, R8UI…). Leer una vista entera con un sampler float es indefinido en Vulkan y en el Adreno da 0
     // (commit 9aa6cb0). Vacío: como siempre.
     std::vector<std::pair<uint32_t, uint32_t>> integer_handles;
+    // Pixel shader: texturas (por la dirección de su handle) que son un adjunto de color del pase que el draw está
+    // escribiendo y que el shader lee en su propio píxel (mezcla programable de NVN: el juego pone una barrera
+    // ORDER_FRAGMENTS_TILED antes). Se declaran input attachment con ese índice y cada muestreo es un subpassLoad: el
+    // ejecutor las enlaza al pase (misma subpasada, con autodependencia) en vez de cortar el pase y copiarlas.
+    struct InputAttachment {
+        uint32_t cbuf_index, cbuf_offset, attachment;
+    };
+    std::vector<InputAttachment> input_attachment_handles;
     // Imágenes (SULD/SUST/SUATOM) con formato entero en la instrucción o con atómicos: declaradas uimage. Sin esto
     // (<datos>/sin_imagenes_enteras al traducir) un R32UI se declaraba OpTypeImage %float … R32ui (no válido en Vulkan:
     // VUID-StandaloneSpirv-Image-04965) y los atómicos ni se traducían.

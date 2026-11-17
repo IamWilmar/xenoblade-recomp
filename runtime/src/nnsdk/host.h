@@ -15,6 +15,12 @@ struct NnsdkInput {
     // soltado, para que un toque más corto que un frame no se pierda entre dos lecturas del juego.
     std::atomic<uint64_t> latched{0};
     std::atomic<int64_t> latched_until_ns{0};
+    // En el otro sentido: la vibración que pide el juego (nn::hid::SendVibrationValue), ya reducida al único motor de
+    // la consola (0 parado, 1..255 la amplitud del vibrador de Android). La escribe nn::hid y la aplica el loader, que
+    // es quien tiene la actividad de Java (el vibrador no tiene API nativa). rumble_serial sube con cada cambio: el
+    // hilo del loader duerme en él con futex.
+    std::atomic<uint32_t> rumble{0};
+    std::atomic<uint32_t> rumble_serial{0};
     // La pantalla táctil, para el panel del HUD (nvn/hud.cpp): el último toque de un dedo. Dónde se posó y por dónde va
     // (o dónde se levantó), en píxeles de la ventana: x en los 32 bits bajos, y en los altos. touch_state: 1 posado,
     // 0 levantado, 2 cancelado. touch_serial sube al posarse cada toque nuevo, después de escribir lo demás.
@@ -40,6 +46,7 @@ struct NnsdkHost {
     void (*game_free)(void*);
     void* (*game_new)(size_t);    // operator new del juego (_Znwm)
     void (*game_delete)(void*);   // operator delete del juego (_ZdlPv)
+    void* (*game_aligned_alloc)(size_t, size_t);  // aligned_alloc del juego (puede faltar)
     // Se llama al principio de cada hilo que crea nn::os.
     void (*thread_start)();
     // La plantilla del TLS del juego (thread_local), de __nnmusl_init_dso: ver loader/tls.h.
@@ -57,6 +64,10 @@ struct NnsdkHost {
     // Dónde quedó main (base y tamaño): para leer y tocar datos del juego por su offset (ver window.cpp, MaxFps).
     const uint8_t* main_base;
     size_t main_size;
+    // nn::ro: carga un NRO desde su imagen (relocado contra main y libnnsdk, con sus constructores corridos) y
+    // busca sus exports. nullptr / 0 si falla.
+    void* (*load_nro)(const void* image, size_t size);
+    uint64_t (*nro_symbol)(const void* module, const char* name);
 };
 
 extern "C" void nnsdk_attach(const NnsdkHost* host);

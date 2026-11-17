@@ -65,6 +65,7 @@ Result StartDetection(const DeviceHandle&) { return kResultNfcDeviceNotFound; }
 Result StopDetection(const DeviceHandle&) { return kResultNfcDeviceNotFound; }
 Result Mount(const DeviceHandle&, ModelType) { return kResultNfcDeviceNotFound; }
 Result Mount(const DeviceHandle&, ModelType, MountTarget) { return kResultNfcDeviceNotFound; }
+Result Unmount(const DeviceHandle&) { return kResultNfcDeviceNotFound; }
 Result Flush(const DeviceHandle&) { return kResultNfcDeviceNotFound; }
 Result Restore(const DeviceHandle&) { return kResultNfcDeviceNotFound; }
 Result GetTagInfo(TagInfo*, const DeviceHandle&) { return kResultNfcDeviceNotFound; }

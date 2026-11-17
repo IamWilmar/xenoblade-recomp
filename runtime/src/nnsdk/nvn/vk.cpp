@@ -92,7 +92,7 @@ void probe_limits(VkContext& c) {
 
 bool create(VkContext& c) {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    app.pApplicationName = "MH Rise port";
+    app.pApplicationName = "Xenoblade 3 port";
     app.apiVersion = VK_API_VERSION_1_1;
     const char* instance_ext[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME};
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};

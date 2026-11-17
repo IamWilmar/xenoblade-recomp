@@ -59,6 +59,21 @@ int main(int argc, char** argv) {
     nvnshader::Options options;
     std::string ir;
     if (getenv("IR")) options.ir = &ir;  // IR=1 shadertool …: imprime el IR de Eden
+    // PROFUNDIDAD=1: la profundidad de -1..1 pasada a 0..1 al final del vertex shader, como en la Flip con Xenoblade
+    // (program.cpp: convert_depth_mode con g_depth_mode 0).
+    options.convert_depth_mode = getenv("PROFUNDIDAD") != nullptr;
+    // XFB=1: la variante de captura del vertex shader (xfb_variant); XFB_GS=1: la del geometry shader (xfb_gs_variant).
+    options.xfb_capture_always = getenv("XFB") != nullptr;
+    options.xfb_gs_capture = getenv("XFB_GS") != nullptr;
+    // SUBPASS="banco:offset:adjunto,…": esas texturas como input attachment (feedback_variant), p. ej. "2:48:0,2:56:2".
+    if (const char* list = getenv("SUBPASS")) {
+        unsigned bank = 0, offset = 0, attachment = 0;
+        int used = 0;
+        for (const char* q = list; std::sscanf(q, "%u:%u:%u%n", &bank, &offset, &attachment, &used) == 3; q += used + (q[used] == ',')) {
+            options.input_attachment_handles.push_back({bank, offset, attachment});
+            if (!q[used]) break;
+        }
+    }
     // Como en la Flip: arrays bindless al set 1 y NonUniform (el Adreno 650 lo tiene). SIN_BINDLESS=1 / SIN_NONUNIFORM=1:
     // como antes / sin la decoración.
     options.bindless_arrays = !getenv("SIN_BINDLESS");
@@ -66,6 +81,8 @@ int main(int argc, char** argv) {
     // CON_BARRERA=1: deja las barreras de grupo dentro de ifs y bucles, como program.cpp con las huellas de
     // kUniformBarrierShaders o de <datos>/con_barrera (para comparar y validar ese SPIR-V).
     options.keep_conditional_barriers = getenv("CON_BARRERA") != nullptr;
+    // SIN_BARRERAS_UNIFORMES=1: como antes, todas las barreras condicionales fuera (también las de flujo uniforme).
+    options.uniform_barriers = getenv("SIN_BARRERAS_UNIFORMES") == nullptr;
     // SIN_COMPARTIDA_PRIVADA=1: la memoria compartida privada de cada invocación se queda en Workgroup (como antes).
     options.shared_to_local = !getenv("SIN_COMPARTIDA_PRIVADA");
     // QUALCOMM=1: los arreglos que program.cpp pone con el driver de Qualcomm (vendorID 0x5143): OpReturn en vez de
@@ -86,6 +103,22 @@ int main(int argc, char** argv) {
             if (std::sscanf(p, "%u:%x", &bank, &offset) == 2) options.integer_handles.push_back({bank, offset});
         }
     options.integer_images = getenv("SIN_IMAGENES_ENTERAS") == nullptr;
+    // GENERICOS=<máscara>: los atributos genéricos que escribe la etapa anterior (Options::previous_stores), como la
+    // variante de program.cpp (generics_variant) de un pixel shader que lee genéricos que su vertex no escribe: solo
+    // declara las entradas que le llegan y las demás las lee a cero. TOPOLOGIA=<n>: la primitiva de entrada de un geometry
+    // shader (InputTopology de Eden: puntos 0, líneas 1, triángulos 3), la de geometry_variant según el draw.
+    if (const char* mask = getenv("GENERICOS")) options.previous_stores = std::strtoull(mask, nullptr, 0);
+    if (const char* topology = getenv("TOPOLOGIA")) options.input_topology = std::atoi(topology);
+    // SUBGRUPOS=<tamaño>:<etapas>:<operaciones>: los subgrupos del dispositivo, lo que program.cpp saca de
+    // VkPhysicalDeviceSubgroupProperties. La Flip (Adreno 650) es SUBGRUPOS=64:0x20:0x3f: solo en compute y sin quads.
+    if (const char* subgroups = getenv("SUBGRUPOS")) {
+        int size = 0, stages = 0, operations = 0;
+        if (std::sscanf(subgroups, "%i:%i:%i", &size, &stages, &operations) == 3) {
+            options.subgroup_size = static_cast<uint32_t>(size);
+            options.subgroup_stages = static_cast<uint32_t>(stages);
+            options.subgroup_operations = static_cast<uint32_t>(operations);
+        }
+    }
     // SPIRV_OPT=1: el SPIR-V de los compute por el optimizador, como program.cpp (spirv_opt_stages); SPIRV_OPT=todas: de
     // todas las etapas.
     if (const char* opt = getenv("SPIRV_OPT"))
@@ -107,9 +140,21 @@ int main(int argc, char** argv) {
             uint32_t stage = 0;  // como program.cpp: +0x714 == 5 es compute (MH Rise no lleva la cabecera 0x12345679)
             std::memcpy(&stage, &ctrl[0x714], 4);
             options.compute_hint = stage == 5;
+            // Vertex shader en dos programas (como program.cpp, vertex_b_offset): +0x748 y +0x754 son sus programas.
+            uint32_t first = 0, second = 0, second_size = 0;
+            std::memcpy(&first, &ctrl[0x748], 4);
+            std::memcpy(&second, &ctrl[0x754], 4);
+            if (ctrl.size() >= 0x75c) std::memcpy(&second_size, &ctrl[0x758], 4);
+            if (stage == 0 && first == 0x30 && second > first && second_size) {
+                options.vertex_b_offset = second;
+                options.constants = nullptr;  // entre +0x700 y +0x704 está el segundo programa, no constantes
+                options.constants_size = 0;
+            }
             std::memcpy(&options.compute_code_offset, &ctrl[0x708], 4);
-            std::memcpy(options.workgroup, &ctrl[0x748], 12);
-            std::memcpy(&options.shared_memory, &ctrl[0x754], 4);
+            if (!options.vertex_b_offset) {
+                std::memcpy(options.workgroup, &ctrl[0x748], 12);
+                std::memcpy(&options.shared_memory, &ctrl[0x754], 4);
+            }
             for (uint32_t& w : options.workgroup) w = w ? w : 1;
         }
     }
@@ -144,10 +189,38 @@ int main(int argc, char** argv) {
                                            "] desplazamientos " + std::to_string(r.shift_left) + "/" + std::to_string(r.secondary_shift_left)).c_str()
                                         : "");
     }
+    // AUDITORIA=1: lo que el texto de arriba no dice y tools/shader_audit.py necesita (una línea por dato, clave=valor):
+    // los genéricos que escribe (los de la etapa siguiente: GENERICOS), si tiene un switch (BRX), los bytes que lee de
+    // cada banco de constantes y, de cada recurso, su clase, su tipo de textura (Shader::TextureType), de dónde sale su
+    // handle (y el del sampler, si va aparte: banco2/offset2) y sus marcas.
+    if (getenv("AUDITORIA")) {
+        std::printf("auditoria: etapa=%s palabras=%zu entradas=0x%llx salidas=0x%llx colores=0x%x brx=%d barreras=%d "
+                    "enteras=%u cbufs=0x%x bindless=%d compartida_a_local=%d barreras_uniformes=%d\n",
+                    nvnshader::stage_name(t.stage), t.spirv.size(), static_cast<unsigned long long>(t.input_generics),
+                    static_cast<unsigned long long>(t.output_generics), t.color_outputs, t.has_brx,
+                    t.conditional_barriers, t.integer_textures, t.constant_buffer_mask, t.has_bindless_set,
+                    t.shared_to_local, t.uniform_barriers);
+        std::printf("leido:");
+        for (unsigned k = 0; k < 18; k++)
+            if (t.constant_buffer_used[k]) std::printf(" c%u=%u", k, t.constant_buffer_used[k]);
+        std::printf("\n");
+        for (const auto& r : t.resources)
+            std::printf("recurso: clase=%s set=%u binding=%u banco=%u offset=0x%x tipo=%u cuenta=%u sombra=%d entera=%d "
+                        "escrita=%d banco2=%d offset2=0x%x\n",
+                        kKinds[r.kind], r.set, r.binding, r.cbuf_index, r.cbuf_offset, r.texture_type, r.count,
+                        r.is_depth, r.is_integer, r.is_written, r.has_secondary ? static_cast<int>(r.secondary_cbuf_index) : -1,
+                        r.has_secondary ? r.secondary_cbuf_offset : 0);
+    }
     if (!ir.empty()) std::printf("%s\n", ir.c_str());
     if (argc > 2) {
         std::ofstream out(argv[2], std::ios::binary);
         out.write(reinterpret_cast<const char*>(t.spirv.data()), t.spirv.size() * sizeof(uint32_t));
+        if (!t.layer_gs.empty()) {  // el geometry shader de paso de un vertex shader que escribe la capa
+            const std::string path = std::string(argv[2]) + ".capa.spv";
+            std::ofstream gs(path, std::ios::binary);
+            gs.write(reinterpret_cast<const char*>(t.layer_gs.data()), t.layer_gs.size() * sizeof(uint32_t));
+            std::printf("  escribe la capa: geometry shader de paso en %s (%zu palabras)\n", path.c_str(), t.layer_gs.size());
+        }
     }
     return 0;
 }

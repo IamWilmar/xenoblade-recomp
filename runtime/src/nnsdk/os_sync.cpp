@@ -11,6 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <climits>
 #include <cstdint>
@@ -198,4 +199,64 @@ bool TimedWaitLightEvent(LightEventType* event, TimeSpan timeout) {
     return ok;
 }
 
+struct ThreadType;
+ThreadType* GetCurrentThread();
+
+// BusyMutex (SDK 12, Xenoblade 3): un spinlock del sistema (el juego reserva 0x20 bytes por objeto,
+// main+0x1240ea8). Aquí: palabra de estado en +0 (0 libre, 1 tomado) y el hilo dueño en +8; espera con futex en vez de
+// girar para no gastar un núcleo grande si el dueño se duerme.
+struct BusyMutexType {
+    std::atomic<uint32_t> state;
+    uint32_t pad;
+    const void* owner;
+};
+static_assert(sizeof(BusyMutexType) <= 0x20);
+void InitializeBusyMutex(BusyMutexType* m) {
+    m->state.store(0, std::memory_order_relaxed);
+    m->owner = nullptr;
+}
+void FinalizeBusyMutex(BusyMutexType*) {}
+bool TryLockBusyMutex(BusyMutexType* m) {
+    uint32_t libre = 0;
+    if (!m->state.compare_exchange_strong(libre, 1, std::memory_order_acquire)) return false;
+    m->owner = GetCurrentThread();
+    return true;
+}
+void LockBusyMutex(BusyMutexType* m) {
+    for (int vuelta = 0;; vuelta++) {
+        uint32_t libre = 0;
+        if (m->state.compare_exchange_weak(libre, 1, std::memory_order_acquire)) break;
+        if (vuelta < 64) continue;
+        syscall(SYS_futex, reinterpret_cast<uint32_t*>(&m->state), FUTEX_WAIT_PRIVATE, 1, nullptr, nullptr, 0);
+    }
+    m->owner = GetCurrentThread();
+}
+void UnlockBusyMutex(BusyMutexType* m) {
+    m->owner = nullptr;
+    m->state.store(0, std::memory_order_release);
+    syscall(SYS_futex, reinterpret_cast<uint32_t*>(&m->state), FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+}
+
 }  // namespace nn::os
+
+// La sección crítica interna del SDK (la que va dentro de SdkMutex y de las cabeceras en línea): un entero con el
+// dueño, igual que la de SdkMutexType. El código en línea de Unity la construye y la usa directamente.
+namespace nn::os::detail {
+
+class InternalCriticalSectionImplByHorizon {
+public:
+    InternalCriticalSectionImplByHorizon();
+    void Initialize();
+    void Enter();
+    void Leave();
+
+private:
+    uint32_t cs_;
+};
+
+InternalCriticalSectionImplByHorizon::InternalCriticalSectionImplByHorizon() : cs_(0) {}
+void InternalCriticalSectionImplByHorizon::Initialize() { __atomic_store_n(&cs_, 0, __ATOMIC_RELEASE); }
+void InternalCriticalSectionImplByHorizon::Enter() { cs_enter(&cs_); }
+void InternalCriticalSectionImplByHorizon::Leave() { cs_leave(&cs_); }
+
+}  // namespace nn::os::detail

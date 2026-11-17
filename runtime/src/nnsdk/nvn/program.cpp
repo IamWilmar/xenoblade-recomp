@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -58,10 +59,15 @@ std::atomic<int64_t> g_opt_us{0};
 // El hilo de la precarga (prefetch_loop): sus fallos no se cuentan ni se vuelcan (el código pudo cambiar o liberarse entre
 // SetShaders y la traducción; el ejecutor lo vuelve a intentar al enlazarlo).
 thread_local bool t_prefetch = false;
+// Traducción aplazada (ensure_translated): con t_defer, translate_stage no traduce un compute de la lista de aplazables
+// que no esté en la caché de SPIR-V; lo dice en t_deferred y lo hace un hilo aparte (deferred_loop).
+thread_local bool t_defer = false, t_deferred = false;
+thread_local bool t_defer_graphics = false;  // ...y también las etapas gráficas (sus draws van a pases recurrentes)
+bool deferrable(uint64_t print);
 
 // Cambia si cambia lo que entra en la clave de la caché (translation_key) o cómo se usa lo traducido.
 // 2: Options::optimize_stages (spirv-opt).
-constexpr uint32_t kKeyVersion = 5;  // 3: gl_FragDepth sin convertir de DepthMode; 4: texturas enteras (Xenoblade); 5: transform feedback emulado
+constexpr uint32_t kKeyVersion = 18;  // 18: GS de paso marcado (Translated::geometry_passthrough) y variante de captura de transform feedback (Xenoblade 3); 17: vertex shader en dos programas, VertexA + VertexB (glslc del SDK 8, Catherine: Full Body); 15: barreras condicionales en flujo uniforme, dentro (UniformBarrierPass; eden-zzzzzzzzz-barreras-uniformes.patch); 13: los image buffers llevan is_written e is_integer (texel buffers en el ejecutor); 12: Unreal Engine 5 (imágenes atómicas enteras, PRMT, IMUL32I, handles en memoria local; eden-zzzzzzz-unreal-engine-5.patch); 11: 11: la consulta de tamaño (TXQ) usa el descriptor de quien muestrea la misma textura (eden-zzzzzz-txq-comparte-descriptor.patch); 10: QuadBroadcast/QuadSwap sin subgrupos en la etapa = valor propio (eden-zzzzz-quad-sin-subgrupos.patch); 9: FSWZADD 0xD7 con operando U32 y sus usos sin QuadBroadcast por carril de gl_FragCoord (Castlevania); 3: gl_FragDepth sin convertir de DepthMode; 4: texturas enteras (Xenoblade); 5: transform feedback emulado; 6: derivadas gruesas (QuadBroadcast de FSWZADD 0xD7) como OpDPdx/yCoarse; 7: sin VariablePointersStorageBuffer en shaders sin storage buffers (eden-zzz-cas-solo-con-ssbo.patch); 8: F2I con abs en el bit 49 y neg en el 45 (eden-zzzz-f2i-abs-neg.patch)
 
 // <datos>/spirv.bin: se empieza a leer con el primer programa del juego, bastante antes de su primer draw.
 // <datos>/sin_cache_spirv al arrancar: sin fichero (y, en vivo, sin buscar ni guardar: se traduce todo como antes).
@@ -112,7 +118,31 @@ size_t code_bound(uint64_t address) {
 // 824 de 1700 etapas no salieron de ella). Lo que el traductor lee acaba ahí: con todo lo de detrás cambiado al azar, los
 // 680 shaders volcados salen iguales (comprobado en el Mac con el traductor de este commit). 0 si no se sabe (sin sección
 // de control).
+// Vertex shader en dos programas (VertexA + VertexB; nvnshader::Options::vertex_b_offset): la sección de control de un
+// vertex shader (+0x714 == 0) lista sus programas en +0x748 {cabecera SPH, tamaño, registros} y +0x754 (el segundo). Con
+// uno solo el segundo va a ceros. Así salen los 1234 vertex shader de Catherine: Full Body (glslc del SDK 8): +0x700 es
+// el final del primer trozo de código y +0x704 el del segundo; no llevan constantes (c1).
+// Devuelve dónde empieza la cabecera del segundo programa, o 0.
+uint32_t vertex_b_offset(const void* control) {
+    if (!control) return 0;
+    const auto* c = static_cast<const uint8_t*>(control);
+    uint32_t stage, first, second, second_size, total;
+    memcpy(&stage, c + 0x714, 4);
+    memcpy(&first, c + 0x748, 4);
+    memcpy(&second, c + 0x754, 4);
+    memcpy(&second_size, c + 0x758, 4);
+    memcpy(&total, c + 0x704, 4);
+    const bool dual = stage == 0 && first == nvnshader::kNvnHeaderSize && second > first && second_size &&
+                      second + second_size <= total && total <= 0x100000;
+    return dual ? second : 0;
+}
+
 size_t code_length(const nvn::ProgramStage& stage) {
+    if (stage.control && vertex_b_offset(stage.control)) {  // los dos programas: hasta el final del segundo
+        uint32_t total = 0;
+        memcpy(&total, static_cast<const uint8_t*>(stage.control) + 0x704, 4);
+        return total;
+    }
     if (stage.constants > stage.code) return static_cast<size_t>(stage.constants - stage.code);
     if (!stage.control) return 0;
     uint32_t begin = 0;
@@ -236,6 +266,7 @@ bool translation_key(const nvn::ProgramStage& stage, size_t bound, const nvnshad
     h.u32(o.convert_depth_mode);
     h.u32(o.compute_code_offset);
     h.u32(o.compute_hint);
+    h.u32(o.vertex_b_offset);
     for (uint32_t w : o.workgroup) h.u32(w);
     h.u32(o.shared_memory);
     h.u32(o.local_memory);
@@ -243,12 +274,16 @@ bool translation_key(const nvn::ProgramStage& stage, size_t bound, const nvnshad
     h.u32(o.nonuniform_indexing);
     h.u64(o.previous_stores);
     h.u32(static_cast<uint32_t>(o.input_topology));
+    // layer_chunk_cull en el bit 30: sin él la clave es la de siempre (lo ya guardado sigue valiendo).
+    h.u32(static_cast<uint32_t>(o.layer_chunk_base + 1) | o.layer_chunk_size << 16 | (o.layer_chunk_cull ? 1u << 30 : 0u) |
+          (o.fetch_1d_is_texture ? 1u << 31 : 0u));
     h.u32(o.subgroup_size);
     h.u32(o.subgroup_stages);
     h.u32(o.subgroup_operations);
     h.u32(o.broken_subgroup_shuffle);
     h.u32(o.broken_unreachable);
     h.u32(o.shared_to_local);
+    h.u32(o.uniform_barriers);
     h.u32(o.optimize_stages);
     h.u32(o.constants ? o.constants_size : ~0u);
     if (o.constants) h.bytes(o.constants, o.constants_size);
@@ -257,6 +292,16 @@ bool translation_key(const nvn::ProgramStage& stage, size_t bound, const nvnshad
     h.u32(no_discard && *no_discard);
     // La variante de logic_or_variant (OR emulado): solo si la hay, así las claves de siempre no cambian (la caché sigue).
     if (o.logic_or_targets) h.u32(0x4c4f5200u | o.logic_or_targets);
+    if (o.xfb_capture_always) h.u32(0x58464241u);  // la variante de captura (xfb_variant): solo si lo es
+    if (o.xfb_gs_capture) h.u32(0x58474300u);       // la del geometry shader (xfb_gs_variant)
+    // La de entradas de vértice enteras (vertex_input_variant): solo si lo es.
+    if (o.uint_vertex_inputs || o.sint_vertex_inputs || o.uscaled_vertex_inputs || o.sscaled_vertex_inputs) {
+        h.u32(0x56494e00u);
+        h.u32(o.uint_vertex_inputs);
+        h.u32(o.sint_vertex_inputs);
+        h.u32(o.uscaled_vertex_inputs);
+        h.u32(o.sscaled_vertex_inputs);
+    }
     // La variante entera (integer_variant) y <datos>/sin_imagenes_enteras: solo si las hay (las claves de siempre igual).
     if (o.unsigned_color_targets || o.signed_color_targets || !o.integer_handles.empty()) {
         h.u32(0x494e5400u);
@@ -266,13 +311,20 @@ bool translation_key(const nvn::ProgramStage& stage, size_t bound, const nvnshad
         for (const auto& [bank, offset] : o.integer_handles) h.u32(bank), h.u32(offset);
     }
     if (!o.integer_images) h.u32(0x494d4700u);
+    // La de adjuntos leídos en su píxel (feedback_variant): solo si los hay.
+    if (!o.input_attachment_handles.empty()) {
+        h.u32(0x53554250u);
+        h.u32(static_cast<uint32_t>(o.input_attachment_handles.size()));
+        for (const auto& a : o.input_attachment_handles) h.u32(a.cbuf_index), h.u32(a.cbuf_offset), h.u32(a.attachment);
+    }
     key = h.key();
     return true;
 }
 
 // bound: hasta dónde se puede leer el código; 0, el final de su memory pool (la precarga traduce una copia suya).
 bool translate_stage(nvn::ProgramStage& out, uint64_t previous_stores = ~0ull, int input_topology = 0, size_t bound = 0) {
-    if (!bound) bound = code_bound(out.code);
+    if (previous_stores == ~0ull) previous_stores = out.previous_stores;  // las variantes de una generics_variant
+    if (!bound) bound = out.code_size ? out.code_size : code_bound(out.code);
     if (!bound) {
         if (!t_prefetch) NVN_LOG("shader en 0x%llx fuera de cualquier memory pool\n", static_cast<unsigned long long>(out.code));
         return false;
@@ -289,6 +341,11 @@ bool translate_stage(nvn::ProgramStage& out, uint64_t previous_stores = ~0ull, i
         uint32_t stage = 0;
         memcpy(&stage, control + 0x714, 4);
         options.compute_hint = stage == 5;
+        options.vertex_b_offset = vertex_b_offset(control);
+        if (options.vertex_b_offset) {  // en un vertex shader esos campos son sus programas, no el workgroup
+            for (uint32_t& w : options.workgroup) w = 1;
+            options.shared_memory = 0;
+        }
     }
     // c1 (constantes tras el código): Eden lee de ahí las tablas de salto de los BRX (switch del shader). En los shaders
     // gráficos sí: sin ellas los casos no se traducen y el valor del switch queda con basura (la piel mojada de 2B y 9S,
@@ -307,16 +364,33 @@ bool translate_stage(nvn::ProgramStage& out, uint64_t previous_stores = ~0ull, i
         std::lock_guard lock(g_prints_mutex);
         g_prints.insert(print);
     }
+    // DEPURACIÓN: <datos>/volcar_huellas (una huella por línea, al arrancar): su código a <datos>/shaders/huella_<huella>
+    // al traducirse, sin esperar a una traza (para shadertool: los geometry shaders no llegan a dibujar en el emulador).
+    if (listed_in("volcar_huellas", print)) {
+        char name[48];
+        snprintf(name, sizeof name, "huella_%016llx", static_cast<unsigned long long>(print));
+        dump_code(out.code, name);
+        if (out.control) dump_code(reinterpret_cast<uint64_t>(out.control), std::string(name) + "_ctrl");
+    }
     if (out.constants && (!compute || c1_allowed(print))) {
         options.constants = reinterpret_cast<const uint8_t*>(out.constants);
         options.constants_size = out.constants_size;
     }
     options.previous_stores = previous_stores;
     options.input_topology = input_topology;
+    options.layer_chunk_base = out.layer_chunk_base;
+    options.layer_chunk_cull = out.layer_chunk_cull;
     options.logic_or_targets = out.logic_or_targets;  // logic_or_variant (0 en las etapas del juego)
     options.unsigned_color_targets = out.unsigned_color_targets;  // integer_variant (0 y vacío en las del juego)
     options.signed_color_targets = out.signed_color_targets;
     options.integer_handles = out.integer_handles;
+    options.input_attachment_handles = out.input_attachments;  // feedback_variant (vacío en las del juego)
+    options.xfb_capture_always = out.xfb_capture_always;  // xfb_variant (false en las del juego)
+    options.xfb_gs_capture = out.xfb_gs_capture;          // xfb_gs_variant (false en las del juego)
+    options.uint_vertex_inputs = out.uint_vertex_inputs;  // vertex_input_variant (0 en las del juego)
+    options.sint_vertex_inputs = out.sint_vertex_inputs;
+    options.uscaled_vertex_inputs = out.uscaled_vertex_inputs;
+    options.sscaled_vertex_inputs = out.sscaled_vertex_inputs;
     // Imágenes con formato entero en la instrucción o con atómicos, declaradas uimage (nvnshader::Options::integer_images):
     // el R32UI de las sondas IBL se declaraba float y los 35 pixel shaders con imageAtomicOr de shd_lgt.wishp no validaban.
     // <datos>/sin_imagenes_enteras al traducir (al arrancar): como antes.
@@ -341,6 +415,9 @@ bool translate_stage(nvn::ProgramStage& out, uint64_t previous_stores = ~0ull, i
     // (793657b4f1e65631) salía NaN en el Adreno con esos stores a Workgroup en los casos de su switch.
     // <datos>/sin_compartida_privada al traducir (al arrancar): se queda en Workgroup, como antes.
     options.shared_to_local = !NVN_FLAG("sin_compartida_privada");
+    // Barreras de grupo en bucles e ifs uniformes: se dejan (nvnshader::Options::uniform_barriers). <datos>/
+    // sin_barreras_uniformes al traducir (al arrancar): como antes, todas las condicionales fuera.
+    options.uniform_barriers = !NVN_FLAG("sin_barreras_uniformes");
     // spirv-opt (spirv_opt_stages). <datos>/sin_spirv_opt_huellas: sin él para esas huellas (una por línea), para aislar
     // un shader que salga mal.
     options.optimize_stages = spirv_opt_stages();
@@ -359,6 +436,11 @@ bool translate_stage(nvn::ProgramStage& out, uint64_t previous_stores = ~0ull, i
     const bool stripped_cacheable = cacheable && keep && translation_key(out, bound, options, false, stripped_key);
     const bool cached = cacheable && nvn::spirv_cache::global().find(key, out.shader);
     if (cached) out.cache_key = key;  // el precalentado de pipelines la apunta
+    if (!cached && t_defer && cacheable &&  // en segundo plano (ensure_translated)
+        ((compute || options.compute_hint) ? deferrable(print) : t_defer_graphics)) {
+        t_deferred = true;
+        return false;
+    }
     nvnshader::Translated stripped;
     bool have_stripped = false, barriers_kept = cached;
     bool ok = cached;
@@ -370,6 +452,9 @@ bool translate_stage(nvn::ProgramStage& out, uint64_t previous_stores = ~0ull, i
         if (ok && out.shader.shared_to_local)
             NVN_LOG("shader %016llx (%s): memoria compartida privada de cada invocación a memoria local (%d accesos)\n",
                     static_cast<unsigned long long>(print), nvnshader::stage_name(out.shader.stage), out.shader.shared_to_local);
+        if (ok && out.shader.uniform_barriers)
+            NVN_LOG("shader %016llx (%s): %d barreras en flujo condicional uniforme, se dejan\n",
+                    static_cast<unsigned long long>(print), nvnshader::stage_name(out.shader.stage), out.shader.uniform_barriers);
         if (ok && out.shader.conditional_barriers) {
             NVN_LOG("shader %016llx (%s): %d barreras en flujo condicional, %s%s%s\n", static_cast<unsigned long long>(print),
                     nvnshader::stage_name(out.shader.stage), out.shader.conditional_barriers, keep ? "se dejan" : "quitadas",
@@ -415,7 +500,8 @@ bool translate_stage(nvn::ProgramStage& out, uint64_t previous_stores = ~0ull, i
     // shader para cualquier cara. Ahora lo hace spirv_opt_stages en la Flip con todos los compute (sale el mismo módulo);
     // si hay fichero, gana el fichero. <datos>/sin_reemplazo_spirv al arrancar: el traducido de siempre.
     const bool variant = out.logic_or_targets || out.unsigned_color_targets || out.signed_color_targets ||
-                         !out.integer_handles.empty();
+                         !out.integer_handles.empty() || !out.input_attachments.empty() || out.xfb_capture_always || out.xfb_gs_capture || out.uint_vertex_inputs ||
+                         out.sint_vertex_inputs || out.uscaled_vertex_inputs || out.sscaled_vertex_inputs;
     if (ok && !NVN_FLAG("sin_reemplazo_spirv") && !variant) {  // el reemplazo es de la etapa del juego
         const char* data = getenv("NIER_DATA");
         char file[96];
@@ -528,6 +614,7 @@ void set_stage_constants(nvn::ProgramStage& stage) {
     uint32_t begin, end;
     memcpy(&begin, control + 0x700, 4);
     memcpy(&end, control + 0x704, 4);
+    if (vertex_b_offset(control)) return;  // entre +0x700 y +0x704 está el segundo programa, no constantes
     if (end > begin && end - begin <= 0x10000) {
         stage.constants = stage.code + begin;
         stage.constants_size = end - begin;
@@ -609,8 +696,8 @@ bool known_stage(const Snapshot& s) {
     if (s.code.size() < nvnshader::kNvnHeaderSize + 4) return false;
     uint32_t common0 = 0;
     memcpy(&common0, s.code.data() + nvnshader::kNvnHeaderSize, 4);
-    const uint32_t type = common0 >> 10 & 0xF;  // SPH: 1 vertex, 2/3 teselación, 4 geometry, 5 pixel
-    return type == 1 || type == 4 || type == 5;
+    const uint32_t type = common0 >> 10 & 0xF;  // SPH: 0 VertexA, 1 vertex, 2/3 teselación, 4 geometry, 5 pixel
+    return type == 1 || type == 4 || type == 5 || (type == 0 && vertex_b_offset(s.control.data()));
 }
 std::mutex g_prefetch_mutex;
 std::condition_variable g_prefetch_cv;
@@ -678,13 +765,248 @@ void prefetch(uint64_t code, const void* control) {
     g_prefetch_cv.notify_one();
 }
 
+// --- La sección de control se copia al fijar los shaders ---
+// NVN consume la sección de control dentro de nvnProgramSetShaders, y el juego puede soltar la suya nada más volver.
+// Unity lo hace. Su creador de programas (main+0x94ede8: reserva el objeto de 0x270 bytes y llama a su constructor,
+// main+0x98b484) recibe el blob de la variante de su llamador (x3: un dynamic_array<UInt8>, datos en +0 y tamaño en
+// +0x10). La sección de control de cada etapa está en blob + 0x60 + offset[i] (main+0x98b6fc: add x24, x24, x20). Si
+// esa dirección no es múltiplo de 8 (main+0x98b700: tst x24, #0x7) hace una copia alineada que guarda en el programa
+// (main+0x98b55c..0x98b5a0, en this+0x48+8·etapa; la libera su destructor, main+0x98be78); si lo es, le pasa a NVN el
+// puntero AL BLOB tal cual (main+0x98b70c: str x24, [sp, #0x30]; main+0x98b69c lo mete en el NVNshaderData;
+// main+0x98b784: nvnProgramSetShaders). Nunca la copia para que dure: el blob es memoria del llamador, y al primer
+// BindProgram (snapshot_program) puede ser ya otra cosa; antes de esa copia lo era casi siempre.
+// Evidencia en la consola:
+// - Los volcados de las 11:58 (work/pares): el código, idéntico al del romfs; de 9, ninguna sección de control es la
+//   suya (8 ni empiezan por 0x98761234).
+// - Ya con la copia al enlazar siguen saliendo huellas que no son de ningún shader y sí el FNV-1a de un PREFIJO de uno
+//   (tools/shader_audit.py las tiene todas): af63f54c86021707 es el del byte 0x78 solo (control+0x700 leído como 1),
+//   08f12207b58d9ea3 el de "78 56" (como 2), 0000000000000000 (como 0 o como más de 1 MB). expl_puerta.log (20:37),
+//   draw 37055: pixel 8b287aa5176ca7a7 = los primeros 0x400 bytes de e9c94fc350a8c718 (FO/Tape, cuyas constantes van
+//   de 0x800 a 0x900): se dibujó con el c1 sacado de en medio de sus instrucciones.
+// - "shader 0 no se pudo traducir: Invalid insn 0x0" (exp_sin_solapar, exp_sincrono, expl_puerta): el código se copia
+//   hasta control+0x700 + 4 KB, y con un +0x700 de 1 se queda corto.
+// Con la longitud mal la etapa pierde sus constantes (c1: las leen 1728 de los 2223 códigos del juego) o usa otras, y
+// va a la caché de SPIR-V con otra clave.
+// Se copian por contenido los kControlBytes que se leen (todo está en +0x700..+0x754): sin lo de detrás (un hash de
+// cada shader en +0x7d0) los 2223 códigos del juego dan 1355 secciones distintas, 2,5 MB si se llegaran a usar todas.
+// <datos>/sin_copia_control: como antes (el puntero del juego).
+const void* keep_control(const void* control) {
+    if (!control || NVN_FLAG("sin_copia_control")) return control;
+    using Copy = std::array<uint8_t, kControlBytes>;
+    Copy copy;
+    uint32_t magic = 0;
+    if (safe_copy(copy.data(), control, copy.size()) == copy.size()) memcpy(&magic, copy.data(), 4);
+    if (magic != 0x98761234u) {  // no es una sección de control (o no se puede leer entera): como antes
+        static std::atomic<int> logged{0};
+        if (nvn::first_times(logged, 8))
+            NVN_LOG("nvnProgramSetShaders: en %p no hay una sección de control (empieza por 0x%08x); se deja el puntero\n",
+                    control, magic);
+        return control;
+    }
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (uint8_t b : copy) h = (h ^ b) * 0x100000001b3ULL;
+    static std::mutex m;
+    static std::unordered_multimap<uint64_t, std::unique_ptr<Copy>> kept;  // nunca se liberan: las variantes apuntan a ellas
+    std::lock_guard lock(m);
+    const auto [first, last] = kept.equal_range(h);
+    for (auto it = first; it != last; ++it)
+        if (*it->second == copy) return it->second->data();
+    return kept.emplace(h, std::make_unique<Copy>(copy))->second->data();
+}
+
+// Al primer BindProgram de una etapa: ¿sigue en su sitio la sección de control que dio el juego? Cuenta las que ya no
+// (las que antes se leían mal) y lo dice en el log, con la huella buena para ponerle nombre (tools/shader_audit.py).
+void note_stale_control(const nvn::ProgramStage& s) {
+    if (!s.game_control || s.game_control == s.control) return;
+    static std::atomic<int> checked{0}, stale{0};
+    uint8_t now[kControlBytes] = {};
+    const bool readable = safe_copy(now, s.game_control, sizeof now) == sizeof now;
+    const int n = ++checked;
+    if (readable && !memcmp(now, s.control, sizeof now)) return;
+    const int bad = ++stale;
+    if (bad > 8 && (bad & (bad - 1))) return;  // las 8 primeras y luego 16, 32, 64…
+    uint32_t begin_now = 0, begin = 0;
+    memcpy(&begin_now, now + 0x700, 4);
+    memcpy(&begin, static_cast<const uint8_t*>(s.control) + 0x700, 4);
+    nvn::ProgramStage probe;
+    probe.code = s.code;
+    probe.control = s.control;
+    NVN_LOG("sección de control ya reutilizada por el juego al enlazar el programa: shader %016llx, en su sitio hay ahora "
+            "+0x700 = 0x%x (%s; el suyo es 0x%x). Van %d de %d etapas enlazadas; se usa la copia de nvnProgramSetShaders\n",
+            static_cast<unsigned long long>(code_print(probe, code_bound(s.code))), begin_now,
+            readable ? "legible" : "ya ni se puede leer", begin, bad, n);
+}
+
 }  // namespace
 
-bool nvn::ensure_translated(ProgramStage& stage) {
+// Al grabar un BindProgram (en el hilo del juego, con el código ya escrito y antes de que el juego pueda reutilizar su
+// memoria), una copia del código, sus constantes y la sección de control de cada etapa aún sin copiar ni traducir. Las
+// copias no se liberan: las variantes (estáticas) apuntan a ellas y son pocas decenas de MB en toda una partida.
+void nvn::snapshot_program(Program& program) {
+    static std::mutex m;
+    static std::deque<Snapshot> kept;
+    std::lock_guard lock(m);
+    for (ProgramStage& s : program.stages) {
+        if (s.code_size || s.tried || !s.code || !s.control) continue;
+        note_stale_control(s);
+        Snapshot snap;
+        if (!take_snapshot(s.code, s.control, snap)) continue;
+        kept.push_back(std::move(snap));
+        Snapshot& k = kept.back();
+        s.code = reinterpret_cast<uint64_t>(k.code.data());
+        s.control = k.control.data();
+        s.code_size = k.code.size();
+    }
+}
+
+// Compute aplazables: las simulaciones de Niagara (Unreal Engine 5), que corren en cada frame. La primera vez que sale un
+// efecto el juego crea su shader justo antes de usarlo, y traducirlo (spirv-opt, ~90 ms) y que el driver compile su
+// pipeline (30-85 ms) se hacía en NvnSubmit con el frame parado: en el primer combate de Final Fantasy Resonance, con las
+// cachés en frío, 4-21 pipelines y 8-42 traducciones por cada 10 s, frames de 400-670 ms cada vez que atacaba un enemigo.
+// La precarga de SetShaders no llega a tiempo. Ahora, si el compute está en <datos>/computes_aplazables (huellas, una por
+// línea: las saca tools/aplazables.py de la auditoría de shaders) y no está en la caché de SPIR-V, NvnSubmit no lo
+// traduce: lo hace uno de dos hilos con una copia del código, deja la pipeline en la caché del driver, y mientras tanto
+// la etapa no se enlaza (sus dispatch no se hacen: el efecto empieza unos frames tarde la primera vez). Solo esas: un
+// compute que corre una sola vez no se puede saltar. Sin el fichero, o con <datos>/sin_aplazar (en vivo), como antes.
+namespace {
+struct DeferredJob {
+    uint64_t id = 0;
+    Snapshot code;
+};
+std::mutex g_deferred_mutex;
+std::condition_variable g_deferred_cv;
+std::deque<DeferredJob> g_deferred_queue;
+std::unordered_set<uint64_t> g_deferred_pending;  // encoladas o traduciéndose (por huella del código)
+// Las que el hilo ya acabó, bien o mal: no se vuelven a aplazar. Si su traducción no quedó en la caché (falló, o la caché
+// está llena), la siguiente vez se hace en NvnSubmit como siempre; sin esto se encolarían una y otra vez y la etapa no se
+// enlazaría nunca.
+std::unordered_set<uint64_t> g_deferred_finished;
+std::atomic<uint64_t> g_deferred_done{0}, g_deferred_ns{0}, g_deferred_graphics{0};
+
+const std::unordered_set<uint64_t>& deferrable_prints() {
+    static const std::unordered_set<uint64_t> prints = [] {
+        std::unordered_set<uint64_t> out;
+        const char* data = getenv("NIER_DATA");
+        if (FILE* f = fopen((std::string(data ? data : ".") + "/computes_aplazables").c_str(), "r")) {
+            char line[64];
+            while (fgets(line, sizeof line, f))
+                if (const uint64_t v = strtoull(line, nullptr, 16)) out.insert(v);
+            fclose(f);
+        }
+        NVN_LOG("compute aplazables: %zu huellas%s\n", out.size(), out.empty() ? " (sin <datos>/computes_aplazables: nada se aplaza)" : "");
+        return out;
+    }();
+    return prints;
+}
+
+void deferred_loop(int index) {
+    pthread_setname_np(pthread_self(), index ? "ShadersFondo1" : "ShadersFondo0");
+    setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 5);  // por debajo de los hilos del juego, sin fijar núcleos
+    t_prefetch = true;
+    for (;;) {
+        DeferredJob job;
+        {
+            std::unique_lock lock(g_deferred_mutex);
+            g_deferred_cv.wait(lock, [] { return !g_deferred_queue.empty(); });
+            job = std::move(g_deferred_queue.front());
+            g_deferred_queue.pop_front();
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        {
+            nvn::ProgramStage stage;
+            stage.code = reinterpret_cast<uint64_t>(job.code.code.data());
+            stage.control = job.code.control.data();
+            set_stage_constants(stage);
+            if (translate_stage(stage, ~0ull, 0, job.code.code.size())) {
+                // La pipeline de un compute, a la caché del driver; las gráficas las crea luego su propio hilo (executor.cpp).
+                if (stage.shader.stage == nvnshader::Stage::Compute) nvn::prefetch_compute_pipeline(stage);
+                else g_deferred_graphics.fetch_add(1, std::memory_order_relaxed);
+            }
+            const VkDevice device = nvn::vk()->device;
+            if (stage.module) vkDestroyShaderModule(device, stage.module, nullptr);
+            if (stage.stripped_module) vkDestroyShaderModule(device, stage.stripped_module, nullptr);
+        }
+        g_deferred_ns.fetch_add(
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
+            std::memory_order_relaxed);
+        const uint64_t done = g_deferred_done.fetch_add(1, std::memory_order_relaxed) + 1;
+        size_t left = 0;
+        {
+            std::lock_guard lock(g_deferred_mutex);
+            g_deferred_pending.erase(job.id);
+            if (g_deferred_finished.size() > 200000) g_deferred_finished.clear();
+            g_deferred_finished.insert(job.id);
+            left = g_deferred_pending.size();
+        }
+        if (done <= 10 || done % 100 == 0 || (!left && done % 10 == 0))
+            NVN_LOG("shaders aplazados: %llu traducidos en segundo plano (%llu gráficos; %.0f ms de media), quedan %zu\n",
+                    static_cast<unsigned long long>(done),
+                    static_cast<unsigned long long>(g_deferred_graphics.load(std::memory_order_relaxed)),
+                    g_deferred_ns.load(std::memory_order_relaxed) / 1e6 / static_cast<double>(done), left);
+    }
+}
+bool deferrable(uint64_t print) { return deferrable_prints().count(print) != 0; }
+}  // namespace
+
+// Las etapas gráficas, igual (defer_graphics, <datos>/sin_aplazar_graficos lo quita): traducir cada shader nuevo son
+// 14-25 ms en NvnSubmit, 28-70 por cada 10 s del combate en frío. El ejecutor solo lo pide cuando los targets enlazados se
+// pintan cada frame, y no enlaza ninguna etapa del programa mientras falte alguna (sus draws no se dibujan).
+bool nvn::ensure_translated(ProgramStage& stage, bool defer_graphics) {
     if (!stage.tried) {
-        stage.tried = true;
         set_stage_constants(stage);
+        defer_graphics = defer_graphics && !NVN_FLAG("sin_aplazar_graficos");
+        const bool defer = (defer_graphics || !deferrable_prints().empty()) && !NVN_FLAG("sin_aplazar");
+        // Cada shader aplazado se conoce por su huella (el contenido del código), no por dónde está: el juego reutiliza
+        // direcciones al crear programas. translate_stage la deja en stage.print también cuando aplaza.
+        if (defer && stage.print) {  // ya se intentó: ¿sigue en el hilo? (sin volver a calcular la clave en cada bind)
+            std::lock_guard lock(g_deferred_mutex);
+            if (g_deferred_pending.count(stage.print)) return false;  // la etapa no se enlaza todavía
+        }
+        t_defer = defer, t_defer_graphics = defer && defer_graphics, t_deferred = false;
         translate_stage(stage);
+        t_defer = t_defer_graphics = false;
+        if (t_deferred) {  // no está en la caché y se puede aplazar
+            const uint64_t id = stage.print;
+            bool queued = false, finished = false;
+            {
+                std::lock_guard lock(g_deferred_mutex);
+                finished = g_deferred_finished.count(id) != 0;
+                queued = !finished && g_deferred_pending.count(id) != 0;  // lo pidió otro programa con el mismo shader
+            }
+            if (queued) return false;
+            if (!finished && id) {  // copia del código (el programa puede destruirse) y a la cola
+                DeferredJob job;
+                job.id = id;
+                uint32_t begin = 0, end = 0;
+                if (stage.control) {
+                    memcpy(&begin, static_cast<const uint8_t*>(stage.control) + 0x700, 4);
+                    memcpy(&end, static_cast<const uint8_t*>(stage.control) + 0x704, 4);
+                }
+                // (take_snapshot busca el código en los memory pools del juego; el del programa es ya una copia nuestra)
+                const size_t bound = stage.code_size ? stage.code_size : code_bound(stage.code);
+                const size_t n = std::min<size_t>(size_t{std::max(begin, end)} + 0x1000, bound);
+                if (begin && begin <= 0x100000 && end <= begin + 0x10000 && n >= begin) {
+                    const auto* c = reinterpret_cast<const uint8_t*>(stage.code);
+                    job.code.code.assign(c, c + n);
+                    job.code.control.assign(static_cast<const uint8_t*>(stage.control),
+                                            static_cast<const uint8_t*>(stage.control) + kControlBytes);
+                    static std::once_flag started;
+                    std::call_once(started, [] {
+                        for (int k = 0; k < 2; k++) std::thread(deferred_loop, k).detach();  // viven lo que el proceso
+                    });
+                    {
+                        std::lock_guard lock(g_deferred_mutex);
+                        g_deferred_pending.insert(id);
+                        g_deferred_queue.push_back(std::move(job));
+                    }
+                    g_deferred_cv.notify_one();
+                    return false;
+                }
+            }
+            // Ya pasó por el hilo y no quedó en la caché (falló, o la caché está llena), o no se pudo copiar: aquí.
+            translate_stage(stage);
+        }
+        stage.tried = true;
     }
     return stage.module != VK_NULL_HANDLE;
 }
@@ -699,11 +1021,15 @@ bool nvn::use_stripped_module(const ProgramStage& stage) {
     }
 }
 
-nvn::ProgramStage::Variant nvn::geometry_variant(ProgramStage& stage, uint64_t previous_stores, int input_topology) {
-    const uint64_t key = previous_stores << 3 ^ static_cast<uint64_t>(input_topology);
+nvn::ProgramStage::Variant nvn::geometry_variant(ProgramStage& stage, uint64_t previous_stores, int input_topology,
+                                                 int layer_chunk_base, bool layer_chunk_cull) {
+    const uint64_t key = previous_stores << 3 ^ static_cast<uint64_t>(input_topology) ^
+                         static_cast<uint64_t>(layer_chunk_base + 1) * 0x9E3779B97F4A7C15ull ^
+                         (layer_chunk_cull ? 0xC2B2AE3D27D4EB4Full : 0);
     if (auto it = stage.variants.find(key); it != stage.variants.end()) return it->second;
     ProgramStage variant;
     variant.code = stage.code;
+    variant.code_size = stage.code_size;
     variant.control = stage.control;
     variant.constants = stage.constants;
     variant.constants_size = stage.constants_size;
@@ -711,11 +1037,95 @@ nvn::ProgramStage::Variant nvn::geometry_variant(ProgramStage& stage, uint64_t p
     variant.unsigned_color_targets = stage.unsigned_color_targets;  // y de una entera
     variant.signed_color_targets = stage.signed_color_targets;
     variant.integer_handles = stage.integer_handles;
+    variant.input_attachments = stage.input_attachments;  // y de una de adjuntos leídos en su píxel
+    variant.xfb_gs_capture = stage.xfb_gs_capture;  // y la del GS con captura
+    variant.layer_chunk_base = layer_chunk_base;
+    variant.layer_chunk_cull = layer_chunk_cull;
     ProgramStage::Variant v;
     if (translate_stage(variant, previous_stores, input_topology)) {
         v.module = variant.module;
         v.spirv_id = variant.spirv_id;
         v.cache_key = variant.cache_key;
+        v.layer_cull = variant.shader.layer_cull;
+        // DEPURACIÓN (Disco Elysium, letras): el layout sale de los recursos de la etapa original; si la variante declara
+        // otros (bindings corridos, otro tipo), el Adreno no enlaza ("Bind group info mismatches").
+        const auto& a = stage.shader.resources;
+        const auto& b = variant.shader.resources;
+        bool same = a.size() == b.size();
+        for (size_t k = 0; same && k < a.size(); k++)
+            same = a[k].kind == b[k].kind && a[k].binding == b[k].binding && a[k].cbuf_index == b[k].cbuf_index &&
+                   a[k].cbuf_offset == b[k].cbuf_offset && a[k].texture_type == b[k].texture_type &&
+                   a[k].count == b[k].count && a[k].is_depth == b[k].is_depth && a[k].is_integer == b[k].is_integer;
+        // Los bindings de la variante se renumeran a los de la original (sus recursos son un subconjunto: el optimizador
+        // quita los UBO que solo usaban los genéricos que ahora se leen a cero, y los demás se corrían), en el SPIR-V y en
+        // la lista. Así vale el layout de la original. Sin eso, en Disco Elysium no se dibujaba el texto del menú (el pixel
+        // de TextMeshPro sobre la ventana no enlazaba).
+        if (!same && v.module) {
+            std::unordered_map<uint32_t, uint32_t> remap;
+            bool ok = true;
+            for (const auto& r : b) {
+                const auto it = std::find_if(a.begin(), a.end(), [&](const nvnshader::Resource& o) {
+                    return o.kind == r.kind && o.set == r.set && o.cbuf_index == r.cbuf_index &&
+                           o.cbuf_offset == r.cbuf_offset && o.texture_type == r.texture_type && o.count == r.count &&
+                           o.is_depth == r.is_depth;
+                });
+                if (it == a.end() || r.set != 0) {
+                    ok = ok && r.set != 0 && it != a.end() && it->binding == r.binding;
+                    continue;
+                }
+                remap[r.binding] = it->binding;
+            }
+            std::vector<uint32_t>& spv = variant.shader.spirv;
+            if (ok && spv.size() > 5) {
+                std::unordered_set<uint32_t> other_sets;  // ids con DescriptorSet distinto de 0: no se tocan
+                for (size_t i = 5; i < spv.size();) {
+                    const uint32_t count = spv[i] >> 16, op = spv[i] & 0xFFFF;
+                    if (!count) break;
+                    if (op == 71 && count >= 4 && spv[i + 2] == 34 && spv[i + 3] != 0) other_sets.insert(spv[i + 1]);
+                    i += count;
+                }
+                for (size_t i = 5; i < spv.size();) {
+                    const uint32_t count = spv[i] >> 16, op = spv[i] & 0xFFFF;
+                    if (!count) break;
+                    if (op == 71 && count >= 4 && spv[i + 2] == 33 && !other_sets.count(spv[i + 1]))
+                        if (auto m = remap.find(spv[i + 3]); m != remap.end()) spv[i + 3] = m->second;
+                    i += count;
+                }
+                for (auto& r : variant.shader.resources)
+                    if (auto m = remap.find(r.binding); r.set == 0 && m != remap.end()) r.binding = m->second;
+                VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                info.codeSize = spv.size() * sizeof(uint32_t);
+                info.pCode = spv.data();
+                VkShaderModule fixed = VK_NULL_HANDLE;
+                if (vkCreateShaderModule(nvn::vk()->device, &info, nullptr, &fixed) == VK_SUCCESS) {
+                    vkDestroyShaderModule(nvn::vk()->device, v.module, nullptr);
+                    v.module = fixed;
+                    v.spirv_id = nvn::spirv_identity(variant.shader);
+                    v.cache_key = {};  // su SPIR-V de la caché es el de antes de renumerar: fuera del precalentado
+                    same = true;
+                    static int fixed_logged = 0;
+                    if (nvn::first_times(fixed_logged, 12))
+                        NVN_LOG("variante de %016llx: %zu bindings renumerados a los de la original\n",
+                                static_cast<unsigned long long>(stage.print), remap.size());
+                }
+            }
+        }
+        static int logged = 0;
+        if (!same && nvn::first_times(logged, 12)) {
+            auto list = [](const std::vector<nvnshader::Resource>& rs) {
+                std::string s;
+                char buf[96];
+                for (const auto& r : rs) {
+                    snprintf(buf, sizeof buf, " [%u:k%d c%u+0x%x t%u n%u%s%s]", r.binding, static_cast<int>(r.kind),
+                             r.cbuf_index, r.cbuf_offset, r.texture_type, r.count, r.is_depth ? " d" : "",
+                             r.is_integer ? " i" : "");
+                    s += buf;
+                }
+                return s;
+            };
+            NVN_LOG("variante de %016llx con otros recursos:\n  original%s\n  variante%s\n",
+                    static_cast<unsigned long long>(stage.print), list(a).c_str(), list(b).c_str());
+        }
     }
     return stage.variants[key] = v;
 }
@@ -725,20 +1135,223 @@ const nvn::ProgramStage* nvn::logic_or_variant(const ProgramStage& stage, uint32
     static std::mutex mutex;
     static std::map<std::pair<uint64_t, uint32_t>, std::unique_ptr<ProgramStage>> variants;
     std::lock_guard lock(mutex);
-    std::unique_ptr<ProgramStage>& slot = variants[{stage.print ? stage.print : stage.code, targets}];
+    std::unique_ptr<ProgramStage>& slot =
+        variants[{(stage.print ? stage.print : stage.code) ^ (~stage.previous_stores * 0x9E3779B97F4A7C15ull), targets}];
     if (!slot) {
         slot = std::make_unique<ProgramStage>();
         ProgramStage& v = *slot;
         v.code = stage.code;
+        v.code_size = stage.code_size;
         v.control = stage.control;
         v.constants = stage.constants;
         v.constants_size = stage.constants_size;
+        v.previous_stores = stage.previous_stores;
         v.logic_or_targets = targets;
         v.tried = true;
         const bool ok = translate_stage(v);
         NVN_LOG("pixel %016llx: variante con la operación lógica OR emulada en los render targets 0x%x: %s (%zu recursos, "
                 "%zu los del juego)\n", static_cast<unsigned long long>(stage.print), targets,
                 ok ? "traducida" : v.shader.error.c_str(), v.shader.resources.size(), stage.shader.resources.size());
+    }
+    return slot->module ? slot.get() : nullptr;
+}
+
+const nvn::ProgramStage* nvn::generics_variant(const ProgramStage& stage, uint64_t previous_stores, const ProgramStage* vs) {
+    static std::mutex mutex;
+    static std::map<std::pair<uint64_t, uint64_t>, std::unique_ptr<ProgramStage>> variants;
+    std::lock_guard lock(mutex);
+    std::unique_ptr<ProgramStage>& slot = variants[{stage.print ? stage.print : stage.code, previous_stores}];
+    if (!slot) {
+        slot = std::make_unique<ProgramStage>();
+        ProgramStage& v = *slot;
+        v.code = stage.code;
+        v.code_size = stage.code_size;
+        v.control = stage.control;
+        v.constants = stage.constants;
+        v.constants_size = stage.constants_size;
+        v.previous_stores = previous_stores;
+        v.tried = true;
+        const bool ok = translate_stage(v, previous_stores);
+        static int logged = 0;
+        if (nvn::first_times(logged, 24))
+            NVN_LOG("pixel %016llx: variante con los genéricos 0x%llx (lee 0x%llx; vertex %016llx): %s, %zu recursos (la del "
+                    "juego %zu)\n",
+                    static_cast<unsigned long long>(stage.print), static_cast<unsigned long long>(previous_stores),
+                    static_cast<unsigned long long>(stage.shader.input_generics),
+                    static_cast<unsigned long long>(vs ? vs->print : 0), ok ? "traducida" : v.shader.error.c_str(),
+                    v.shader.resources.size(), stage.shader.resources.size());
+        if (vs && NVN_FLAG("volcar_genericos")) {  // DEPURACIÓN: el par, para estudiarlo con shadertool
+            char name[64];
+            snprintf(name, sizeof name, "par_%016llx_ps", static_cast<unsigned long long>(stage.print));
+            dump_code(stage.code, name);
+            if (stage.control) dump_code(reinterpret_cast<uint64_t>(stage.control), std::string(name) + "_ctrl");
+            snprintf(name, sizeof name, "par_%016llx_vs_%016llx", static_cast<unsigned long long>(stage.print),
+                     static_cast<unsigned long long>(vs->print));
+            dump_code(vs->code, name);
+            if (vs->control) dump_code(reinterpret_cast<uint64_t>(vs->control), std::string(name) + "_ctrl");
+        }
+    }
+    return slot->module ? slot.get() : nullptr;
+}
+
+const nvn::ProgramStage* nvn::xfb_variant(const ProgramStage& stage) {
+    static std::mutex mutex;
+    static std::map<uint64_t, std::unique_ptr<ProgramStage>> variants;
+    std::lock_guard lock(mutex);
+    std::unique_ptr<ProgramStage>& slot = variants[stage.print ? stage.print : stage.code];
+    if (!slot) {
+        slot = std::make_unique<ProgramStage>();
+        ProgramStage& v = *slot;
+        v.code = stage.code;
+        v.code_size = stage.code_size;
+        v.control = stage.control;
+        v.constants = stage.constants;
+        v.constants_size = stage.constants_size;
+        v.previous_stores = stage.previous_stores;
+        v.xfb_capture_always = true;
+        v.tried = true;
+        const bool ok = translate_stage(v);
+        bool has_xfb = false;
+        for (const nvnshader::Resource& r : v.shader.resources)
+            has_xfb |= r.kind == nvnshader::Resource::StorageBuffer && r.cbuf_index == nvnshader::kXfbBank && r.texture_type;
+        NVN_LOG("vertex %016llx: variante de captura (transform feedback): %s\n", static_cast<unsigned long long>(stage.print),
+                !ok ? v.shader.error.c_str() : has_xfb ? "traducida" : "sin genéricos que capturar");
+        if (ok && !has_xfb && v.module) {
+            vkDestroyShaderModule(nvn::vk()->device, v.module, nullptr);
+            v.module = VK_NULL_HANDLE;
+        }
+    }
+    return slot->module ? slot.get() : nullptr;
+}
+
+const nvn::ProgramStage* nvn::xfb_gs_variant(const ProgramStage& stage) {
+    static std::mutex mutex;
+    static std::map<uint64_t, std::unique_ptr<ProgramStage>> variants;
+    std::lock_guard lock(mutex);
+    std::unique_ptr<ProgramStage>& slot = variants[stage.print ? stage.print : stage.code];
+    if (!slot) {
+        slot = std::make_unique<ProgramStage>();
+        ProgramStage& v = *slot;
+        v.code = stage.code;
+        v.code_size = stage.code_size;
+        v.control = stage.control;
+        v.constants = stage.constants;
+        v.constants_size = stage.constants_size;
+        v.previous_stores = stage.previous_stores;
+        v.xfb_gs_capture = true;
+        v.tried = true;
+        const bool ok = translate_stage(v);
+        uint32_t stride = 0;
+        bool counter = false;
+        for (const nvnshader::Resource& r : v.shader.resources) {
+            if (r.kind != nvnshader::Resource::StorageBuffer) continue;
+            if (r.cbuf_index == nvnshader::kXfbBank) stride = r.texture_type;
+            counter |= r.cbuf_index == nvnshader::kXfbCountBank;
+        }
+        NVN_LOG("geometry %016llx: variante de captura (transform feedback, cuenta en la GPU): %s, %u bytes por vértice\n",
+                static_cast<unsigned long long>(stage.print), !ok ? v.shader.error.c_str() : stride && counter ? "traducida" : "sin captura",
+                stride);
+        // Su código, para shadertool (XFB_GS=1): no se puede probar en el emulador (sin geometry shaders).
+        char name[48];
+        snprintf(name, sizeof name, "xfb_gs_%016llx", static_cast<unsigned long long>(stage.print));
+        dump_code(stage.code, name);
+        if (stage.control) dump_code(reinterpret_cast<uint64_t>(stage.control), std::string(name) + "_ctrl");
+        if (ok && !(stride && counter) && v.module) {
+            vkDestroyShaderModule(nvn::vk()->device, v.module, nullptr);
+            v.module = VK_NULL_HANDLE;
+        }
+    }
+    return slot->module ? slot.get() : nullptr;
+}
+
+const nvn::ProgramStage* nvn::vertex_input_variant(const ProgramStage& stage, uint32_t uint_inputs, uint32_t sint_inputs,
+                                                   uint32_t uscaled_inputs, uint32_t sscaled_inputs) {
+    using Key = std::tuple<uint64_t, bool, uint32_t, uint32_t, uint32_t, uint32_t>;
+    static std::mutex mutex;
+    static std::map<Key, std::unique_ptr<ProgramStage>> variants;
+    std::lock_guard lock(mutex);
+    std::unique_ptr<ProgramStage>& slot = variants[{stage.print ? stage.print : stage.code, stage.xfb_capture_always,
+                                                    uint_inputs, sint_inputs, uscaled_inputs, sscaled_inputs}];
+    if (!slot) {
+        slot = std::make_unique<ProgramStage>();
+        ProgramStage& v = *slot;
+        v.code = stage.code;
+        v.code_size = stage.code_size;
+        v.control = stage.control;
+        v.constants = stage.constants;
+        v.constants_size = stage.constants_size;
+        v.previous_stores = stage.previous_stores;
+        v.xfb_capture_always = stage.xfb_capture_always;
+        v.uint_vertex_inputs = uint_inputs;
+        v.sint_vertex_inputs = sint_inputs;
+        v.uscaled_vertex_inputs = uscaled_inputs;
+        v.sscaled_vertex_inputs = sscaled_inputs;
+        v.tried = true;
+        const bool ok = translate_stage(v);
+        bool same = ok && v.shader.resources.size() == stage.shader.resources.size();
+        for (size_t i = 0; same && i < v.shader.resources.size(); i++) {
+            const nvnshader::Resource &a = v.shader.resources[i], &b = stage.shader.resources[i];
+            same = a.kind == b.kind && a.binding == b.binding && a.set == b.set && a.cbuf_index == b.cbuf_index &&
+                   a.cbuf_offset == b.cbuf_offset && a.count == b.count;
+        }
+        NVN_LOG("vertex %016llx: variante de entradas enteras (uint 0x%x int 0x%x uscaled 0x%x sscaled 0x%x%s): %s\n",
+                static_cast<unsigned long long>(stage.print), uint_inputs, sint_inputs, uscaled_inputs, sscaled_inputs,
+                stage.xfb_capture_always ? ", sobre la de captura" : "",
+                !ok ? v.shader.error.c_str() : same ? "traducida" : "otros recursos: no se usa");
+        if (ok && !same && v.module) {
+            vkDestroyShaderModule(nvn::vk()->device, v.module, nullptr);
+            v.module = VK_NULL_HANDLE;
+        }
+    }
+    return slot->module ? slot.get() : nullptr;
+}
+
+const nvn::ProgramStage* nvn::feedback_variant(const ProgramStage& stage,
+                                               const std::vector<nvnshader::Options::InputAttachment>& attachments) {
+    // Por la huella del código (o su dirección), las variantes de partida (genéricos, OR, entera) y la lista.
+    static std::mutex mutex;
+    static std::map<std::string, std::unique_ptr<ProgramStage>> variants;
+    std::string key(reinterpret_cast<const char*>(&stage.spirv_id), sizeof stage.spirv_id);
+    const uint64_t base = stage.print ? stage.print : stage.code;
+    key.append(reinterpret_cast<const char*>(&base), sizeof base);
+    for (const auto& a : attachments) key.append(reinterpret_cast<const char*>(&a), sizeof a);
+    std::lock_guard lock(mutex);
+    std::unique_ptr<ProgramStage>& slot = variants[key];
+    if (!slot) {
+        slot = std::make_unique<ProgramStage>();
+        ProgramStage& v = *slot;
+        v.code = stage.code;
+        v.code_size = stage.code_size;
+        v.control = stage.control;
+        v.constants = stage.constants;
+        v.constants_size = stage.constants_size;
+        v.previous_stores = stage.previous_stores;
+        v.logic_or_targets = stage.logic_or_targets;
+        v.unsigned_color_targets = stage.unsigned_color_targets;
+        v.signed_color_targets = stage.signed_color_targets;
+        v.integer_handles = stage.integer_handles;
+        v.input_attachments = attachments;
+        v.tried = true;
+        const bool ok = translate_stage(v);
+        // El ejecutor enlaza con los recursos de la etapa de partida: los mismos, con esas texturas como input attachment.
+        bool same = ok && v.shader.resources.size() == stage.shader.resources.size();
+        size_t declared = 0;
+        for (size_t i = 0; same && i < v.shader.resources.size(); i++) {
+            const nvnshader::Resource &a = v.shader.resources[i], &b = stage.shader.resources[i];
+            same = a.kind == b.kind && a.binding == b.binding && a.set == b.set && a.cbuf_index == b.cbuf_index &&
+                   a.cbuf_offset == b.cbuf_offset && a.count == b.count;
+            declared += a.input_attachment >= 0;
+        }
+        same = same && declared == attachments.size();
+        static int logged = 0;
+        if (nvn::first_times(logged, 80) || !ok || !same)
+            NVN_LOG("pixel %016llx: variante de adjuntos leídos en su píxel (%zu texturas): %s\n",
+                    static_cast<unsigned long long>(stage.print), attachments.size(),
+                    !ok ? v.shader.error.c_str() : same ? "traducida" : "otros recursos: no se usa");
+        if (ok && !same && v.module) {
+            vkDestroyShaderModule(nvn::vk()->device, v.module, nullptr);
+            v.module = VK_NULL_HANDLE;
+        }
     }
     return slot->module ? slot.get() : nullptr;
 }
@@ -751,17 +1364,21 @@ const nvn::ProgramStage* nvn::integer_variant(const ProgramStage& stage, uint32_
     static std::map<Key, std::unique_ptr<ProgramStage>> variants;
     std::lock_guard lock(mutex);
     std::unique_ptr<ProgramStage>& slot =
-        variants[{stage.print ? stage.print : stage.code, stage.logic_or_targets, uint_targets, sint_targets, textures}];
+        variants[{(stage.print ? stage.print : stage.code) ^ (~stage.previous_stores * 0x9E3779B97F4A7C15ull),
+                  stage.logic_or_targets, uint_targets, sint_targets, textures}];
     if (!slot) {
         slot = std::make_unique<ProgramStage>();
         ProgramStage& v = *slot;
         v.code = stage.code;
+        v.code_size = stage.code_size;
         v.control = stage.control;
         v.constants = stage.constants;
         v.constants_size = stage.constants_size;
+        v.previous_stores = stage.previous_stores;
         v.logic_or_targets = stage.logic_or_targets;
         v.unsigned_color_targets = uint_targets;
         v.signed_color_targets = sint_targets;
+        v.input_attachments = stage.input_attachments;
         for (size_t i = 0; i < stage.shader.resources.size() && i < 64; i++)
             if (textures >> i & 1)
                 v.integer_handles.push_back({stage.shader.resources[i].cbuf_index, stage.shader.resources[i].cbuf_offset});
@@ -828,27 +1445,31 @@ void nvn::dump_stage_code(const ProgramStage& stage, const std::string& name) {
 
 extern "C" {
 
-nvn::Boolean nvnProgramInitialize(void* program, void*) {
-    open_spirv_cache();
-    g_programs.create(program);
-    return 1;
-}
 // El juego puede finalizar un programa con comandos que lo usan aún sin reproducir (Xenoblade DE, Valle de la Espada:
 // BindProgram de un programa ya destruido leído por scan_pass -> fallo de segmentación en 'tried', offset 0x2c), y un
 // pipeline nuevo de un draw pendiente necesitaría sus módulos. Como las texturas (nvnTextureFinalize): el objeto se saca
 // de la tabla y se conserva, módulos incluidos (pocos programas se finalizan: al cambiar de escena).
-void nvnProgramFinalize(void* program) {
-    if (std::unique_ptr<nvn::Program> p = g_programs.take(program)) {
-        static std::mutex m;
-        static std::vector<std::unique_ptr<nvn::Program>> finalized;
-        std::lock_guard lock(m);
-        finalized.push_back(std::move(p));
-        static int logged = 0;
-        if (nvn::first_times(logged, 4))
-            NVN_LOG("programa %p finalizado por el juego: se conserva por si queda grabado (%zu conservados)\n", program,
-                    finalized.size());
-    }
+static void keep_program(void* program, std::unique_ptr<nvn::Program> p, const char* why) {
+    if (!p) return;
+    static std::mutex m;
+    static std::vector<std::unique_ptr<nvn::Program>> finalized;
+    std::lock_guard lock(m);
+    finalized.push_back(std::move(p));
+    static int logged = 0;
+    if (nvn::first_times(logged, 4))
+        NVN_LOG("programa %p %s por el juego: se conserva por si queda grabado (%zu conservados)\n", program, why,
+                finalized.size());
 }
+nvn::Boolean nvnProgramInitialize(void* program, void*) {
+    open_spirv_cache();
+    // Inicializado otra vez sin finalizarlo: el de antes no se borra (g_programs.create lo destruía, con los BindProgram
+    // ya grabados apuntándole). Unity no lo hace (main+0x98b728 y main+0x98bd1c inicializan objetos nuevos y
+    // main+0x98bf70 los finaliza), pero la cola no puede quedarse con un puntero a memoria liberada si algún juego sí.
+    keep_program(program, g_programs.take(program), "reinicializado");
+    g_programs.create(program);
+    return 1;
+}
+void nvnProgramFinalize(void* program) { keep_program(program, g_programs.take(program), "finalizado"); }
 
 nvn::Boolean nvnProgramSetShaders(void* program, int count, const ShaderData* stages) {
     nvn::Program* p = g_programs.get(program);
@@ -859,10 +1480,15 @@ nvn::Boolean nvnProgramSetShaders(void* program, int count, const ShaderData* st
     }
     p->stages.clear();
     p->stages.resize(count);
-    // Solo se apunta la dirección: el juego puede terminar de escribir el código después (NVN lo lee
+    // Del código solo se apunta la dirección: el juego puede terminar de escribirlo después (NVN lo lee
     // al dibujar), así que la etapa es del executor la primera vez que se enlaza; la precarga la deja traducida antes.
-    for (int k = 0; k < count; k++) p->stages[k].code = stages[k].code, p->stages[k].control = stages[k].control;
-    for (int k = 0; k < count; k++) prefetch(stages[k].code, stages[k].control);  // traducidas antes del primer draw
+    // La sección de control se copia ya (keep_control): es ahora cuando NVN la lee, y después puede no estar.
+    for (int k = 0; k < count; k++) {
+        p->stages[k].code = stages[k].code;
+        p->stages[k].game_control = stages[k].control;
+        p->stages[k].control = keep_control(stages[k].control);
+    }
+    for (int k = 0; k < count; k++) prefetch(p->stages[k].code, p->stages[k].control);  // traducidas antes del primer draw
     // Única en toda la ejecución: un Program nuevo puede reutilizar la memoria de otro ya finalizado, y las
     // cachés del ejecutor (pipelines, layouts, sets) van por (ProgramStage*, generación).
     static std::atomic<uint64_t> serial{0};

@@ -18,6 +18,9 @@ namespace {
 
 constexpr int kSlot = 2;          // TLS_SLOT_APP de bionic
 constexpr size_t kTcbSize = 16;   // musl en AArch64: el bloque del módulo va detrás de 16 bytes
+// Bloque de los hilos que existen antes de conocer la plantilla (el principal, antes de DT_INIT). Tiene que caber el
+// TLS entero del juego: el de Unreal Engine 5 pasa de una página (Final Fantasy Resonance: 4121 bytes).
+constexpr size_t kProvisionalSize = 64 << 10;
 
 struct Template {
     const uint8_t* image = nullptr;
@@ -59,7 +62,7 @@ uintptr_t ensure() {
     std::lock_guard lock(g_m);
     // Sin plantilla aún (el hilo principal antes de DT_INIT) se reserva de sobra; set_template la copia luego.
     const size_t align = std::max<size_t>(g_tpl.align, 16);
-    const size_t size = ((g_tpl.known ? g_tpl.offset + g_tpl.total_size : 4096) + align - 1) & ~(align - 1);
+    const size_t size = ((g_tpl.known ? g_tpl.offset + g_tpl.total_size : kProvisionalSize) + align - 1) & ~(align - 1);
     auto* block = static_cast<uint8_t*>(aligned_alloc(align, size));
     memset(block, 0, size);
     fill(block);
@@ -95,7 +98,7 @@ void set_template(const void* image, size_t image_size, size_t total_size, size_
     g_tpl.known = true;
     printf("TLS del juego: %zu bytes (%zu de .tdata), alineado a %zu, en TP+%#zx; %zu hilos ya tenían bloque\n",
            total_size, image_size, align, g_tpl.offset, g_blocks.size());
-    if (g_tpl.offset + total_size > 4096) {
+    if (g_tpl.offset + total_size > kProvisionalSize) {
         printf("[aviso] el TLS del juego no cabe en el bloque provisional de los hilos que ya existían\n");
         return;
     }

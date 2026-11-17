@@ -6,12 +6,18 @@
 #include <dirent.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
 
+#include "nnsdk/os.h"
 #include "nnsdk/rutas.h"
+
+namespace nn::os {
+class SystemEvent;  // su primer miembro es el SystemEventType: misma dirección
+}
 
 namespace {
 
@@ -49,6 +55,19 @@ int ListAddOnContent(int* out, int offset, int count) {
     int written = 0;
     for (int k = offset; out && k >= 0 && k < static_cast<int>(all.size()) && written < count; k++) out[written++] = all[k];
     return written;
+}
+
+// El evento que el sistema señala cuando cambia la lista de DLC (se instala uno con el juego abierto). El sdk le
+// engancha el handle del servicio en modo AutoClear (sdk+0x33230) y deja el SystemEventType como inicializado: el byte
+// de estado de +0x28 a 2 (sdk+0x3471c4), que es lo que mira el destructor del juego para destruirlo
+// (nn::os::SystemEvent::~SystemEvent, main+0x944db4). Aquí las carpetas de <datos>/aoc solo se miran al preguntar, así
+// que el evento existe y no se señala nunca: quien lo sondea (el plugin de Unity, main+0x155aa70) ve "sin cambios".
+// Solo lo pide ese plugin (main+0x155aa60), que en Disco Elysium no tiene llamadores.
+void GetAddOnContentListChangedEvent(os::SystemEvent* event) {
+    constexpr size_t kStateOffset = 0x28;
+    constexpr uint8_t kStateInterProcessEvent = 2;
+    nnsdk::create_system_event(reinterpret_cast<os::SystemEventType*>(event), /*auto_clear=*/true, /*signaled=*/false);
+    reinterpret_cast<uint8_t*>(event)[kStateOffset] = kStateInterProcessEvent;
 }
 
 }  // namespace nn::aoc

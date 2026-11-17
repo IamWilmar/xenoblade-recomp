@@ -3,10 +3,14 @@
 // a ese envío. Adquirir textura de la ventana es rotar.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <mutex>
 
+#include <unistd.h>
+
+#include "nnsdk/runtime.h"
 #include "nnsdk/nvn/commands.h"
 #include "nnsdk/nvn/flags.h"
 #include "nnsdk/nvn/nvn.h"
@@ -50,6 +54,23 @@ constexpr int kWindowAcquireSuccess = 0;
 
 nvn::Objects<Queue> g_queues;
 nvn::Objects<Sync> g_syncs;
+
+// DEPURACIÓN (<datos>/diag_syncs, en vivo): los primeros sucesos de la cola desde que se enciende (envíos, FenceSync,
+// esperas de syncs, presentar y adquirir), con el hilo y el momento, para ver a qué espera el juego en cada frame.
+std::atomic<int> g_diag_left{0};
+bool diag_syncs() {
+    static std::atomic<bool> was{false};
+    const bool on = NVN_FLAG("diag_syncs");
+    if (on != was.exchange(on, std::memory_order_relaxed) && on) g_diag_left.store(1200, std::memory_order_relaxed);
+    return on && g_diag_left.fetch_sub(1, std::memory_order_relaxed) > 0;
+}
+double diag_ms() {
+    static const auto t0 = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+double ms_since(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+}
 
 }  // namespace
 
@@ -116,7 +137,11 @@ void nvnQueueSubmitCommands(void* queue, int count, const uint64_t* handles) {
             lists.push_back(reinterpret_cast<const nvn::CommandList*>(handles[k]));
             capture = capture || lists.back()->cpu_capture;
         }
+    const auto diag_t0 = std::chrono::steady_clock::now();
     nvn::execute(lists);
+    if (diag_syncs())
+        NVN_LOG("[sync] %.2f hilo %d: SubmitCommands -> envío %llu (%zu listas), %.2f ms dentro\n", diag_ms(), gettid(),
+                static_cast<unsigned long long>(nvn::last_submit()), lists.size(), ms_since(diag_t0));
     // Una lista pinta la textura de captura que la CPU leerá de su memoria unos ticks después sin ningún sync (ver
     // CommandList::cpu_capture): la reproducción y la GPU se esperan aquí. Una parada por captura (al guardar la partida).
     // <datos>/captura_sin_espera lo quita.
@@ -136,7 +161,12 @@ void nvnQueueFinish(void*) {
     if (nvn::first_times(logged, 20) || NVN_FLAG("diag_miniatura")) NVN_LOG("nvnQueueFinish (envío %llu)\n", static_cast<unsigned long long>(nvn::last_submit()));
     nvn::wait_idle();
 }
-void nvnQueueFenceSync(void*, void* sync, int, int) { nvn::sync_signal_at(sync, nvn::last_submit()); }
+void nvnQueueFenceSync(void*, void* sync, int, int) {
+    nvn::sync_signal_at(sync, nvn::last_submit());
+    if (diag_syncs())
+        NVN_LOG("[sync] %.2f hilo %d: QueueFenceSync %p -> envío %llu\n", diag_ms(), gettid(), sync,
+                static_cast<unsigned long long>(nvn::last_submit()));
+}
 // Espera de la GPU a un sync: un NVNsync solo lo señala un FenceSync de esta misma cola (no hay más colas ni syncs de
 // otras APIs), así que lo enviado antes ya va antes en el orden. NVN_TRUE: la espera quedó puesta.
 nvn::Boolean nvnQueueWaitSync(void*, const void*) { return 1; }
@@ -150,7 +180,13 @@ void nvnQueuePresentTexture(void*, void* window, int index) {
         nvn::pin_critical_thread();
     }
     nvn::refresh_critical_threads();
+    nvn::note_game_present();  // el número de frame del juego (reproducción en diferido: commands.h)
+    nnsdk::frame_queued();     // y el de nn::vi (ListFrameHistory)
+    const auto diag_t0 = std::chrono::steady_clock::now();
     if (nvn::Window* w = nvn::g_windows.get(window)) nvn::queue_present(*w, index);
+    if (diag_syncs())
+        NVN_LOG("[sync] %.2f hilo %d: PresentTexture índice %d (frame %u del juego), %.2f ms dentro\n", diag_ms(), gettid(), index,
+                nvn::game_frame(), ms_since(diag_t0));
 }
 
 // NVNeventBuilder: dónde vive el valor del evento (pool + offset). Xenoblade lo lee de vuelta con GetMemoryOffset;
@@ -238,10 +274,30 @@ int nvnSyncWait(const void* sync, uint64_t timeout_ns) {
     const bool forced = s->replay_only && nvn::cpu_rt_pending() > 0;
     if (forced && NVN_FLAG("diag_miniatura")) NVN_LOG("nvnSyncWait: espera a la GPU forzada por %d devoluciones pendientes\n", nvn::cpu_rt_pending());
     auto wait = s->replay_only && !forced ? nvn::wait_replayed : nvn::wait_submit;
-    if (wait(submit, 0)) return kSyncAlreadySignaled;
+    const bool diag = diag_syncs();
+    const uint64_t diag_last = diag ? nvn::last_submit() : 0, diag_replayed = diag ? nvn::replayed_ticket() : 0;
+    // Un hilo que espera de verdad (con plazo) a un fence del juego está liberando lo que ese envío usaba: Unreal Engine 5
+    // lo hace en su RHIInterruptThread (main+0x1443c20: SyncWait sin plazo por cada envío y luego suelta sus recursos).
+    // Se apunta para que nvnMemoryPoolFinalize no espere a envíos posteriores (thread_completion_ticket, commands.h).
+    const bool completion = !s->replay_only && timeout_ns != 0;
+    if (wait(submit, 0)) {
+        if (completion) nvn::note_thread_completion(submit);
+        if (diag)
+            NVN_LOG("[sync] %.2f hilo %d: SyncWait %p (%s, envío %llu; último %llu, reproducido %llu) plazo %.1f ms: ya señalado\n",
+                    diag_ms(), gettid(), sync, s->replay_only ? "ventana" : "fence", static_cast<unsigned long long>(submit),
+                    static_cast<unsigned long long>(diag_last), static_cast<unsigned long long>(diag_replayed),
+                    std::min<uint64_t>(timeout_ns, 1ull << 40) / 1e6);
+        return kSyncAlreadySignaled;
+    }
     const auto start = std::chrono::steady_clock::now();
     const bool ok = wait(submit, timeout_ns);
+    if (ok && completion) nvn::note_thread_completion(submit);
     count_wait((std::chrono::steady_clock::now() - start).count(), !ok, timeout_ns);
+    if (diag)
+        NVN_LOG("[sync] %.2f hilo %d: SyncWait %p (%s, envío %llu; último %llu, reproducido %llu) plazo %.1f ms: esperó %.2f ms%s\n",
+                diag_ms(), gettid(), sync, s->replay_only ? "ventana" : "fence", static_cast<unsigned long long>(submit),
+                static_cast<unsigned long long>(diag_last), static_cast<unsigned long long>(diag_replayed),
+                std::min<uint64_t>(timeout_ns, 1ull << 40) / 1e6, ms_since(start), ok ? "" : " y caducó");
     return ok ? kSyncConditionSatisfied : kSyncTimeoutExpired;
 }
 
@@ -274,6 +330,10 @@ int nvnWindowAcquireTexture(void* window, void* sync, int* index) {
         s->submit = nvn::last_submit();
         s->replay_only = true;
     }
+    if (diag_syncs())
+        NVN_LOG("[sync] %.2f hilo %d: AcquireTexture -> índice %d, sync %p envío %llu (último %llu)\n", diag_ms(), gettid(),
+                index ? *index : -1, sync, static_cast<unsigned long long>(sync && g_syncs.get(sync) ? g_syncs.get(sync)->submit : 0),
+                static_cast<unsigned long long>(nvn::last_submit()));
     return r;
 }
 // Como el de la ventana, pero la espera a que la textura esté libre la hace la cola: aquí no hay que esperar (presentar
@@ -317,6 +377,9 @@ void nvn::sync_signal_at(void* sync, uint64_t submit) {
     if (!s) s = &g_syncs.create(sync);
     s->submit = submit;
     s->replay_only = false;
+    if (diag_syncs())
+        NVN_LOG("[sync] %.2f hilo %d: sync %p señalado por el envío %llu\n", diag_ms(), gettid(), sync,
+                static_cast<unsigned long long>(submit));
 }
 
 NVN_PROC(nvnQueueBuilderSetDefaults);

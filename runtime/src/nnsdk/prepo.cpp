@@ -172,4 +172,7 @@ Result PlayReport::Save(const account::Uid&) { return ResultSuccess; }
 Result AddSessionId(PlayReport* report, const char*) { return report->add(); }
 Result RequestImmediateTransmission() { return ResultSuccess; }
 
+// SDK 12 (Xenoblade 3): abre la sesión de informes; aquí no hay servicio de informes.
+void Initialize() {}
+
 }  // namespace nn::prepo

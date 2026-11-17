@@ -13,11 +13,13 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <linux/sockios.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <strings.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -55,6 +57,10 @@ enum class FcntlCommand : int32_t {};
 enum class EventFdFlags : int32_t {};
 enum class ResolverOptionKey : uint32_t {};
 enum class Errno : int32_t {};
+enum class AiErrno : int32_t {};
+enum class NameInfoFlag : int32_t {};
+enum class IoctlCommand : uint32_t {};
+enum class ShutdownMethod : int32_t {};
 
 struct Config;
 struct SockAddr;
@@ -159,7 +165,12 @@ constexpr int kSockNonBlock = 0x20000000, kSockCloExec = 0x10000000;  // bits al
 constexpr int kAiPassive = 0x1, kAiCanonName = 0x2;
 
 // AiErrno de la consola (los de FreeBSD).
-constexpr int kEaiFail = 4, kEaiFamily = 5, kEaiMemory = 6, kEaiNoName = 8, kEaiService = 9;
+constexpr int kEaiFail = 4, kEaiFamily = 5, kEaiMemory = 6, kEaiNoName = 8, kEaiService = 9, kEaiOverflow = 14;
+// NameInfoFlag (los NI_* de FreeBSD): sin resolver solo cambian algo el de "host en cifras" y el de "nombre o nada".
+constexpr int kNiNumericHost = 0x2, kNiNameReqd = 0x4;
+// IoctlCommand (los de FreeBSD, con el largo del argumento en los bits 16-28): los que el SDK deja pasar sobre un
+// socket. El resto de su lista son de interfaces de red (grupo 'i') y de BPF (sdk+0x391e40).
+constexpr uint32_t kFionSpace = 0x40046676, kFionWrite = 0x40046677, kFionRead = 0x4004667f, kSiocAtMark = 0x40047307;
 
 int fail(int err) {
     errno = err;
@@ -588,7 +599,7 @@ void free_addrinfo(Info* info) {
 }
 
 // Como en la consola, el resultado vive en un buffer del hilo hasta la siguiente llamada.
-HostEnt* host_by_name(const char* name) {
+HostEnt* host_entry(const char* name, uint32_t addr) {
     struct Entry {
         HostEnt h;
         char name[256];
@@ -597,8 +608,6 @@ HostEnt* host_by_name(const char* name) {
         InAddr* list[2];
     };
     static thread_local Entry e;
-    uint32_t addr;
-    if (!resolve_local(name, &addr)) return nullptr;
     snprintf(e.name, sizeof e.name, "%s", name);
     e.aliases[0] = nullptr;
     e.addr.addr = addr;
@@ -606,6 +615,78 @@ HostEnt* host_by_name(const char* name) {
     e.list[1] = nullptr;
     e.h = {e.name, e.aliases, kAfInet, sizeof(InAddr), e.list};
     return &e.h;
+}
+
+HostEnt* host_by_name(const char* name) {
+    uint32_t addr;
+    return resolve_local(name, &addr) ? host_entry(name, addr) : nullptr;
+}
+
+// El nombre de una dirección: sin resolver solo se sabe el de la propia máquina (127.0.0.0/8 es "localhost"). Con
+// nullptr el il2cpp del juego se queda con la dirección escrita como nombre (main+0x35b544 → main+0x35b644).
+HostEnt* host_by_addr(const void* addr, unsigned len, int family) {
+    if (!addr || family != kAfInet || len < sizeof(uint32_t)) return nullptr;
+    uint32_t a;
+    memcpy(&a, addr, sizeof a);
+    return (ntohl(a) >> 24) == 127 ? host_entry("localhost", a) : nullptr;
+}
+
+// getnameinfo sin resolver ni /etc/services: el puerto siempre en cifras y el host también, salvo la propia máquina.
+// Unity lo llama con host y servicio en cifras (flags 0xa, main+0x370bdc) para escribir "dirección:puerto".
+int do_getnameinfo(const void* addr, unsigned len, char* host, size_t host_size, char* serv, size_t serv_size, int flags) {
+    const auto* sa = static_cast<const BsdSockAddrIn*>(addr);
+    if (!sa || len < 8) return kEaiFail;
+    if (sa->family != kAfInet) return kEaiFamily;
+    if (serv && serv_size && snprintf(serv, serv_size, "%u", ntohs(sa->port)) >= static_cast<int>(serv_size))
+        return kEaiOverflow;
+    if (host && host_size) {
+        char text[INET_ADDRSTRLEN] = "localhost";
+        const bool named = !(flags & kNiNumericHost) && (ntohl(sa->addr) >> 24) == 127;
+        if (!named) {
+            if (flags & kNiNameReqd) return kEaiNoName;
+            const in_addr a{sa->addr};
+            inet_ntop(AF_INET, &a, text, sizeof text);
+        }
+        if (snprintf(host, host_size, "%s", text) >= static_cast<int>(host_size)) return kEaiOverflow;
+    }
+    return 0;
+}
+
+// Las preguntas sobre el propio socket se contestan con las de Linux (el valor es un int en los dos): cuánto hay por
+// leer, cuánto queda por enviar, cuánto cabe aún en el buffer de envío y si se está en la marca de datos urgentes.
+// Como el SDK: sin argumento EINVAL, con un tamaño de más de 32 bits EFAULT, y EINVAL si el argumento que pide el
+// comando no cabe en el tamaño dado o el comando no es de su lista (sdk+0x391c48…0x391ca8).
+int do_ioctl(int fd, uint32_t cmd, void* arg, size_t size) {
+    if (!arg) return fail(EINVAL);
+    if (size >> 32) return fail(EFAULT);
+    if (((cmd >> 16) & 0x1fff) > size) return fail(EINVAL);
+    int value = 0;
+    switch (cmd) {
+        case kFionRead:
+            if (::ioctl(fd, FIONREAD, &value) != 0) return -1;
+            break;
+        case kFionWrite:
+            if (::ioctl(fd, SIOCOUTQ, &value) != 0) return -1;
+            break;
+        case kFionSpace: {
+            int capacity = 0, queued = 0;
+            socklen_t l = sizeof capacity;
+            if (::getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &capacity, &l) != 0 || ::ioctl(fd, SIOCOUTQ, &queued) != 0) return -1;
+            value = std::max(capacity - queued, 0);
+            break;
+        }
+        case kSiocAtMark:
+            if (::ioctl(fd, SIOCATMARK, &value) != 0) return -1;
+            break;
+        default: {
+            static std::atomic<int> logged{0};
+            if (nvn::first_times(logged, 8)) printf("[socket] Ioctl(0x%x): sin equivalente sin red\n", cmd);
+            // Las de interfaz (SIOCGIF*…, grupo 'i') preguntan por una interfaz de red, y aquí no hay ninguna.
+            return fail(((cmd >> 8) & 0xff) == 'i' ? ENXIO : EINVAL);
+        }
+    }
+    memcpy(arg, &value, sizeof value);
+    return 0;
 }
 
 // Claves del resolver que el SDK atiende sin servicio: 10001 da un id de petición nuevo (libcurl y el juego lo usan
@@ -672,10 +753,20 @@ Result Initialize(const Config&) {
     printf("[socket] Initialize: consola sin red (solo 127.0.0.1)\n");
     return ResultSuccess;
 }
+// La forma corta: el sdk arma con ella un Config con sus tamaños de buffer por defecto y sigue por el mismo camino
+// (sdk+0x38d440). La memoria que da el juego era para los buffers de la biblioteca de la consola; aquí los sockets son
+// los del kernel y no se toca. Es la que Unity usa si el proyecto no trae su propia configuración de red
+// (main+0x36e268, con 6 MB por defecto); Disco Elysium arranca por la otra.
+Result Initialize(void*, unsigned long pool_size, unsigned long, int concurrency) {
+    printf("[socket] Initialize (%lu KB, %d hilos): consola sin red (solo 127.0.0.1)\n", pool_size / 1024, concurrency);
+    return ResultSuccess;
+}
 Result Finalize() { return ResultSuccess; }
 
 int GetLastErrno() { return errno; }
 Errno GetLastError() { return static_cast<Errno>(errno); }
+// El errno del hilo, con los números de Linux, es el mismo para el juego y para bionic (sdk+0x38cc10).
+void SetLastError(Errno error) { errno = static_cast<int>(error); }
 
 int Socket(int family, int type, int protocol) { return do_socket(family, type, protocol); }
 int Socket(Family family, Type type, Protocol protocol) {
@@ -690,6 +781,7 @@ int Accept(int fd, sockaddr* addr, unsigned int* len) { return do_accept(fd, add
 int Accept(int fd, SockAddr* addr, unsigned int* len) { return do_accept(fd, addr, len); }
 int Listen(int fd, int backlog) { return ::listen(fd, backlog); }
 int Shutdown(int fd, int how) { return ::shutdown(fd, how); }  // SHUT_RD/WR/RDWR: 0, 1, 2 en los dos
+int Shutdown(int fd, ShutdownMethod how) { return ::shutdown(fd, static_cast<int>(how)); }
 int Close(int fd) { return do_close(fd); }
 
 int GetSockName(int fd, sockaddr* addr, unsigned int* len) { return do_sockname(fd, addr, len, false); }
@@ -698,6 +790,12 @@ int GetPeerName(int fd, sockaddr* addr, unsigned int* len) { return do_sockname(
 
 int GetSockOpt(int fd, int level, int name, void* value, unsigned int* len) {
     return do_getsockopt(fd, level, name, value, len);
+}
+// La de enums, con los mismos números que la vieja: el il2cpp del juego pide el error de un connect con nivel 0xffff
+// y opción 0x1007 (main+0x35c644). El sdk rechaza sin preguntar un valor nulo y un largo nulo o a cero (sdk+0x39033c).
+int GetSockOpt(int fd, Level level, Option name, void* value, unsigned int* len) {
+    if (!value || !len || !*len) return fail(EINVAL);
+    return do_getsockopt(fd, static_cast<int>(level), static_cast<int>(name), value, len);
 }
 int SetSockOpt(int fd, int level, int name, const void* value, unsigned int len) {
     return do_setsockopt(fd, level, name, value, len);
@@ -736,6 +834,19 @@ int Fcntl(int fd, FcntlCommand cmd, ...) {
     va_end(args);
     return do_fcntl(fd, static_cast<int>(cmd), arg);
 }
+// La vieja, con el comando como int: la del socket de depuración de PhysX (F_GETFL y F_SETFL con 0x800 para no
+// bloquear, main+0x147f520).
+int Fcntl(int fd, int cmd, ...) {
+    va_list args;
+    va_start(args, cmd);
+    const int arg = va_arg(args, int);
+    va_end(args);
+    return do_fcntl(fd, cmd, arg);
+}
+
+int Ioctl(int fd, IoctlCommand cmd, void* arg, unsigned long size) {
+    return do_ioctl(fd, static_cast<uint32_t>(cmd), arg, size);
+}
 
 int Poll(pollfd* fds, unsigned long n, int timeout) { return do_poll(fds, n, timeout); }
 int Poll(PollFd* fds, unsigned long n, int timeout) {
@@ -743,6 +854,14 @@ int Poll(PollFd* fds, unsigned long n, int timeout) {
     return do_poll(reinterpret_cast<pollfd*>(fds), n, timeout);
 }
 int Select(int nfds, FdSet* rd, FdSet* wr, FdSet* ex, TimeVal* timeout) { return do_select(nfds, rd, wr, ex, timeout); }
+
+// Las mismas con los tipos de la libc (fd_set de 1024 bits y timeval de dos long, como los de nn::socket).
+int Select(int nfds, fd_set* rd, fd_set* wr, fd_set* ex, timeval* timeout) {
+    static_assert(sizeof(fd_set) == sizeof(FdSet) && sizeof(timeval) == sizeof(TimeVal));
+    return do_select(nfds, reinterpret_cast<FdSet*>(rd), reinterpret_cast<FdSet*>(wr), reinterpret_cast<FdSet*>(ex),
+                     reinterpret_cast<const TimeVal*>(timeout));
+}
+int Ioctl(int fd, unsigned int cmd, void* arg, unsigned long size) { return do_ioctl(fd, cmd, arg, size); }
 
 int EventFd(unsigned long initval, EventFdFlags flags) { return do_eventfd(initval, static_cast<int>(flags)); }
 // Como el SDK: un read/write de 8 bytes; 0 o -1.
@@ -766,6 +885,15 @@ const char* InetNtop(int family, const void* src, char* dst, unsigned int size) 
     }
     return ::inet_ntop(AF_INET, src, dst, size);
 }
+// La de enums, con las comprobaciones del sdk (sdk+0x39ace0): sin origen EINVAL y sin destino ENOSPC, que es también
+// lo que da si la dirección escrita no cabe.
+const char* InetNtop(Family family, const void* src, char* dst, unsigned int size) {
+    if (!src || !dst) {
+        errno = src ? ENOSPC : EINVAL;
+        return nullptr;
+    }
+    return InetNtop(static_cast<uint8_t>(family), src, dst, size);
+}
 int InetPton(int family, const char* src, void* dst) {
     if (family != kAfInet) return fail(EAFNOSUPPORT);
     return ::inet_pton(AF_INET, src, dst);
@@ -787,6 +915,18 @@ void FreeAddrInfo(addrinfo* info) { free_addrinfo(reinterpret_cast<LegacyAddrInf
 void FreeAddrInfo(AddrInfo* info) { free_addrinfo(info); }
 
 HostEnt* GetHostEntByName(const char* name, const ResolverOption*, unsigned long) { return host_by_name(name); }
+// Las dos sin opciones del resolver (el sdk las pasa a las de arriba con nullptr, sdk+0x388c20 y sdk+0x388c60): las
+// del il2cpp del juego para System.Net.Dns (main+0x35b8a8 y main+0x35b540).
+HostEnt* GetHostEntByName(const char* name) { return host_by_name(name); }
+HostEnt* GetHostEntByAddr(const void* addr, unsigned int len, Family family) {
+    return host_by_addr(addr, len, static_cast<uint8_t>(family));
+}
+
+AiErrno GetNameInfo(const SockAddr* addr, unsigned int len, char* host, unsigned long host_size, char* serv,
+                    unsigned long serv_size, NameInfoFlag flags) {
+    return static_cast<AiErrno>(do_getnameinfo(addr, len, host, host_size, serv, serv_size, static_cast<int>(flags)));
+}
+const char* GAIStrError(AiErrno code) { return gai_error(static_cast<int>(code)); }
 
 int ResolverGetOption(ResolverOption* out, ResolverOptionKey key) {
     return resolver_get_option(out, static_cast<uint32_t>(key));
@@ -853,3 +993,27 @@ int nnsocketResolverSetOption(const ResolverOption* opt) { return resolver_set_o
 int nnsocketSysctl(int*, unsigned long, void*, unsigned long*, void*, unsigned long) { return fail(ENOENT); }
 
 }  // extern "C"
+
+namespace nn::socket {
+int GetNameInfo(const sockaddr* addr, unsigned int len, char* host, unsigned int host_size, char* serv,
+                unsigned int serv_size, int flags) {
+    return do_getnameinfo(addr, len, host, host_size, serv, serv_size, flags);
+}
+}  // namespace nn::socket
+
+// SDK 8 (Catherine: Full Body): las conversiones IPv4 de texto, con el InAddr de nn::socket (orden de red) y el
+// in_addr de la libc (mismo layout). InetNtoa devuelve un buffer estático, como inet_ntoa.
+#include <arpa/inet.h>
+namespace nn::socket {
+int InetAton(const char* text, InAddr* out) {
+    in_addr a{};
+    const int ok = inet_aton(text, &a);
+    if (ok && out) out->addr = a.s_addr;
+    return ok;
+}
+char* InetNtoa(in_addr a) {
+    static thread_local char buf[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &a, buf, sizeof buf);
+    return buf;
+}
+}  // namespace nn::socket

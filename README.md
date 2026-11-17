@@ -12,9 +12,15 @@ own ARM64 code runs directly on the device's CPU, while this project reimplement
 
 ## Status
 
-**Version 0.11 — playable.** Colony 9, the main menus and battles run at ~30 fps on the Flip 2 (battles are at the
-GPU limit: occasional dips to ~29). Upscaled to 1080p with AMD FSR 1.
+**Version 0.12 — playable.** Colony 9, the open field, the main menus and battles run at 30 fps on the Flip 2.
+The game's own dynamic resolution renders the 3D between 640×360 and 960×540, and the image is upscaled to 1080p with
+AMD FSR 1 when that fits in the frame, with 16x anisotropic filtering on the textures.
 
+- The graphics layer now draws the game's G-buffer in far fewer GPU passes, which leaves room in the frame: in the
+  prologue battle the GPU needs about 26 ms of the 33 ms budget (it was at the limit before).
+- **TV mode** (settings panel): the game runs its TV profile (1080p interface). Not recommended on the
+  Flip 2: in tests it dropped below 30 fps in battles and the 3D looked softer than in handheld mode. Takes effect the
+  next time the app is opened.
 - Known issues: in some battles a thin green or teal line can flicker across the screen; shadows are as soft as in the
   console's handheld mode (an optional `sombras_2x` file doubles their resolution, at a GPU cost).
 
@@ -77,7 +83,7 @@ may stutter while its shaders are translated and compiled; they are cached for t
   Y on the left. You can change the mode from the quick settings while the game is running. Any other controller, over
   USB or Bluetooth (a DualSense, for example), is read by position too: its bottom button is B.
 - **Settings panel.** Swipe in from the right edge of the screen (the system's back gesture, the one that shows an arrow)
-  and a panel slides out over the game. It has a switch for the FPS counter (your choice is remembered) and *Change
+  and a panel slides out over the game. It has a switch for the FPS counter (your choice is remembered), *TV mode* and *Change
   folder*, which brings the folder screen back the next time you open the app. The same swipe, a tap outside the panel
   or a few seconds without touching it hide it again.
 
@@ -89,6 +95,7 @@ at start-up.
 | Name | Effect |
 |---|---|
 | `lsfg/` | Frame generation (Lossless Scaling's LSFG) to show ~60 fps. Needs **your own** `Lossless.dll` from the Windows app *Lossless Scaling* (sold on Steam), copied into that `lsfg` folder or to `Download/Lossless.dll`. Not included here. |
+| `modo_tv` | TV mode (the same switch as in the settings panel): the game runs its TV profile. Read at start-up. |
 | `sombras_2x` | 1024×1024 shadow cascades instead of the handheld 512×512 (sharper, slower). |
 | `sin_fps` | Hides the FPS counter (the same switch as in the settings panel). |
 | `botones_xbox`, `botones_retro` | Force the face buttons to be read by position (`botones_xbox`) or by name (`botones_retro`) if a controller comes out swapped. |
@@ -152,7 +159,7 @@ CPU y este proyecto reimplementa el SDK de la consola y la API gráfica NVN sobr
   grandes para el juego). Probado en la Flip 2.
 - Los botones quedan donde están en la consola original del juego en los dos modos del mando de la Retroid (Xbox y
   Retro), y cualquier otro mando, por USB o Bluetooth, se lee por posición. Deslizando un dedo desde el borde derecho de
-  la pantalla sale un panel de ajustes, con el interruptor del contador de FPS y el de volver a elegir la
+  la pantalla sale un panel de ajustes, con el interruptor del contador de FPS, el del modo TV y el de volver a elegir la
   carpeta. Con la carpeta ya elegida, la app abre el juego directamente.
 - Proyecto de fans, sin ánimo de lucro, sin relación con el fabricante de la consola ni
   con Monolith Soft.

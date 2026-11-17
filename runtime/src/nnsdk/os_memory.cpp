@@ -60,6 +60,7 @@ constexpr size_t kTotalMemory = 0xCD500000;
 // Lo que Horizon cuenta como usado antes del heap: las imágenes de main (125 MB de código, 72 MB de rodata, 98 MB de
 // data y 4 MB de bss), sdk y subsdk0.
 constexpr size_t kProgramSize = 320 * kMB;
+constexpr size_t kSystemResourceSize = 0x1400000;  // el del main.npdm (os.cpp: memoria de direcciones virtuales)
 
 constexpr uint32_t kResultBusy = 0x803;          // os, 4: la cola del heap no está libre para encoger
 constexpr uint32_t kResultOutOfMemory = 0x1003;  // os, 8
@@ -154,8 +155,10 @@ void QueryMemoryInfo(MemoryInfo* info) {
     int threads = 0;
     nnsdk::thread_totals(&stacks, &threads);
     std::lock_guard lock(g_m);
-    info->total_available_memory_size = kTotalMemory;
-    info->total_used_memory_size = kProgramSize + g_heap_size + stacks;
+    // TotalNonSystemMemorySize: el pool de aplicación menos el system resource del proceso (el de su npdm, 20 MB en
+    // Final Fantasy Resonance). Unreal lo coteja así (main+0x13738): con más, cree estar en un kit de desarrollo.
+    info->total_available_memory_size = kTotalMemory - kSystemResourceSize;
+    info->total_used_memory_size = kProgramSize + g_heap_size + stacks + nnsdk::va_committed();
     info->total_memory_heap_size = g_heap_size;
     info->allocated_memory_heap_size = g_allocated;
     info->program_size = kProgramSize;

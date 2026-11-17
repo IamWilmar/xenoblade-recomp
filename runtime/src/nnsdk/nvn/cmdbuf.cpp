@@ -18,6 +18,28 @@ using namespace nvn;
 
 namespace {
 
+// El NVNtexture que pasa el juego, o el original si es una copia de su struct: nvnTextureInitialize deja una marca y la
+// dirección del original en los primeros 16 bytes (texture.cpp). Unity (Disco Elysium) copia los NVNtexture de la
+// ventana y dibuja la composición final en la copia; sin esto, el destino no estaba registrado y salía negro.
+Texture* texture_of(const void* p) { return nvn::texture_lookup(p); }
+}  // namespace
+
+Texture* nvn::texture_lookup(const void* p) {
+    if (!p) return nullptr;
+    if (Texture* t = g_textures.get(p)) return t;
+    uint64_t tag[2];
+    memcpy(tag, p, sizeof tag);
+    if (tag[0] != nvn::kTextureTag) return nullptr;
+    Texture* t = g_textures.get(reinterpret_cast<const void*>(tag[1]));
+    static int logged = 0;
+    if (t && nvn::first_times(logged, 8))
+        NVN_LOG("textura %p: copia del NVNtexture %p (%ux%u formato %#x)\n", p, reinterpret_cast<const void*>(tag[1]),
+                t->desc.width, t->desc.height, t->desc.format);
+    return t;
+}
+
+namespace {
+
 // Las listas grabadas viven hasta que el juego recicla la memoria de control en la que (en NVN) estaría
 // su handle: al volver a dar esa memoria con AddControlMemory, sus handles dejan de ser válidos y se
 // liberan. Antes no se liberaban nunca: ~4 MB/s de fuga y Android acababa matando el juego.
@@ -42,8 +64,13 @@ struct CommandBuffer {
     bool command_callback_enabled = true;
     // SetCopyRowStride / SetCopyImageStride: zancadas del buffer en las copias entre buffer y textura (0: compacto).
     int64_t copy_row_stride = 0, copy_image_stride = 0;
+    uint32_t created_frame = 0, begin_frame = 0;  // DEPURACIÓN: frame del juego en que se creó y en que grabó por última vez
 };
 std::atomic<int64_t> g_live_lists{0};
+// Protege las `lists` de todos los command buffers: AddControlMemory suelta listas de cualquiera de ellos (el pool de
+// memoria de control de Unity 2022 es común) mientras otros hilos graban en los suyos. Orden: este y luego el de
+// g_command_buffers (find_if).
+std::mutex g_lists_mutex;
 
 Objects<CommandBuffer> g_command_buffers;
 
@@ -150,6 +177,8 @@ CommandList* new_list(size_t hint) {
         list->commands.clear();
         list->spilled.clear();
         list->reset_inline();
+        list->texture_refs.clear();  // recycle_command_list ya soltó las de una lista sin enviar
+        list->submitted = false;
         return list;
     }
     return new CommandList;  // pool vacío (al arrancar): crece sola
@@ -205,22 +234,35 @@ TextureViewDesc view_of(const void* view) {
     return view ? *static_cast<const TextureViewDesc*>(view) : TextureViewDesc{};
 }
 
+// Reproducción en diferido: el comando que se va a grabar nombra esta textura por puntero. La lista lo apunta (al enviarse
+// le pondrá su ticket) y la textura cuenta un comando grabado más sin enviar (ver replay_barrier en commands.h).
+Texture* use(void* cmd, Texture* t) {
+    if (!t) return t;
+    if (CommandList* list = recording(cmd)) {
+        list->texture_refs.push_back(t);
+        __atomic_fetch_add(&t->open_refs, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&t->record_frame, nvn::game_frame(), __ATOMIC_RELAXED);
+    }
+    return t;
+}
+
 // Borrado de una región de una textura: el color son 4 valores de 32 bits (float, int o uint) que se guardan tal cual.
 void clear_texture(void* cmd, const void* texture, const void* view, const CopyRegion* region, const void* color, int mask) {
     if (!texture || !region || !color) return;
     cmd::ClearTexture c{};
-    c.texture = g_textures.get(texture);
+    c.texture = texture_of(texture);
     c.view = view_of(view);
     c.region = *region;
     memcpy(c.color, color, sizeof c.color);
     c.mask = mask;
-    if (c.texture) record(cmd, c);
+    if (c.texture) use(cmd, c.texture), record(cmd, c);
 }
 
 }  // namespace
 
 void nvn::recycle_command_list(CommandList* list) {
     if (!list) return;
+    nvn::note_list_dropped(*list);  // si nunca se envió, sus texturas dejan de contarla
     if (!g_recycle.load(std::memory_order_relaxed) || list->commands.capacity() == 0) {  // sin memoria: no sirve
         delete list;
         return;
@@ -232,15 +274,23 @@ void nvn::recycle_command_list(CommandList* list) {
 
 extern "C" {
 
+std::atomic<uint64_t> g_cb_initialized{0}, g_cb_finalized{0};  // DEPURACIÓN: para la línea de listas vivas
 nvn::Boolean nvnCommandBufferInitialize(void* cmd, void*) {
-    g_command_buffers.create(cmd);
+    g_cb_initialized.fetch_add(1, std::memory_order_relaxed);
+    g_command_buffers.create(cmd).created_frame = nvn::game_frame();
     g_generation.fetch_add(1, std::memory_order_acq_rel);  // tras crearlo: lo que se recordara de esta dirección ya no vale
     return 1;
 }
 void nvnCommandBufferFinalize(void* cmd) {
+    g_cb_finalized.fetch_add(1, std::memory_order_relaxed);
     if (CommandBuffer* cb = g_command_buffers.get(cmd)) {
-        for (Recorded& r : cb->lists) release_command_list(r.list);
-        g_live_lists -= static_cast<int64_t>(cb->lists.size());
+        std::vector<Recorded> lists;
+        {
+            std::lock_guard lock(g_lists_mutex);
+            lists.swap(cb->lists);
+        }
+        for (Recorded& r : lists) release_command_list(r.list);
+        g_live_lists -= static_cast<int64_t>(lists.size());
         recycle_command_list(cb->recording);  // a medio grabar: nunca llegó a la cola
         cb->recording = nullptr;
     }
@@ -257,22 +307,30 @@ void nvnCommandBufferAddCommandMemory(void* cmd, void*, int64_t, size_t size) {
 void nvnCommandBufferAddControlMemory(void* cmd, void* memory, size_t size) {
     CommandBuffer* cb = g_command_buffers.get(cmd);
     if (!cb) return;
+    // Esa memoria vuelve a usarse: los handles que había en ella dejan de valer, los grabara el command buffer que los
+    // grabara (Unity 2022 pasa los trozos de un command buffer a otro).
     const auto* begin = static_cast<const uint8_t*>(memory);
-    size_t freed = 0;
-    for (size_t k = 0; k < cb->lists.size();) {
-        const uint8_t* c = cb->lists[k].control;
-        if (c && c >= begin && c < begin + size) {
-            release_command_list(cb->lists[k].list);
-            cb->lists[k] = cb->lists.back();
-            cb->lists.pop_back();
-            freed++;
-        } else {
-            k++;
-        }
+    std::vector<CommandList*> dead;
+    {
+        std::lock_guard lock(g_lists_mutex);
+        g_command_buffers.find_if([&](const void*, CommandBuffer& b) {
+            for (size_t k = 0; k < b.lists.size();) {
+                const uint8_t* c = b.lists[k].control;
+                if (c && c >= begin && c < begin + size) {
+                    dead.push_back(b.lists[k].list);
+                    b.lists[k] = b.lists.back();
+                    b.lists.pop_back();
+                } else {
+                    k++;
+                }
+            }
+            return false;
+        });
+        cb->control = begin;
+        cb->control_size = size;
     }
-    g_live_lists -= static_cast<int64_t>(freed);
-    cb->control = begin;
-    cb->control_size = size;
+    for (CommandList* list : dead) release_command_list(list);
+    g_live_lists -= static_cast<int64_t>(dead.size());
 }
 // Lo que queda del último trozo de memoria de comandos y de control, con la misma cuenta que Get*MemoryUsed (16 bytes por
 // comando, 64 por lista). Nada se graba en esa memoria, así que quedarse sin ella no para la grabación.
@@ -286,6 +344,7 @@ size_t nvnCommandBufferGetCommandMemoryFree(const void* cmd) {
 size_t nvnCommandBufferGetControlMemoryFree(const void* cmd) {
     const CommandBuffer* cb = find(cmd);
     if (!cb) return 0;
+    std::lock_guard lock(g_lists_mutex);
     size_t lists = cb->recording ? 1 : 0;
     for (const Recorded& r : cb->lists) lists += r.control == cb->control;
     const size_t used = lists * 64;
@@ -306,6 +365,7 @@ size_t nvnCommandBufferGetControlMemorySize(const void* cmd) {
 size_t nvnCommandBufferGetCommandMemoryUsed(const void* cmd) {
     const CommandBuffer* cb = find(cmd);
     if (!cb) return 0;
+    std::lock_guard lock(g_lists_mutex);
     size_t n = cb->recording ? cb->recording->commands.size() : 0;
     for (const Recorded& r : cb->lists) n += r.list->commands.size();
     return n * 16;
@@ -313,10 +373,13 @@ size_t nvnCommandBufferGetCommandMemoryUsed(const void* cmd) {
 size_t nvnCommandBufferGetControlMemoryUsed(const void* cmd) {
     const CommandBuffer* cb = find(cmd);
     if (!cb || nvnCommandBufferGetCommandMemoryUsed(cmd) == 0) return 0;
+    std::lock_guard lock(g_lists_mutex);
     return (cb->lists.size() + (cb->recording ? 1 : 0)) * 64;
 }
 void nvnCommandBufferSetMemoryCallback(void* cmd, void* callback) {
     if (CommandBuffer* cb = g_command_buffers.get(cmd)) cb->memory_callback = callback;
+    static int logged = 0;  // DEPURACIÓN (Castlevania)
+    if (logged++ < 16) NVN_LOG("SetMemoryCallback cb %p fn %p\n", cmd, callback);
 }
 void nvnCommandBufferSetMemoryCallbackData(void* cmd, void* data) {
     if (CommandBuffer* cb = g_command_buffers.get(cmd)) cb->memory_callback_data = data;
@@ -341,6 +404,24 @@ void nvnCommandBufferBeginRecording(void* cmd) {
     if (CommandBuffer* cb = find(cmd)) {
         recycle_command_list(cb->recording);  // una grabación sin EndRecording: nunca llegó a la cola
         cb->recording = new_list(cb->last_size);
+        cb->begin_frame = nvn::game_frame();
+        // Sin memoria de control para otra lista (64 bytes cada una, como GetControlMemoryUsed): en NVN el driver
+        // avisa al juego con su callback (evento 1, OUT_OF_CONTROL_MEMORY) y el juego da otro trozo con
+        // AddControlMemory. Unity 2022 (Castlevania, main+0xd30ef0) solo da memoria así: 16 352 bytes al crear cada
+        // command buffer y luego un trozo de su pool en cada aviso, dejando el viejo a la espera de la GPU para
+        // reciclarlo. Sin el aviso nunca volvía a dar memoria, las listas no se soltaban nunca (16 000 en 4 minutos)
+        // y Android mataba el juego por memoria. Unity antiguo (Disco Elysium) daba memoria él solo en cada frame.
+        // Unreal Engine 5 (Final Fantasy Resonance) no da memoria al crear el command buffer: espera al primer aviso
+        // (su callback, main+0x144c698, da un trozo de control con malloc y lo apunta para liberarlo cuando la GPU
+        // acabe). Así que el aviso vale también sin ninguna memoria de control todavía.
+        if (cb->memory_callback && nvnCommandBufferGetControlMemoryFree(cmd) < 64) {
+            using Callback = void (*)(void* cmd, int event, size_t min_size, void* data);
+            static std::atomic<int> calls{0};
+            const int n = ++calls;
+            if (n <= 8 || n % 1000 == 0)
+                NVN_LOG("sin memoria de control (cb %p, %zu listas): aviso #%d al juego\n", cmd, cb->lists.size(), n);
+            reinterpret_cast<Callback>(cb->memory_callback)(cmd, 1, 64, cb->memory_callback_data);
+        }
     }
 }
 uint64_t nvnCommandBufferEndRecording(void* cmd) {
@@ -350,12 +431,44 @@ uint64_t nvnCommandBufferEndRecording(void* cmd) {
     cb->recording = nullptr;
     cb->last_size = list->commands.size();
     cb->recorded_total += list->commands.size();
-    cb->lists.push_back({cb->control, list});
+    {
+        std::lock_guard lock(g_lists_mutex);
+        cb->lists.push_back({cb->control, list});
+    }
     int64_t live = ++g_live_lists;
     static int64_t next_report = 1000;
     if (live >= next_report) {  // DEPURACIÓN: si esto crece sin parar, hay listas que no se liberan
         NVN_LOG("%lld listas de comandos vivas\n", static_cast<long long>(live));
         next_report *= 2;
+        // DEPURACIÓN (Castlevania): qué command buffers las retienen.
+        size_t buffers = 0, null_control = 0, most = 0;
+        const CommandBuffer* top = nullptr;
+        // Edad (frames del juego desde su última grabación) de los que tienen listas: si los viejos se acumulan, el
+        // juego no los finaliza ni los reutiliza.
+        const uint32_t now = nvn::game_frame();
+        size_t age_2 = 0, age_60 = 0, age_600 = 0, age_more = 0;
+        uint32_t oldest = 0;
+        std::lock_guard lock(g_lists_mutex);
+        g_command_buffers.find_if([&](const void*, const CommandBuffer& b) {
+            buffers++;
+            for (const Recorded& r : b.lists) null_control += r.control == nullptr;
+            if (b.lists.size() > most) most = b.lists.size(), top = &b;
+            if (!b.lists.empty()) {
+                const uint32_t age = now - b.begin_frame;
+                (age <= 2 ? age_2 : age <= 60 ? age_60 : age <= 600 ? age_600 : age_more)++;
+                oldest = std::max(oldest, age);
+            }
+            return false;
+        });
+        NVN_LOG("  con listas, por frames desde su última grabación: %zu de 0-2, %zu de 3-60, %zu de 61-600, %zu de más "
+                "(el más viejo, %u); frame %u\n", age_2, age_60, age_600, age_more, oldest, now);
+        if (top)
+            NVN_LOG("  %zu command buffers (creados %llu, finalizados %llu); %zu listas sin memoria de control; el que "
+                    "más: %zu listas, control %p +%zu, callback %p (comandos %s)\n",
+                    buffers, static_cast<unsigned long long>(g_cb_initialized.load()),
+                    static_cast<unsigned long long>(g_cb_finalized.load()), null_control, most,
+                    static_cast<const void*>(top->control), top->control_size, top->memory_callback,
+                    top->command_callback_enabled ? "sí" : "no");
     }
     return reinterpret_cast<uint64_t>(list);
 }
@@ -367,10 +480,10 @@ void nvnCommandBufferSetRenderTargets(void* cmd, int count, void* const* colors,
     cmd::SetRenderTargets c{};
     c.count = count > 8 ? 8 : count;
     for (int k = 0; k < c.count; k++) {
-        c.colors[k] = colors && colors[k] ? g_textures.get(colors[k]) : nullptr;
+        c.colors[k] = colors && colors[k] ? texture_of(colors[k]) : nullptr;
         c.color_views[k] = view_of(color_views ? color_views[k] : nullptr);
     }
-    c.depth = depth ? g_textures.get(depth) : nullptr;
+    c.depth = depth ? texture_of(depth) : nullptr;
     c.depth_view = view_of(depth_view);
     for (int k = 0; k < c.count; k++) {
         const Texture* t = c.colors[k];
@@ -394,6 +507,8 @@ void nvnCommandBufferSetRenderTargets(void* cmd, int count, void* const* colors,
         }
         NVN_LOG("SetRenderTargets %d:%s depth %p->%s\n", count, s.c_str(), depth, c.depth ? "ok" : "NULO");
     }
+    for (int k = 0; k < c.count; k++) use(cmd, c.colors[k]);
+    use(cmd, c.depth);
     record(cmd, c);
 }
 void nvnCommandBufferClearColor(void* cmd, int index, const float* color, int mask) {
@@ -548,7 +663,9 @@ void nvnCommandBufferBindVertexStreamState(void* cmd, int count, const VertexStr
 // --- Programas, buffers, texturas ---
 
 void nvnCommandBufferBindProgram(void* cmd, const void* program, int stages) {
-    record(cmd, cmd::BindProgram{program ? find_program(program) : nullptr, stages});
+    Program* p = program ? find_program(program) : nullptr;
+    if (p && !NVN_FLAG("sin_copia_shaders")) snapshot_program(*p);
+    record(cmd, cmd::BindProgram{p, stages});
 }
 void nvnCommandBufferBindVertexBuffers(void* cmd, int first, int count, const BufferRange* ranges) {
     if (CommandList* list = recording(cmd))
@@ -664,19 +781,31 @@ void nvnCommandBufferCopyBufferToBuffer(void* cmd, uint64_t src, uint64_t dst, s
 }
 void nvnCommandBufferCopyTextureToTexture(void* cmd, const void* src, const void* src_view, const CopyRegion* src_region,
                                           const void* dst, const void* dst_view, const CopyRegion* dst_region, int) {
-    record(cmd, cmd::CopyTexture{g_textures.get(src), view_of(src_view), *src_region, g_textures.get(dst),
+    record(cmd, cmd::CopyTexture{use(cmd, texture_of(src)), view_of(src_view), *src_region, use(cmd, texture_of(dst)),
                                  view_of(dst_view), *dst_region});
 }
 void nvnCommandBufferCopyBufferToTexture(void* cmd, uint64_t src, const void* dst, const void* dst_view,
                                          const CopyRegion* region, int) {
     const CommandBuffer* cb = find(cmd);
-    record(cmd, cmd::CopyBufferToTexture{src, g_textures.get(dst), view_of(dst_view), *region, cb ? cb->copy_row_stride : 0,
-                                         cb ? cb->copy_image_stride : 0});
+    cmd::CopyBufferToTexture c{src, use(cmd, texture_of(dst)), view_of(dst_view), *region, cb ? cb->copy_row_stride : 0,
+                               cb ? cb->copy_image_stride : 0};
+    // DIAGNÓSTICO: la huella de lo que la copia leerá del buffer, para que la cola vea si cambió antes de reproducirla
+    // (cmd::CopyBufferToTexture::print). El buffer ya está escrito: Unity lo llena y lo vacía a la GPU antes de grabar
+    // (memcpy en main+0x95bdb0, nvnBufferFlushMappedRange en main+0x95bdb8, la copia en main+0x95be60).
+    if (c.dst && src) {
+        const size_t span = nvn::texel_span(*c.dst, &c.dst_view, &c.region, c.row_stride, c.image_stride);
+        if (span && span <= UINT32_MAX) {
+            c.span = static_cast<uint32_t>(span);
+            c.print = cmd::edge_print(reinterpret_cast<const void*>(src), span);
+            if (span >= 65536) cmd::sample_stats(reinterpret_cast<const void*>(src), span, c.sample_print, c.sample_cd, c.samples);
+        }
+    }
+    record(cmd, c);
 }
 void nvnCommandBufferCopyTextureToBuffer(void* cmd, const void* src, const void* src_view, const CopyRegion* region,
                                          uint64_t dst, int) {
     const CommandBuffer* cb = find(cmd);
-    Texture* t = g_textures.get(src);
+    Texture* t = texture_of(src);
     if (!t || !region || !dst) return;
     static int logged = 0;  // DEPURACIÓN (miniatura de la partida): quién copia texturas a buffers
     if (nvn::first_times(logged, 8) || NVN_FLAG("diag_miniatura"))
@@ -684,7 +813,7 @@ void nvnCommandBufferCopyTextureToBuffer(void* cmd, const void* src, const void*
                 t->desc.width, t->desc.height, t->desc.format, t->desc.flags, region->x, region->y, region->width,
                 region->height, region->depth, static_cast<unsigned long long>(dst),
                 static_cast<long long>(cb ? cb->copy_row_stride : 0), static_cast<long long>(cb ? cb->copy_image_stride : 0));
-    record(cmd, cmd::CopyTextureToBuffer{t, view_of(src_view), *region, dst, cb ? cb->copy_row_stride : 0,
+    record(cmd, cmd::CopyTextureToBuffer{use(cmd, t), view_of(src_view), *region, dst, cb ? cb->copy_row_stride : 0,
                                          cb ? cb->copy_image_stride : 0});
 }
 // Zancadas del buffer para las copias que se graben después (0: filas y capas compactas).
@@ -704,9 +833,9 @@ ptrdiff_t nvnCommandBufferGetCopyImageStride(const void* cmd) {
 }
 // Downsample: resolver un multisample (o reducir) src en dst. Los Tiled* hacen lo mismo con la caché por tiles de Maxwell.
 static void downsample(void* cmd, const void* src, const void* src_view, const void* dst, const void* dst_view) {
-    Texture* s = g_textures.get(src);
-    Texture* d = g_textures.get(dst);
-    if (s && d) record(cmd, cmd::Downsample{s, view_of(src_view), d, view_of(dst_view)});
+    Texture* s = texture_of(src);
+    Texture* d = texture_of(dst);
+    if (s && d) record(cmd, cmd::Downsample{use(cmd, s), view_of(src_view), use(cmd, d), view_of(dst_view)});
 }
 void nvnCommandBufferDownsample(void* cmd, const void* src, const void* dst) { downsample(cmd, src, nullptr, dst, nullptr); }
 void nvnCommandBufferDownsampleTextureView(void* cmd, const void* src, const void* src_view, const void* dst,
@@ -760,7 +889,8 @@ void nvnCommandBufferResetCounter(void* cmd, int type) {
 // genéricos y no la posición) guardan además sus salidas en un SSBO (nvnshader::kXfbBank) que el ejecutor enlaza al
 // buffer de captura 0 mientras está activo. Xenoblade deforma así con el viento la hierba alta del campo (draws de puntos
 // con el rasterizador descartado) y la dibuja leyendo lo capturado como stream de vértices; sin captura leía lo último
-// que dejó el skinning en ese buffer (matrices) y salían pinchos negros. DrawTransformFeedback sigue sin hacer nada.
+// que dejó el skinning en ese buffer (matrices) y salían pinchos negros. DrawTransformFeedback dibuja lo capturado: el
+// ejecutor apunta los bytes escritos por buffer de control al acabar o pausar (Xenoblade 3 lo usa desde la intro).
 static void warn_transform_feedback(const char* what) {
     static std::atomic<int> logged{0};
     if (logged.fetch_add(1) < 8) NVN_LOG("transform feedback sin soporte: %s\n", what);
@@ -772,19 +902,22 @@ void nvnCommandBufferBindTransformFeedbackBuffers(void* cmd, int first, int coun
 void nvnCommandBufferBindTransformFeedbackBuffer(void* cmd, int index, uint64_t address, size_t size) {
     record(cmd, cmd::TransformFeedback{cmd::TransformFeedback::Bind, index, {address, size}});
 }
-void nvnCommandBufferBeginTransformFeedback(void* cmd, uint64_t) {
-    record(cmd, cmd::TransformFeedback{cmd::TransformFeedback::Begin, 0, {}});
+void nvnCommandBufferBeginTransformFeedback(void* cmd, uint64_t control) {
+    record(cmd, cmd::TransformFeedback{cmd::TransformFeedback::Begin, 0, {}, control});
 }
-void nvnCommandBufferEndTransformFeedback(void* cmd, uint64_t) {
-    record(cmd, cmd::TransformFeedback{cmd::TransformFeedback::End, 0, {}});
+void nvnCommandBufferEndTransformFeedback(void* cmd, uint64_t control) {
+    record(cmd, cmd::TransformFeedback{cmd::TransformFeedback::End, 0, {}, control});
 }
-void nvnCommandBufferPauseTransformFeedback(void* cmd, uint64_t) {
-    record(cmd, cmd::TransformFeedback{cmd::TransformFeedback::Pause, 0, {}});
+void nvnCommandBufferPauseTransformFeedback(void* cmd, uint64_t control) {
+    record(cmd, cmd::TransformFeedback{cmd::TransformFeedback::Pause, 0, {}, control});
 }
-void nvnCommandBufferResumeTransformFeedback(void* cmd, uint64_t) {
-    record(cmd, cmd::TransformFeedback{cmd::TransformFeedback::Resume, 0, {}});
+void nvnCommandBufferResumeTransformFeedback(void* cmd, uint64_t control) {
+    record(cmd, cmd::TransformFeedback{cmd::TransformFeedback::Resume, 0, {}, control});
 }
-void nvnCommandBufferDrawTransformFeedback(void*, int, uint64_t) { warn_transform_feedback("DrawTransformFeedback"); }
+void nvnCommandBufferDrawTransformFeedback(void* cmd, int primitive, uint64_t control) {
+    if (NVN_FLAG("sin_dibujar_xfb")) return warn_transform_feedback("DrawTransformFeedback (sin_dibujar_xfb)");
+    record(cmd, cmd::TransformFeedback{cmd::TransformFeedback::Draw, primitive, {}, control});
+}
 
 // Swizzle de viewport (NV_viewport_swizzle, para dibujar las caras de un cubo de una vez): Vulkan no lo tiene en el
 // Adreno. La identidad (+X, +Y, +Z, +W = 0, 2, 4, 6) no cambia nada; otra se avisa.
@@ -823,6 +956,23 @@ void nvnCommandBufferCallCommands(void* cmd, int count, const uint64_t* handles)
             if (list->commands.size() == list->commands.capacity()) [[unlikely]]
                 grow(*list);
             list->commands.push_back(c);
+        }
+        // Reproducción en diferido: los comandos copiados nombran las mismas texturas, y la lista llamada no se envía
+        // nunca: sus menciones pasan a esta, que es la que llega a la cola (al enviarse les pone su ticket). Disco Elysium
+        // lleva los graphics jobs de Unity encendidos (boot.config: gfx-enable-native-gfx-jobs=1): cada job graba en el
+        // command buffer de su hilo (main+0x950d18 a main+0x950da4) y el principal llama a sus listas una a una
+        // (main+0x950bf4), así que casi todos los SetRenderTargets del frame llegan por aquí. Sin esto, sus texturas
+        // contaban la lista llamada como "grabada sin enviar" hasta que el juego reciclaba su memoria de control (4 frames
+        // después: el anillo de main+0x98dfd4) y ningún envío les ponía ticket: una finalizada entraba al limbo y solo la
+        // regla del frame la tenía viva hasta reproducirse. <datos>/sin_refs_llamadas (en vivo): como antes.
+        if (!called->texture_refs.empty() && !NVN_FLAG("sin_refs_llamadas")) {
+            auto* from = const_cast<CommandList*>(called);  // es nuestra: el handle del juego es el puntero a la lista
+            for (Texture* t : from->texture_refs) {
+                list->texture_refs.push_back(t);
+                // Si la llamada aún la contaba, la cuenta pasa tal cual; si ya no (enviada o llamada antes), una nueva.
+                if (from->submitted) __atomic_fetch_add(&t->open_refs, 1, __ATOMIC_RELAXED);
+            }
+            from->submitted = true;
         }
     }
 }

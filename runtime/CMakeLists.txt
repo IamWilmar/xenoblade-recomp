@@ -10,10 +10,16 @@ add_compile_options(-Wall -Wextra)
 add_library(nnsdk SHARED
   src/nnsdk/account.cpp
   src/nnsdk/audio.cpp
+  src/nnsdk/audio_renderer.cpp
+  src/nnsdk/irsensor.cpp
+  src/nnsdk/pl.cpp
   src/nnsdk/codec.cpp
   src/nnsdk/cxx.cpp
   src/nnsdk/diag.cpp
   src/nnsdk/fs.cpp
+  src/nnsdk/fs_remoto.cpp
+  src/nnsdk/fontll.cpp
+  src/nnsdk/nvos.cpp
   src/nnsdk/hid.cpp
   src/nnsdk/libc.cpp
   src/nnsdk/mem.cpp
@@ -24,6 +30,7 @@ add_library(nnsdk SHARED
   src/nnsdk/nvn/buffer.cpp
   src/nnsdk/nvn/device.cpp
   src/nnsdk/nvn/cmdbuf.cpp
+  src/nnsdk/nvn/checkpoints.cpp
   src/nnsdk/nvn/formats.cpp
   src/nnsdk/nvn/executor.cpp
   src/nnsdk/nvn/gpu_memory.cpp
@@ -45,6 +52,8 @@ add_library(nnsdk SHARED
   src/nnsdk/os.cpp
   src/nnsdk/vi.cpp
   src/nnsdk/aoc.cpp
+  src/nnsdk/ro.cpp
+  src/nnsdk/setjmp.S
   src/nnsdk/album.cpp
   src/nnsdk/bcat.cpp
   src/nnsdk/crypto.cpp
@@ -91,7 +100,7 @@ endforeach()
 set(OPUS_PRESUME_NEON ON CACHE BOOL "" FORCE)  # arm64: NEON siempre, sin detección en tiempo de ejecución
 add_subdirectory(${OPUS_DIR} ${CMAKE_CURRENT_BINARY_DIR}/opus EXCLUDE_FROM_ALL)
 target_link_libraries(nnsdk PRIVATE opus)
-target_link_libraries(nnsdk PRIVATE vulkan android mediandk aaudio z)
+target_link_libraries(nnsdk PRIVATE vulkan android mediandk aaudio z jnigraphics)
 # Su libc++ estática no se exporta: el juego debe usar una sola copia de libc++abi (la del loader).
 target_link_options(nnsdk PRIVATE -Wl,--exclude-libs,ALL)
 
@@ -101,6 +110,7 @@ add_library(loader_core OBJECT
   src/loader/nso.cpp
   src/loader/imports.cpp
   src/loader/crash.cpp
+  src/loader/exceptions.cpp
   src/loader/host_symbols.c
   src/loader/stub_dispatch.S
   src/loader/tls.cpp

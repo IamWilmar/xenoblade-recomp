@@ -97,7 +97,8 @@ nvn::Boolean nvnMemoryPoolInitialize(void* pool, const MemoryPoolBuilder* b) {
         nnsdk::watch::add_virtual_range(reinterpret_cast<uintptr_t>(p), size);
     }
     static int logged = 0;  // DEPURACIÓN: los pools (para confirmar sus flags; miniatura de la partida: cuál es el de captura)
-    if (nvn::first_times(logged, 64) || NVN_FLAG("diag_miniatura"))
+    static int logged_big = 0;
+    if (nvn::first_times(logged, 64) || NVN_FLAG("diag_miniatura") || (b->size > (4u << 20) && nvn::first_times(logged_big, 300)))
         NVN_LOG("memory pool %p %s: %zu KB, flags 0x%x, memoria %p%s\n", pool,
                 reserved ? "virtual" : (b->flags & nvn::kPoolFlagPhysical) ? "físico" : "", b->size >> 10, b->flags,
                 static_cast<void*>(storage), reserved && b->storage ? " (la del juego no se usa)" : "");
@@ -112,6 +113,14 @@ void nvnMemoryPoolFinalize(void* pool) {
     {  // DEPURACIÓN (miniatura de la partida)
         static int logged = 0;
         if (nvn::first_times(logged, 64) || NVN_FLAG("diag_miniatura")) NVN_LOG("pool finalizado %p\n", pool);
+    }
+    // Lo ya enviado puede leer de su memoria al reproducirse (buffers de vértices y de uniformes): el juego la libera o
+    // reutiliza en cuanto vuelve de aquí. Primero, que la cola lo reproduzca (solo los pools con buffers; ver MemoryPool).
+    // Si este hilo libera por envíos terminados (thread_completion_ticket, commands.h), basta con ese envío.
+    // <datos>/barrera_pools_completa (en vivo): siempre todo lo encolado, como antes.
+    if (nvn::MemoryPool* live = nvn::g_memory_pools.get(pool); live && live->buffers) {
+        const uint64_t done = NVN_FLAG("barrera_pools_completa") ? 0 : nvn::thread_completion_ticket();
+        nvn::replay_barrier(done, "nvnMemoryPoolFinalize");
     }
     if (std::unique_ptr<nvn::MemoryPool> p = nvn::g_memory_pools.take(pool); p && p->reserved) {
         // Lo que ya está grabado puede seguir leyendo de sus direcciones (subidas de texturas): primero que acabe.
@@ -174,7 +183,10 @@ void* nvnMemoryPoolMap(const void* pool) {
     nvn::MemoryPool* p = nvn::g_memory_pools.get(pool);
     return p ? p->storage : nullptr;
 }
-uint64_t nvnMemoryPoolGetBufferAddress(const void* pool) { return reinterpret_cast<uint64_t>(nvnMemoryPoolMap(pool)); }
+uint64_t nvnMemoryPoolGetBufferAddress(const void* pool) {
+    if (nvn::MemoryPool* p = nvn::g_memory_pools.get(pool)) p->buffers = true;  // direcciones de GPU sobre su memoria
+    return reinterpret_cast<uint64_t>(nvnMemoryPoolMap(pool));
+}
 size_t nvnMemoryPoolGetSize(const void* pool) {
     nvn::MemoryPool* p = nvn::g_memory_pools.get(pool);
     return p ? p->size : 0;

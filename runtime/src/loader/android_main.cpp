@@ -12,8 +12,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <jni.h>
+#include <linux/futex.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include <sys/system_properties.h>
 #include <time.h>
 #include <unistd.h>
@@ -146,9 +148,9 @@ enum : uint64_t {
 // si su mando se presenta como el del modo Retro (2022:3001, "Retroid Pocket Controller").
 // <datos>/botones_xbox y <datos>/botones_retro (en vivo) fuerzan una u otra para todos.
 int forced_layout() {  // 1: Xbox (por posición), 0: Retro (por nombre), -1: sin forzar
-    static const std::string xbox = g_data + "/botones_xbox", retro = g_data + "/botones_retro";
     static int checks = 0, forced = -1;
-    if (checks++ % 32 == 0) forced = access(xbox.c_str(), F_OK) == 0 ? 1 : access(retro.c_str(), F_OK) == 0 ? 0 : -1;
+    if (checks++ % 32 == 0)
+        forced = access((g_data + "/botones_xbox").c_str(), F_OK) == 0 ? 1 : access((g_data + "/botones_retro").c_str(), F_OK) == 0 ? 0 : -1;
     return forced;
 }
 struct PadInfo {
@@ -433,6 +435,133 @@ void* walk(void*) {
     return nullptr;
 }
 
+// --- Vibración ---
+// nn::hid deja en g_input.rumble la amplitud que el juego quiere en el motor (0 parado, 1..255) y despierta a este
+// hilo por g_input.rumble_serial. El vibrador de Android solo tiene API de Java, así que se llega por JNI con la
+// actividad: Vibrator.vibrate(VibrationEffect.createOneShot(ms, amplitud)) y cancel(). Va en un hilo propio para que
+// ningún hilo del juego quede enganchado a la máquina de Java (ART les mediría la pila y les pondría su guarda).
+//
+// En la Switch el valor se queda puesto hasta que el juego manda otro. Aquí cada orden es un pulso de 2 s que se
+// renueva antes de acabar mientras el juego la mantenga: si el juego o este hilo se paran, el motor calla solo.
+// Si algo de Java falla (no hay vibrador, falta el permiso VIBRATE del manifiesto), se anota una vez y no vibra.
+constexpr jlong kPulseMs = 2000;
+constexpr int64_t kRenewNs = 1'800'000'000;
+
+void* vibrator(void* arg) {
+    pthread_setname_np(pthread_self(), "Vibrador");
+    auto* activity = static_cast<ANativeActivity*>(arg);
+    JNIEnv* env = nullptr;
+    JavaVMAttachArgs attach{JNI_VERSION_1_6, "Vibrador", nullptr};
+    if (activity->vm->AttachCurrentThread(&env, &attach) != JNI_OK || !env) {
+        printf("[vibra] no puedo entrar en la máquina de Java: sin vibración\n");
+        return nullptr;
+    }
+    // Con una excepción pendiente la siguiente llamada JNI aborta el proceso: se mira y se limpia tras cada paso.
+    bool broken = false;
+    auto check = [&](const char* step) {
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            if (!broken) printf("[vibra] %s: excepción de Java, sin vibración\n", step);
+            broken = true;
+        }
+        return !broken;
+    };
+    auto method = [&](jclass cls, const char* name, const char* signature) -> jmethodID {
+        if (broken || !cls) return nullptr;
+        jmethodID id = env->GetMethodID(cls, name, signature);
+        return check(name) ? id : nullptr;
+    };
+
+    jobject service = nullptr;
+    jclass effect_class = nullptr;
+    jmethodID vibrate = nullptr, cancel = nullptr, one_shot = nullptr;
+    bool present = false, amplitude_control = false;
+    {
+        jclass activity_class = env->GetObjectClass(activity->clazz);
+        jmethodID get_service = method(activity_class, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+        jstring name = get_service ? env->NewStringUTF("vibrator") : nullptr;
+        if (check("NewStringUTF") && name) service = env->CallObjectMethod(activity->clazz, get_service, name);
+        if (!check("getSystemService")) service = nullptr;
+        jclass service_class = service ? env->GetObjectClass(service) : nullptr;
+        jmethodID has_vibrator = method(service_class, "hasVibrator", "()Z");
+        jmethodID has_amplitude = method(service_class, "hasAmplitudeControl", "()Z");
+        vibrate = method(service_class, "vibrate", "(Landroid/os/VibrationEffect;)V");
+        cancel = method(service_class, "cancel", "()V");
+        if (!broken && service_class) effect_class = env->FindClass("android/os/VibrationEffect");
+        if (!check("VibrationEffect")) effect_class = nullptr;
+        if (effect_class) {
+            one_shot = env->GetStaticMethodID(effect_class, "createOneShot", "(JI)Landroid/os/VibrationEffect;");
+            if (!check("createOneShot")) one_shot = nullptr;
+        }
+        if (has_vibrator && has_amplitude && vibrate && cancel && one_shot) {
+            present = env->CallBooleanMethod(service, has_vibrator);
+            if (!check("hasVibrator")) present = false;
+            if (present) {
+                amplitude_control = env->CallBooleanMethod(service, has_amplitude);
+                if (!check("hasAmplitudeControl")) amplitude_control = false;
+            }
+            // cancel() ya pide el permiso: si falta, se sabe al arrancar y no en mitad del juego.
+            if (present && !broken) {
+                env->CallVoidMethod(service, cancel);
+                check("cancel (¿falta el permiso VIBRATE en el manifiesto?)");
+            }
+        }
+    }
+    if (broken || !service || !one_shot || !present) {
+        if (!broken)
+            printf("[vibra] %s: sin vibración\n",
+                   service && one_shot ? "la consola no tiene vibrador" : "no encuentro el vibrador de Android");
+        activity->vm->DetachCurrentThread();
+        return nullptr;
+    }
+    printf("[vibra] vibrador de Android listo (amplitud regulable: %s)\n", amplitude_control ? "sí" : "no, siempre al máximo");
+
+    auto now_ns = [] {
+        timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return int64_t{ts.tv_sec} * 1'000'000'000 + ts.tv_nsec;
+    };
+    uint32_t applied = 0;
+    int64_t started_ns = 0;
+    int logged = 0;
+    while (!broken) {
+        // Primero el serial y luego el valor: si nn::hid lo cambia después, el futex ya no encuentra el serial leído
+        // y vuelve enseguida.
+        const uint32_t serial = g_input.rumble_serial.load();
+        const uint32_t want = g_input.rumble.load();
+        const int64_t now = now_ns();
+        if (want != applied || (want != 0 && now - started_ns >= kRenewNs)) {
+            if (want == 0) {
+                env->CallVoidMethod(service, cancel);
+                check("cancel");
+            } else {
+                const jint amplitude = static_cast<jint>(want > 255 ? 255 : want);
+                jobject effect = env->CallStaticObjectMethod(effect_class, one_shot, kPulseMs, amplitude);
+                if (check("createOneShot") && effect) {
+                    env->CallVoidMethod(service, vibrate, effect);
+                    check("vibrate");
+                }
+                if (effect) env->DeleteLocalRef(effect);
+            }
+            if (logged < 16 && want != applied) {
+                logged++;
+                printf("[vibra] motor a %u/255\n", want);
+            }
+            applied = want;
+            started_ns = now;
+        }
+        timespec renew{};
+        if (want != 0) {
+            const int64_t left = kRenewNs - (now - started_ns);
+            renew.tv_sec = static_cast<time_t>(left / 1'000'000'000);
+            renew.tv_nsec = static_cast<long>(left % 1'000'000'000);
+        }
+        syscall(SYS_futex, reinterpret_cast<uint32_t*>(&g_input.rumble_serial), FUTEX_WAIT_PRIVATE, serial,
+                want != 0 ? &renew : nullptr, nullptr, 0);
+    }
+    activity->vm->DetachCurrentThread();
+    return nullptr;
+}
 
 // El último toque que se posó en el borde derecho de la pantalla (su hora de Android, en ns; 0 si no hay): la tecla BACK que
 // llega poco después es el gesto de "atrás" del sistema hecho desde ese borde.
@@ -601,6 +730,7 @@ void android_main(android_app* app) {
     }
     setenv("NIER_DATA", g_data.c_str(), 1);
     setenv("NIER_SETUP", "1", 1);  // la carpeta sale de la pantalla de inicio: el panel del HUD ofrece cambiarla
+    setenv("NIER_TV_MODE", "1", 1);  // este port tiene modo TV (nnsdk::tv_mode): el panel del HUD lo ofrece
     setenv("NIER_TRAZA_DESDE", "94", 1);  // DEPURACIÓN: también vuelca los shaders de los draws trazados desde aquí
     setenv("NIER_VOLCAR_TRAS", "", 1);  // DEPURACIÓN: RT tras esos draws
     setenv("NIER_VOLCAR_TAM", "", 1);  // DEPURACIÓN: RT tras los draws a ese tamaño
@@ -610,6 +740,12 @@ void android_main(android_app* app) {
     setenv("NIER_TRAZA_LIGERA", "1", 1);
     setenv("NIER_SONDA_MEMORIA", "", 1);  // DEPURACIÓN: "1": mide los límites del driver al arrancar  // DEPURACIÓN: trazas sin volcar render targets ni shaders
     std::string log = g_data + "/log.txt";
+    // Los logs de las sesiones anteriores se guardan (log_1.txt la última, hasta log_5.txt): quien juega por su cuenta
+    // vuelve a abrir el juego y el log de la partida que tuvo un problema no se pierde. Si rename falla, como antes.
+    for (int k = 5; k > 1; k--)
+        rename((g_data + "/log_" + std::to_string(k - 1) + ".txt").c_str(),
+               (g_data + "/log_" + std::to_string(k) + ".txt").c_str());
+    rename(log.c_str(), (g_data + "/log_1.txt").c_str());
     if (freopen(log.c_str(), "w", stdout)) {
         // Por bloques: línea a línea, cada printf era una escritura en la SD. <datos>/registro o <datos>/log_lineas: línea
         // a línea (para leerlo en vivo, y lo último no se pierde si el proceso se cae).
@@ -653,6 +789,15 @@ void android_main(android_app* app) {
     {
         pthread_t thread;
         pthread_create(&thread, nullptr, walk, nullptr);
+        pthread_detach(thread);
+    }
+    // <datos>/sin_vibracion al abrir el juego: el hilo del vibrador ni se crea (nn::hid mira el mismo fichero en vivo
+    // para dejar de pedir vibración).
+    if (access((g_data + "/sin_vibracion").c_str(), F_OK) == 0) {
+        printf("[vibra] <datos>/sin_vibracion: sin vibración\n");
+    } else {
+        pthread_t thread;
+        pthread_create(&thread, nullptr, vibrator, app->activity);
         pthread_detach(thread);
     }
 

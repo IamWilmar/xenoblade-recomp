@@ -1,0 +1,299 @@
+diff --color -u -r a/src/shader_recompiler/backend/spirv/emit_spirv.cpp b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+--- a/src/shader_recompiler/backend/spirv/emit_spirv.cpp	2026-11-14 02:50:54
++++ b/src/shader_recompiler/backend/spirv/emit_spirv.cpp	2026-11-14 02:50:54
+@@ -473,8 +473,23 @@
+     if (info.uses_typeless_image_writes) {
+         ctx.AddCapability(spv::Capability::StorageImageWriteWithoutFormat);
+     }
+-    if (info.uses_image_buffers) {
++    if (info.uses_image_buffers || !info.image_buffer_descriptors.empty()) {
+         ctx.AddCapability(spv::Capability::ImageBuffer);
++    }
++    // r8ui, r8i, r16ui, r16i y rg32ui no están en el juego base de formatos de storage image.
++    const auto extended_format{[](ImageFormat format) {
++        return format == ImageFormat::R8_UINT || format == ImageFormat::R8_SINT || format == ImageFormat::R16_UINT ||
++               format == ImageFormat::R16_SINT || format == ImageFormat::R32G32_UINT;
++    }};
++    bool extended_formats{false};
++    for (const auto& desc : info.image_descriptors) {
++        extended_formats |= extended_format(desc.format);
++    }
++    for (const auto& desc : info.image_buffer_descriptors) {
++        extended_formats |= extended_format(desc.format);
++    }
++    if (extended_formats) {
++        ctx.AddCapability(spv::Capability::StorageImageExtendedFormats);
+     }
+     if (info.uses_sample_id) {
+         ctx.AddCapability(spv::Capability::SampleRateShading);
+diff --color -u -r a/src/shader_recompiler/frontend/maxwell/translate/impl/not_implemented.cpp b/src/shader_recompiler/frontend/maxwell/translate/impl/not_implemented.cpp
+--- a/src/shader_recompiler/frontend/maxwell/translate/impl/not_implemented.cpp	2026-11-14 02:50:54
++++ b/src/shader_recompiler/frontend/maxwell/translate/impl/not_implemented.cpp	2026-11-14 02:50:54
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/bit_field.h"
+ #include "common/common_types.h"
+ #include "shader_recompiler/exception.h"
+ #include "shader_recompiler/frontend/maxwell/opcodes.h"
+@@ -143,10 +144,6 @@
+     ThrowNotImplemented(Opcode::IMUL_imm);
+ }
+ 
+-void TranslatorVisitor::IMUL32I(u64) {
+-    ThrowNotImplemented(Opcode::IMUL32I);
+-}
+-
+ void TranslatorVisitor::JCAL(u64) {
+     ThrowNotImplemented(Opcode::JCAL);
+ }
+@@ -195,22 +192,6 @@
+     ThrowNotImplemented(Opcode::PRET);
+ }
+ 
+-void TranslatorVisitor::PRMT_reg(u64) {
+-    ThrowNotImplemented(Opcode::PRMT_reg);
+-}
+-
+-void TranslatorVisitor::PRMT_rc(u64) {
+-    ThrowNotImplemented(Opcode::PRMT_rc);
+-}
+-
+-void TranslatorVisitor::PRMT_cr(u64) {
+-    ThrowNotImplemented(Opcode::PRMT_cr);
+-}
+-
+-void TranslatorVisitor::PRMT_imm(u64) {
+-    ThrowNotImplemented(Opcode::PRMT_imm);
+-}
+-
+ void TranslatorVisitor::R2B(u64) {
+     ThrowNotImplemented(Opcode::R2B);
+ }
+@@ -284,6 +265,102 @@
+ 
+ void TranslatorVisitor::VSHR(u64) {
+     ThrowNotImplemented(Opcode::VSHR);
++}
++
++namespace {
++// PRMT: arma un valor de 32 bits con cuatro bytes escogidos de los ocho de {c:a} (los 0-3 son de a, los 4-7 de c).
++// Sin modo, cada nibble del control elige el byte de su posición (bits 0-2) y, con el bit 3, replica su signo. Los
++// modos (f4e, b4e, rc8, ecl, ecr, rc16) son patrones fijos que elige el control con sus dos bits bajos. Es la misma
++// instrucción que PTX documenta como "prmt"; GLSLC la usa en los compute de Unreal Engine 5 (la rejilla de luces).
++void PRMT(TranslatorVisitor& v, u64 insn, const IR::U32& control, const IR::U32& src_c) {
++    union {
++        u64 insn;
++        BitField<0, 8, IR::Reg> dest_reg;
++        BitField<8, 8, IR::Reg> src_reg;
++        // 3 bits: el cuarto del campo de 4 que escribe el ensamblador cae sobre un bit fijo del código de operación.
++        BitField<51, 3, u64> mode;
++    } const prmt{insn};
++    // [modo - 1][control & 3][byte de destino 0..3] = byte de origen
++    static constexpr u8 TABLES[6][4][4]{
++        {{0, 1, 2, 3}, {1, 2, 3, 4}, {2, 3, 4, 5}, {3, 4, 5, 6}}, // f4e
++        {{0, 7, 6, 5}, {1, 0, 7, 6}, {2, 1, 0, 7}, {3, 2, 1, 0}}, // b4e
++        {{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}}, // rc8
++        {{0, 1, 2, 3}, {1, 1, 2, 3}, {2, 2, 2, 3}, {3, 3, 3, 3}}, // ecl
++        {{0, 0, 0, 0}, {0, 1, 1, 1}, {0, 1, 2, 2}, {0, 1, 2, 3}}, // ecr
++        {{0, 1, 0, 1}, {2, 3, 2, 3}, {0, 1, 0, 1}, {2, 3, 2, 3}}, // rc16 (solo mira el bit 0)
++    };
++    if (prmt.mode > 6) {
++        throw NotImplementedException("PRMT mode {}", prmt.mode.Value());
++    }
++    auto& ir{v.ir};
++    const IR::U32 src_a{v.X(prmt.src_reg)};
++    const IR::U32 zero{ir.Imm32(0)};
++    // El byte `index` (0..7, valor de IR) de {c:a}, ya en los 8 bits bajos.
++    const auto byte_at{[&](const IR::U32& index) {
++        const IR::U32 source{ir.Select(ir.IGreaterThanEqual(index, ir.Imm32(4), false), src_c, src_a)};
++        const IR::U32 shift{ir.ShiftLeftLogical(ir.BitwiseAnd(index, ir.Imm32(3)), ir.Imm32(3))};
++        return ir.BitwiseAnd(ir.ShiftRightLogical(source, shift), ir.Imm32(0xff));
++    }};
++    IR::U32 result{zero};
++    for (u32 k = 0; k < 4; k++) {
++        IR::U32 byte;
++        if (prmt.mode == 0) {
++            const IR::U32 select{ir.BitwiseAnd(ir.ShiftRightLogical(control, ir.Imm32(4 * k)), ir.Imm32(0xf))};
++            const IR::U32 value{byte_at(ir.BitwiseAnd(select, ir.Imm32(7)))};
++            const IR::U32 sign{ir.Select(ir.INotEqual(ir.BitwiseAnd(value, ir.Imm32(0x80)), zero), ir.Imm32(0xff), zero)};
++            byte = IR::U32{ir.Select(ir.INotEqual(ir.BitwiseAnd(select, ir.Imm32(8)), zero), sign, value)};
++        } else {
++            const auto& table{TABLES[prmt.mode - 1]};
++            const IR::U32 choice{ir.BitwiseAnd(control, ir.Imm32(3))};
++            IR::U32 index{ir.Imm32(table[3][k])};
++            for (u32 c = 3; c-- > 0;) {
++                index = IR::U32{ir.Select(ir.IEqual(choice, ir.Imm32(c)), ir.Imm32(table[c][k]), index)};
++            }
++            byte = byte_at(index);
++        }
++        result = ir.BitwiseOr(result, ir.ShiftLeftLogical(byte, ir.Imm32(8 * k)));
++    }
++    v.X(prmt.dest_reg, result);
++}
++} // Anonymous namespace
++
++void TranslatorVisitor::PRMT_reg(u64 insn) {
++    PRMT(*this, insn, GetReg20(insn), GetReg39(insn));
++}
++
++void TranslatorVisitor::PRMT_rc(u64 insn) {
++    PRMT(*this, insn, GetReg39(insn), GetCbuf(insn));
++}
++
++void TranslatorVisitor::PRMT_cr(u64 insn) {
++    PRMT(*this, insn, GetCbuf(insn), GetReg39(insn));
++}
++
++void TranslatorVisitor::PRMT_imm(u64 insn) {
++    PRMT(*this, insn, GetImm20(insn), GetReg39(insn));
++}
++
++// IMUL32I: producto por un inmediato de 32 bits. La mitad alta del producto de 64 bits no se usa en lo visto.
++void TranslatorVisitor::IMUL32I(u64 insn) {
++    union {
++        u64 raw;
++        BitField<0, 8, IR::Reg> dest_reg;
++        BitField<8, 8, IR::Reg> src_reg;
++        BitField<52, 1, u64> cc;
++        BitField<53, 1, u64> high;
++    } const imul{insn};
++    if (imul.high != 0) {
++        throw NotImplementedException("IMUL32I high");
++    }
++    const IR::U32 result{ir.IMul(X(imul.src_reg), GetImm32(insn))};
++    X(imul.dest_reg, result);
++    if (imul.cc != 0) {
++        const IR::U32 zero{ir.Imm32(0)};
++        SetZFlag(ir.IEqual(result, zero));
++        SetSFlag(ir.ILessThan(result, zero, true));
++        ResetCFlag();
++        ResetOFlag();
++    }
+ }
+ 
+ } // namespace Shader::Maxwell
+diff --color -u -r a/src/shader_recompiler/ir_opt/texture_pass.cpp b/src/shader_recompiler/ir_opt/texture_pass.cpp
+--- a/src/shader_recompiler/ir_opt/texture_pass.cpp	2026-11-14 02:50:54
++++ b/src/shader_recompiler/ir_opt/texture_pass.cpp	2026-11-14 02:50:54
+@@ -564,13 +564,71 @@
+            inst->GetOpcode() == IR::Opcode::GetAttributeU32;
+ }
+ 
++// El programa que recorre TexturePass, para buscar en todo él (TrackLocal).
++thread_local const IR::Program* t_program{nullptr};
++
++// Un handle que el shader guarda en su memoria local y vuelve a leer (GLSLC lo hace con las texturas que un material de
++// Unreal Engine 5 mete en una estructura local): se siguen las escrituras a esa misma palabra. Vale si todas las del
++// programa guardan el mismo handle seguible y ninguna escritura va a una posición calculada (podría pisar esa palabra).
++std::optional<ConstBufferAddr> TrackLocal(const IR::Value& handle, Environment& env,
++                                          const HostTranslateInfo& host_info, std::string* why) {
++    if (handle.IsImmediate() || !t_program) {
++        return std::nullopt;
++    }
++    const IR::Inst* const load{handle.InstRecursive()};
++    if (load->GetOpcode() != IR::Opcode::LoadLocal || !load->Arg(0).IsImmediate()) {
++        return std::nullopt;
++    }
++    const u32 offset{load->Arg(0).U32()};
++    std::optional<ConstBufferAddr> found;
++    u32 writes{};
++    for (IR::Block* const other : t_program->post_order_blocks) {
++        for (IR::Inst& write : other->Instructions()) {
++            if (write.GetOpcode() != IR::Opcode::WriteLocal) {
++                continue;
++            }
++            if (!write.Arg(0).IsImmediate()) {
++                *why = "escritura local a una posición calculada";
++                return std::nullopt;
++            }
++            if (write.Arg(0).U32() != offset) {
++                continue;
++            }
++            writes++;
++            const std::optional<ConstBufferAddr> addr{Track(write.Arg(1), env, host_info, other)};
++            if (!addr || addr->count != 1 || !addr->dynamic_offset.IsEmpty()) {
++                *why = fmt::format("la escritura {} a la palabra local {:#x} no se sigue", writes, offset);
++                return std::nullopt;
++            }
++            if (found && (found->index != addr->index || found->offset != addr->offset ||
++                          found->shift_left != addr->shift_left || found->has_secondary != addr->has_secondary ||
++                          found->secondary_index != addr->secondary_index ||
++                          found->secondary_offset != addr->secondary_offset ||
++                          found->secondary_shift_left != addr->secondary_shift_left ||
++                          found->and_mask != addr->and_mask || found->or_imm != addr->or_imm)) {
++                *why = fmt::format("la palabra local {:#x} recibe handles distintos (c{}[{:#x}] y c{}[{:#x}])", offset,
++                                   found->index, found->offset, addr->index, addr->offset);
++                return std::nullopt;
++            }
++            found = addr;
++        }
++    }
++    if (!found) {
++        *why = fmt::format("nadie escribe la palabra local {:#x}", offset);
++    }
++    return found;
++}
++
+ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const HostTranslateInfo& host_info) {
+     ConstBufferAddr addr;
+     if (IsBindless(inst)) {
+         const std::optional<ConstBufferAddr> track_addr{TrackCached(inst.Arg(0), env, host_info, block)};
+ 
++        std::string local_why;
+         if (track_addr) {
+             addr = *track_addr;
++        } else if (const std::optional<ConstBufferAddr> local{TrackLocal(inst.Arg(0), env, host_info, &local_why)}) {
++            addr = *local;
+         } else if (host_info.support_attribute_texture_handle &&
+                    IsAttributeSourcedHandle(inst.Arg(0))) {
+             // The handle travels with the vertices (sprite batches pick the texture per quad), so
+@@ -588,7 +646,24 @@
+                 .has_secondary = false,
+             };
+         } else {
+-            throw NotImplementedException("Failed to track bindless texture constant buffer");
++            // De dónde sale el handle (unos niveles de su expresión), para saber qué forma no se sigue.
++            const auto describe{[](const auto& self, const IR::Value& value, int depth) -> std::string {
++                if (value.IsImmediate()) {
++                    return value.Type() == IR::Type::U32 ? fmt::format("{:#x}", value.U32()) : std::string{"imm"};
++                }
++                const IR::Inst* const def{value.InstRecursive()};
++                std::string text{fmt::format("{}", def->GetOpcode())};
++                if (depth == 0 || def->GetOpcode() == IR::Opcode::Phi) {
++                    return text;
++                }
++                text += '(';
++                for (size_t k = 0; k < def->NumArgs(); k++) {
++                    text += (k ? ", " : "") + self(self, def->Arg(k), depth - 1);
++                }
++                return text + ')';
++            }};
++            throw NotImplementedException("Failed to track bindless texture constant buffer: {}{}{}",
++                                          describe(describe, inst.Arg(0), 6), local_why.empty() ? "" : "; ", local_why);
+         }
+     } else {
+         addr = ConstBufferAddr{
+@@ -785,6 +860,7 @@
+     env.handle_cache.clear();
+     env.track_cache.clear();
+     TextureInstVector to_replace;
++    t_program = &program;
+     for (IR::Block* const block : program.post_order_blocks) {
+         env.track_cache.clear();
+         for (IR::Inst& inst : block->Instructions()) {
+@@ -894,7 +970,12 @@
+             }
+             const bool is_written{inst->GetOpcode() != IR::Opcode::ImageRead};
+             const bool is_read{inst->GetOpcode() != IR::Opcode::ImageWrite};
+-            const bool is_integer{is_texture_pixel_format_integer(cbuf)};
++            // Una imagen con operaciones atómicas, o declarada con formato entero (r32ui...), es entera aunque no se
++            // sepa aún qué textura tendrá enlazada: con tipo float y formato R32ui el módulo no es SPIR-V válido
++            // (OpImageTexelPointer pide el mismo tipo; los 831 compute de Niagara de Unreal Engine 5).
++            const bool is_atomic{is_written && is_read};
++            const bool is_integer{is_texture_pixel_format_integer(cbuf) || is_atomic ||
++                                  flags.image_format != ImageFormat::Typeless};
+             if (flags.type == TextureType::Buffer) {
+                 index = descriptors.Add(ImageBufferDescriptor{
+                     .format = flags.image_format,

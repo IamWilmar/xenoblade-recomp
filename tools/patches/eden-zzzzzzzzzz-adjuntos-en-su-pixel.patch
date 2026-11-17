@@ -1,0 +1,137 @@
+--- a/src/shader_recompiler/shader_info.h
++++ b/src/shader_recompiler/shader_info.h
+@@ -226,6 +226,9 @@
+     u32 size_shift;
+     u32 handle_and_mask{~0U};  // ver ConstBufferAddr: handle = (valor & handle_and_mask) | handle_or
+     u32 handle_or{};
++    // Port: >= 0, la textura es el adjunto de color con ese índice del pase en curso y el shader la lee en su propio
++    // píxel (mezcla programable de NVN): se declara input attachment y sus muestreos son subpassLoad (nvn_shader.cpp).
++    s32 input_attachment{-1};
+ 
+     auto operator<=>(const TextureDescriptor&) const = default;
+ };
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -43,6 +43,7 @@
+     u32 count;
+     bool is_multisample;
+     bool is_integer;
++    bool is_subpass{};  // port: input attachment (TextureDescriptor::input_attachment); image_type es su OpTypeImage
+ };
+ 
+ struct TextureBufferDefinition {
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -1391,6 +1391,35 @@
+ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_index) {
+     textures.reserve(info.texture_descriptors.size());
+     for (const TextureDescriptor& desc : info.texture_descriptors) {
++        if (desc.input_attachment >= 0) {
++            // Port: adjunto del propio pase leído en su píxel (ver TextureDescriptor::input_attachment).
++            const Id subpass_type{TypeImage(F32[1], spv::Dim::SubpassData, 0, false, false, 2,
++                                            spv::ImageFormat::Unknown)};
++            const Id subpass_pointer{TypePointer(spv::StorageClass::UniformConstant, subpass_type)};
++            const Id subpass_id{AddGlobalVariable(subpass_pointer, spv::StorageClass::UniformConstant)};
++            Decorate(subpass_id, spv::Decoration::Binding, binding);
++            Decorate(subpass_id, spv::Decoration::DescriptorSet, 0U);
++            Decorate(subpass_id, spv::Decoration::InputAttachmentIndex,
++                     static_cast<u32>(desc.input_attachment));
++            Name(subpass_id, NameOf(stage, desc, "subpass"));
++            AddCapability(spv::Capability::InputAttachment);
++            textures.push_back({
++                .id = subpass_id,
++                .sampled_type = subpass_type,
++                .pointer_type = subpass_pointer,
++                .image_type = subpass_type,
++                .count = 1,
++                .is_multisample = false,
++                .is_integer = false,
++                .is_subpass = true,
++            });
++            if (profile.supported_spirv >= 0x00010400) {
++                interfaces.push_back(subpass_id);
++            }
++            ++binding;
++            ++scaling_index;
++            continue;
++        }
+         const Id image_type{ImageType(*this, desc)};
+         const Id sampled_type{TypeSampledImage(image_type)};
+         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, sampled_type)};
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <optional>
++
+ #include <boost/container/static_vector.hpp>
+ 
+ #include "shader_recompiler/backend/spirv/emit_spirv.h"
+@@ -238,8 +240,25 @@
+     spv::ImageOperandsMask mask{};
+ };
+ 
++// Port: la textura es un input attachment (el adjunto del pase que el shader lee en su píxel): su lectura, sea cual sea
++// la coordenada (la mezcla programable de NVN solo garantiza el propio píxel). nullopt: una textura normal.
++std::optional<Id> SubpassRead(EmitContext& ctx, const IR::TextureInstInfo& info) {
++    if (info.type == TextureType::Buffer) {
++        return std::nullopt;
++    }
++    const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
++    if (!def.is_subpass) {
++        return std::nullopt;
++    }
++    const Id image{ctx.OpLoad(def.image_type, def.id)};
++    return ctx.OpImageRead(ctx.F32[4], image, ctx.SConst(0, 0));
++}
++
+ Id Texture(EmitContext& ctx, IR::TextureInstInfo info, [[maybe_unused]] const IR::Value& index) {
+     const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
++    if (def.is_subpass) {
++        throw NotImplementedException("Sampling mode of an input attachment texture");
++    }
+     if (def.count > 1) {
+         auto const idx = index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index);
+         const bool non_uniform{MarkNonUniform(ctx, idx, index, NonUniformKind::SampledImage)};
+@@ -256,6 +275,9 @@
+ }
+ 
+ Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& index) {
++    if (info.type != TextureType::Buffer && ctx.textures.at(info.descriptor_index).is_subpass) {
++        throw NotImplementedException("Query or fetch mode of an input attachment texture");
++    }
+     if (info.type == TextureType::Buffer) {
+         const TextureBufferDefinition& def{ctx.texture_buffers.at(info.descriptor_index)};
+         if (def.count > 1) {
+@@ -557,6 +579,9 @@
+ Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords,
+                               Id bias_lc, const IR::Value& offset) {
+     const auto info{inst->Flags<IR::TextureInstInfo>()};
++    if (const auto subpass{SubpassRead(ctx, info)}) {
++        return *subpass;
++    }
+     const bool is_integer{IsTextureInteger(ctx, info)};
+     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
+     Id color;
+@@ -582,6 +607,9 @@
+ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords,
+                               Id lod, const IR::Value& offset) {
+     const auto info{inst->Flags<IR::TextureInstInfo>()};
++    if (const auto subpass{SubpassRead(ctx, info)}) {
++        return *subpass;
++    }
+     const bool is_integer{IsTextureInteger(ctx, info)};
+     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
+     const ImageOperands operands(ctx, false, true, false, lod, offset);
+@@ -656,6 +684,9 @@
+ Id EmitImageFetch(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords, Id offset,
+                   Id lod, Id ms) {
+     const auto info{inst->Flags<IR::TextureInstInfo>()};
++    if (const auto subpass{SubpassRead(ctx, info)}) {
++        return *subpass;
++    }
+     const bool is_integer{IsTextureInteger(ctx, info)};
+     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
+     AddOffsetToCoordinates(ctx, info, coords, offset);

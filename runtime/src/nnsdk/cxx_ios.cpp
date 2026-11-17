@@ -14,6 +14,7 @@
 
 #include <pthread.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -23,6 +24,11 @@
 #include <new>
 
 #include "nnsdk/runtime.h"
+
+// El mbstate_t de musl (la libc de Nintendo), con su nombre de struct: sale en el mangling de fpos<mbstate_t>.
+struct __mbstate_t {
+    unsigned __opaque1, __opaque2;
+};
 
 namespace std {
 namespace __1 {
@@ -153,10 +159,12 @@ class ios_base {
                               showbase = 0x200, showpos = 0x800, skipws = 0x1000, unitbuf = 0x2000,
                               uppercase = 0x4000, adjustfield = left | right | internal, basefield = dec | oct | hex;
     static constexpr iostate goodbit = 0, badbit = 1, eofbit = 2, failbit = 4;
+    enum seekdir { beg, cur, end };
 
     virtual ~ios_base();
     void init(void* sb);
     void clear(iostate state);
+    void __set_badbit_and_consider_rethrow();
     locale getloc() const;
     void setstate(iostate state) { clear(__rdstate_ | state); }
     bool good() const { return __rdstate_ == 0; }
@@ -208,10 +216,17 @@ class basic_ios<char, char_traits<char>> : public ios_base {
 };
 static_assert(sizeof(basic_ios<char, char_traits<char>>) == 0x98);
 
-// fpos<mbstate_t> de musl: {mbstate_t de 8 bytes, streamoff}; va y vuelve en dos registros.
-struct __pos {
-    long state, off;
+// fpos<mbstate_t> de libc++ con el mbstate_t de musl: {estado de 8 bytes, streamoff}; va y vuelve en dos registros.
+// streamoff es long long: con long el nombre de seekoff no es el que importa el juego.
+using streamoff = long long;
+template <class State>
+class fpos {
+  public:
+    State __st_;
+    streamoff __off_;
 };
+using streampos = fpos<__mbstate_t>;
+static_assert(sizeof(streampos) == 16);
 
 // Las virtuales de la base son las de libc++: el basic_stringbuf del juego hereda imbue, setbuf, sync, showmanyc,
 // xsgetn, uflow y xsputn, y las llama con sus objetos.
@@ -226,8 +241,8 @@ class basic_streambuf<char, char_traits<char>> {
 
     virtual void imbue(const locale& loc);
     virtual basic_streambuf* setbuf(char* s, streamsize n);
-    virtual __pos seekoff(long off, int way, unsigned which);
-    virtual __pos seekpos(__pos sp, unsigned which);
+    virtual streampos seekoff(streamoff off, ios_base::seekdir way, unsigned which);
+    virtual streampos seekpos(streampos sp, unsigned which);
     virtual int sync();
     virtual streamsize showmanyc();
     virtual streamsize xsgetn(char* s, streamsize n);
@@ -275,6 +290,7 @@ class basic_ostream<char, char_traits<char>> : virtual public basic_ios<char, ch
     explicit basic_ostream(basic_streambuf<char, char_traits<char>>* sb) { this->init(sb); }
     ~basic_ostream() override;
     basic_ostream& operator<<(int n);
+    basic_ostream& operator<<(long n);
     basic_ostream& operator<<(unsigned int n);
     basic_ostream& operator<<(unsigned long n);
     basic_ostream& operator<<(unsigned short n);
@@ -329,6 +345,67 @@ std::__1::string make_string(const char* p, size_t n) {
     printf("[libc++] %s\n", what);
     fflush(stdout);
     abort();
+}
+
+// A dónde enlazó el loader un import de función de main: lo que hay en su slot del GOT. Sirve para llamar a la misma
+// función que llamaría el juego cuando esa función no puede ser la copia de libnnsdk (la libc++abi: las excepciones en
+// vuelo las lleva la del loader, que es con la que enlaza main). Se busca en la propia imagen: la cabecera MOD0 (su
+// offset está en +4) da la sección dinámica, y de ahí salen las relocaciones JUMP_SLOT / GLOB_DAT con sus símbolos.
+// Sin objetos con destructor, try ni noexcept (que también deja tabla), como el resto de lo que puede quedar en la
+// pila de una unwind del juego.
+void* game_import(const char* name) {
+    constexpr int64_t kStrTab = 5, kSymTab = 6, kRela = 7, kRelaSize = 8, kPltRelSize = 2, kJmpRel = 23;
+    constexpr uint32_t kGlobDat = 1025, kJumpSlot = 1026;
+    const uint8_t* base = nnsdk::host().main_base;
+    const uint64_t size = nnsdk::host().main_size;
+    auto u32 = [&](uint64_t off) {
+        uint32_t v = 0;
+        if (off + 4 <= size) memcpy(&v, base + off, 4);
+        return v;
+    };
+    auto u64 = [&](uint64_t off) {
+        uint64_t v = 0;
+        if (off + 8 <= size) memcpy(&v, base + off, 8);
+        return v;
+    };
+    if (!base || size < 0x40) return nullptr;
+    const uint64_t mod0 = u32(4);
+    if (mod0 + 8 > size || memcmp(base + mod0, "MOD0", 4) != 0) return nullptr;
+    uint64_t strtab = 0, symtab = 0, tables[2][2] = {};  // {inicio, tamaño} de .rela.plt y de .rela.dyn
+    for (uint64_t off = mod0 + static_cast<int32_t>(u32(mod0 + 4)); off + 16 <= size; off += 16) {
+        const auto tag = static_cast<int64_t>(u64(off));
+        const uint64_t value = u64(off + 8);
+        if (tag == 0) break;
+        if (tag == kStrTab) strtab = value;
+        if (tag == kSymTab) symtab = value;
+        if (tag == kJmpRel) tables[0][0] = value;
+        if (tag == kPltRelSize) tables[0][1] = value;
+        if (tag == kRela) tables[1][0] = value;
+        if (tag == kRelaSize) tables[1][1] = value;
+    }
+    if (!strtab || !symtab) return nullptr;
+    const size_t length = strlen(name) + 1;
+    for (const auto& table : tables) {
+        for (uint64_t off = table[0]; off + 24 <= table[0] + table[1] && off + 24 <= size; off += 24) {
+            const uint64_t slot = u64(off), info = u64(off + 8);
+            const uint32_t type = static_cast<uint32_t>(info), symbol = static_cast<uint32_t>(info >> 32);
+            if (!symbol || (type != kJumpSlot && type != kGlobDat)) continue;
+            const uint64_t text = strtab + u32(symtab + 24 * uint64_t{symbol});
+            if (text + length > size || memcmp(base + text, name, length) != 0) continue;
+            return reinterpret_cast<void*>(u64(slot));
+        }
+    }
+    return nullptr;
+}
+
+// `throw;` desde código de libnnsdk al que el juego llama dentro de un catch suyo: el __cxa_rethrow de main. Ni
+// noexcept ni nada que destruir: la excepción tiene que atravesar este marco sin tabla de limpieza (ver arriba).
+[[noreturn]] void game_rethrow() {
+    static std::atomic<void*> cached{nullptr};
+    void* rethrow = cached.load(std::memory_order_relaxed);
+    if (!rethrow) cached.store(rethrow = game_import("__cxa_rethrow"), std::memory_order_relaxed);
+    if (rethrow) reinterpret_cast<void (*)()>(rethrow)();
+    fail("el juego pide relanzar una excepción y main no importa __cxa_rethrow");
 }
 
 // La tabla clásica de ctype<char> de Nintendo (coincide entera con la del sdk): solo ASCII, de 0x80 en adelante 0.
@@ -643,6 +720,15 @@ void ios_base::clear(iostate state) {
     if (__rdstate_ & __exceptions_) fail("ios_base::clear: ios_base::failure");
 }
 
+// Lo que hace un operator<< del juego en su catch (...) cuando su streambuf lanza (main+0x2998c4, entre su
+// __cxa_begin_catch y su __cxa_end_catch): marca badbit y, si el stream tiene pedidas excepciones para badbit, relanza
+// la que está en vuelo (sdk+0x4b972c). A diferencia de clear(), no hay que crear ninguna excepción: basta con relanzar
+// la del juego con su propia libc++abi.
+void ios_base::__set_badbit_and_consider_rethrow() {
+    __rdstate_ |= badbit;
+    if (__exceptions_ & badbit) game_rethrow();
+}
+
 locale ios_base::getloc() const { return *reinterpret_cast<const locale*>(&__loc_); }
 
 basic_ios<char, char_traits<char>>::~basic_ios() {}
@@ -653,8 +739,12 @@ void basic_streambuf<char, char_traits<char>>::imbue(const locale&) {}
 basic_streambuf<char, char_traits<char>>* basic_streambuf<char, char_traits<char>>::setbuf(char*, streamsize) {
     return this;
 }
-__pos basic_streambuf<char, char_traits<char>>::seekoff(long, int, unsigned) { return {0, -1}; }
-__pos basic_streambuf<char, char_traits<char>>::seekpos(__pos, unsigned) { return {0, -1}; }
+// Los de la base no saben moverse: pos_type(-1), el estado a cero en x0 y -1 en x1 (sdk+0x4b27cc y sdk+0x4b27d8). El
+// juego los tiene tal cual en la vtable de un streambuf suyo que no los redefine (main+0x4c641f8 y main+0x4c64200).
+streampos basic_streambuf<char, char_traits<char>>::seekoff(streamoff, ios_base::seekdir, unsigned) {
+    return {{0, 0}, -1};
+}
+streampos basic_streambuf<char, char_traits<char>>::seekpos(streampos, unsigned) { return {{0, 0}, -1}; }
 int basic_streambuf<char, char_traits<char>>::sync() { return 0; }
 streamsize basic_streambuf<char, char_traits<char>>::showmanyc() { return 0; }
 int basic_streambuf<char, char_traits<char>>::underflow() { return -1; }
@@ -747,6 +837,9 @@ basic_ostream<char, char_traits<char>>& basic_ostream<char, char_traits<char>>::
     const fmtflags base = __fmtflags_ & basefield;
     const long v = base == oct || base == hex ? static_cast<long>(static_cast<unsigned int>(n)) : n;
     return put_integer(*this, static_cast<unsigned long>(v), true);
+}
+basic_ostream<char, char_traits<char>>& basic_ostream<char, char_traits<char>>::operator<<(long n) {
+    return put_integer(*this, static_cast<unsigned long>(n), true);
 }
 basic_ostream<char, char_traits<char>>& basic_ostream<char, char_traits<char>>::operator<<(unsigned int n) {
     return put_integer(*this, n, false);

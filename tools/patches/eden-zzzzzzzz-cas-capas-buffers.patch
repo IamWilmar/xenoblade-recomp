@@ -1,0 +1,439 @@
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
+index d1c08c1..1e68ec2 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
+@@ -248,6 +248,15 @@ Id EmitStorageAtomicExchange32(EmitContext& ctx, const IR::Value& binding, const
+     return StorageAtomicU32(ctx, binding, offset, value, &Sirit::Module::OpAtomicExchange);
+ }
+ 
++Id EmitStorageAtomicCompareExchange32(EmitContext& ctx, const IR::Value& binding,
++                                      const IR::Value& offset, Id compare, Id value) {
++    const Id pointer{StoragePointer(ctx, ctx.storage_types.U32, &StorageDefinitions::U32, binding,
++                                    offset, sizeof(u32))};
++    const auto [scope, semantics]{AtomicArgs(ctx)};
++    return ctx.OpAtomicCompareExchange(ctx.U32[1], pointer, scope, semantics, semantics, value,
++                                       compare);
++}
++
+ Id EmitStorageAtomicIAdd64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+                            Id value) {
+     return StorageAtomicU64(ctx, binding, offset, value, &Sirit::Module::OpAtomicIAdd,
+@@ -461,6 +470,10 @@ Id EmitGlobalAtomicExchange32(EmitContext&) {
+     throw NotImplementedException("SPIR-V Instruction");
+ }
+ 
++Id EmitGlobalAtomicCompareExchange32(EmitContext&) {
++    throw NotImplementedException("SPIR-V Instruction");
++}
++
+ Id EmitGlobalAtomicIAdd64(EmitContext&) {
+     throw NotImplementedException("SPIR-V Instruction");
+ }
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
+index f8e32d1..cc1f585 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
+@@ -262,15 +262,15 @@ Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& ind
+             const Id idx{index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index)};
+             const bool non_uniform{
+                 MarkNonUniform(ctx, idx, index, NonUniformKind::UniformTexelBuffer)};
+-            const Id ptr{ctx.OpAccessChain(ctx.image_buffer_type, def.id, idx)};
+-            const Id object{ctx.OpLoad(ctx.image_buffer_type, ptr)};
++            const Id ptr{ctx.OpAccessChain(def.image_type, def.id, idx)};
++            const Id object{ctx.OpLoad(def.image_type, ptr)};
+             if (non_uniform) {
+                 DecorateNonUniform(ctx, ptr);
+                 DecorateNonUniform(ctx, object);
+             }
+             return object;
+         }
+-        return ctx.OpLoad(ctx.image_buffer_type, def.id);
++        return ctx.OpLoad(def.image_type, def.id);
+     } else {
+         const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
+         if (def.count > 1) {
+@@ -332,7 +332,7 @@ bool IsTextureMsaa(EmitContext& ctx, const IR::TextureInstInfo& info) {
+ 
+ bool IsTextureInteger(EmitContext& ctx, const IR::TextureInstInfo& info) {
+     if (info.type == TextureType::Buffer) {
+-        return false;
++        return ctx.texture_buffers.at(info.descriptor_index).is_integer;
+     }
+     return ctx.textures.at(info.descriptor_index).is_integer;
+ }
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h b/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
+index 165ec3f..ace8318 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
+@@ -365,6 +365,8 @@ Id EmitStorageAtomicXor32(EmitContext& ctx, const IR::Value& binding, const IR::
+                           Id value);
+ Id EmitStorageAtomicExchange32(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+                                Id value);
++Id EmitStorageAtomicCompareExchange32(EmitContext& ctx, const IR::Value& binding,
++                                      const IR::Value& offset, Id compare, Id value);
+ Id EmitStorageAtomicIAdd64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+                            Id value);
+ Id EmitStorageAtomicSMin64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+@@ -426,6 +428,7 @@ Id EmitGlobalAtomicAnd32(EmitContext& ctx);
+ Id EmitGlobalAtomicOr32(EmitContext& ctx);
+ Id EmitGlobalAtomicXor32(EmitContext& ctx);
+ Id EmitGlobalAtomicExchange32(EmitContext& ctx);
++Id EmitGlobalAtomicCompareExchange32(EmitContext& ctx);
+ Id EmitGlobalAtomicIAdd64(EmitContext& ctx);
+ Id EmitGlobalAtomicSMin64(EmitContext& ctx);
+ Id EmitGlobalAtomicUMin64(EmitContext& ctx);
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index aa05688..d123b30 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -1333,19 +1333,27 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
+     const spv::ImageFormat format{spv::ImageFormat::Unknown};
+     image_buffer_type = TypeImage(F32[1], spv::Dim::Buffer, 0U, false, false, 1, format);
+ 
+-    const Id type{TypePointer(spv::StorageClass::UniformConstant, image_buffer_type)};
++    const Id float_pointer{TypePointer(spv::StorageClass::UniformConstant, image_buffer_type)};
++    Id uint_pointer{};
+     texture_buffers.reserve(info.texture_buffer_descriptors.size());
+     for (const TextureBufferDescriptor& desc : info.texture_buffer_descriptors) {
+         if (desc.count != 1) {
+             throw NotImplementedException("Array of texture buffers");
+         }
++        if (desc.is_integer && !image_buffer_type_uint.value) {
++            image_buffer_type_uint = TypeImage(U32[1], spv::Dim::Buffer, 0U, false, false, 1, format);
++            uint_pointer = TypePointer(spv::StorageClass::UniformConstant, image_buffer_type_uint);
++        }
++        const Id type{desc.is_integer ? uint_pointer : float_pointer};
+         const Id id{AddGlobalVariable(type, spv::StorageClass::UniformConstant)};
+         Decorate(id, spv::Decoration::Binding, binding);
+         Decorate(id, spv::Decoration::DescriptorSet, 0U);
+         Name(id, NameOf(stage, desc, "texbuf"));
+         texture_buffers.push_back({
+             .id = id,
++            .image_type = desc.is_integer ? image_buffer_type_uint : image_buffer_type,
+             .count = desc.count,
++            .is_integer = desc.is_integer,
+         });
+         if (profile.supported_spirv >= 0x00010400) {
+             interfaces.push_back(id);
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index a5821e9..f256e2a 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -47,7 +47,9 @@ struct TextureDefinition {
+ 
+ struct TextureBufferDefinition {
+     Id id;
++    Id image_type;
+     u32 count;
++    bool is_integer;
+ };
+ 
+ struct ImageBufferDefinition {
+@@ -253,6 +255,7 @@ public:
+     Id output_u32{};
+ 
+     Id image_buffer_type{};
++    Id image_buffer_type_uint{};
+     Id image_u32{};
+ 
+     std::array<UniformDefinitions, Info::MAX_CBUFS> cbufs{};
+diff --git a/src/shader_recompiler/environment.h b/src/shader_recompiler/environment.h
+index eec3ff7..2225d13 100644
+--- a/src/shader_recompiler/environment.h
++++ b/src/shader_recompiler/environment.h
+@@ -87,6 +87,13 @@ public:
+     [[nodiscard]] virtual bool IsTexturePixelFormatInteger(u32 raw_handle) = 0;
+ 
+     // Un recompilador sin los valores de los cbuf (handle 0) decide por la dirección del handle.
++    /// True when a texelFetch whose instruction says 1D reads a texture buffer (samplerBuffer). The Maxwell
++    /// instruction cannot tell them apart; an emulator asks the bound texture (ReadTextureType), a static
++    /// translator has to decide for the whole program.
++    [[nodiscard]] virtual bool Fetch1DIsBuffer() const {
++        return false;
++    }
++
+     [[nodiscard]] virtual bool IsTextureIntegerAt(u32 cbuf_index, u32 cbuf_offset, u32 raw_handle) {
+         (void)cbuf_index, (void)cbuf_offset;
+         return IsTexturePixelFormatInteger(raw_handle);
+diff --git a/src/shader_recompiler/frontend/ir/ir_emitter.cpp b/src/shader_recompiler/frontend/ir/ir_emitter.cpp
+index 95815d7..0d97cfc 100644
+--- a/src/shader_recompiler/frontend/ir/ir_emitter.cpp
++++ b/src/shader_recompiler/frontend/ir/ir_emitter.cpp
+@@ -1517,6 +1517,11 @@ U32U64 IREmitter::GlobalAtomicXor(const U64& pointer_offset, const U32U64& value
+     }
+ }
+ 
++U32 IREmitter::GlobalAtomicCompareExchange(const U64& pointer_offset, const U32& compare,
++                                           const U32& value) {
++    return Inst<U32>(Opcode::GlobalAtomicCompareExchange32, pointer_offset, compare, value);
++}
++
+ U32U64 IREmitter::GlobalAtomicExchange(const U64& pointer_offset, const U32U64& value) {
+     switch (value.Type()) {
+     case Type::U32:
+diff --git a/src/shader_recompiler/frontend/ir/ir_emitter.h b/src/shader_recompiler/frontend/ir/ir_emitter.h
+index f22f0f7..f929912 100644
+--- a/src/shader_recompiler/frontend/ir/ir_emitter.h
++++ b/src/shader_recompiler/frontend/ir/ir_emitter.h
+@@ -283,6 +283,8 @@ public:
+     [[nodiscard]] U32U64 GlobalAtomicOr(const U64& pointer_offset, const U32U64& value);
+     [[nodiscard]] U32U64 GlobalAtomicXor(const U64& pointer_offset, const U32U64& value);
+     [[nodiscard]] U32U64 GlobalAtomicExchange(const U64& pointer_offset, const U32U64& value);
++    [[nodiscard]] U32 GlobalAtomicCompareExchange(const U64& pointer_offset, const U32& compare,
++                                                  const U32& value);
+ 
+     [[nodiscard]] F32 GlobalAtomicF32Add(const U64& pointer_offset, const Value& value,
+                                          const FpControl control = {});
+diff --git a/src/shader_recompiler/frontend/ir/microinstruction.cpp b/src/shader_recompiler/frontend/ir/microinstruction.cpp
+index 8441798..119fa54 100644
+--- a/src/shader_recompiler/frontend/ir/microinstruction.cpp
++++ b/src/shader_recompiler/frontend/ir/microinstruction.cpp
+@@ -129,6 +129,7 @@ bool Inst::MayHaveSideEffects() const noexcept {
+     case Opcode::GlobalAtomicOr32:
+     case Opcode::GlobalAtomicXor32:
+     case Opcode::GlobalAtomicExchange32:
++    case Opcode::GlobalAtomicCompareExchange32:
+     case Opcode::GlobalAtomicIAdd64:
+     case Opcode::GlobalAtomicSMin64:
+     case Opcode::GlobalAtomicUMin64:
+@@ -165,6 +166,7 @@ bool Inst::MayHaveSideEffects() const noexcept {
+     case Opcode::StorageAtomicOr32:
+     case Opcode::StorageAtomicXor32:
+     case Opcode::StorageAtomicExchange32:
++    case Opcode::StorageAtomicCompareExchange32:
+     case Opcode::StorageAtomicIAdd64:
+     case Opcode::StorageAtomicSMin64:
+     case Opcode::StorageAtomicUMin64:
+diff --git a/src/shader_recompiler/frontend/ir/opcodes.cpp b/src/shader_recompiler/frontend/ir/opcodes.cpp
+index 94ba0f6..1cf62dc 100644
+--- a/src/shader_recompiler/frontend/ir/opcodes.cpp
++++ b/src/shader_recompiler/frontend/ir/opcodes.cpp
+@@ -10,7 +10,7 @@ namespace Shader::IR {
+ 
+ namespace Detail {
+ 
+-OpcodeMeta META_TABLE[534] = {
++OpcodeMeta META_TABLE[536] = {
+ #define OPCODE(name_token, type_token, ...)                                                        \
+     {                                                                                              \
+         .name{#name_token},                                                                        \
+@@ -21,7 +21,7 @@ OpcodeMeta META_TABLE[534] = {
+ #undef OPCODE
+ };
+ 
+-u8 NUM_ARGS[534] = {
++u8 NUM_ARGS[536] = {
+ #define OPCODE(name_token, type_token, ...) u8(CalculateNumArgsOf(Opcode::name_token)),
+ #include "opcodes.inc"
+ #undef OPCODE
+diff --git a/src/shader_recompiler/frontend/ir/opcodes.h b/src/shader_recompiler/frontend/ir/opcodes.h
+index 50f9d7b..1a79f39 100644
+--- a/src/shader_recompiler/frontend/ir/opcodes.h
++++ b/src/shader_recompiler/frontend/ir/opcodes.h
+@@ -57,12 +57,12 @@ static constexpr Type F64x2{Type::F64x2};
+ static constexpr Type F64x3{Type::F64x3};
+ static constexpr Type F64x4{Type::F64x4};
+ 
+-extern OpcodeMeta META_TABLE[534];
++extern OpcodeMeta META_TABLE[536];
+ constexpr size_t CalculateNumArgsOf(Opcode op) noexcept {
+     const auto& arg_types = META_TABLE[size_t(op)].arg_types;
+     return size_t(std::distance(arg_types.begin(), std::ranges::find(arg_types, Type::Void)));
+ }
+-extern u8 NUM_ARGS[534];
++extern u8 NUM_ARGS[536];
+ } // namespace Detail
+ 
+ /// Get return type of an opcode
+diff --git a/src/shader_recompiler/frontend/ir/opcodes.inc b/src/shader_recompiler/frontend/ir/opcodes.inc
+index fee0afa..6f06a79 100644
+--- a/src/shader_recompiler/frontend/ir/opcodes.inc
++++ b/src/shader_recompiler/frontend/ir/opcodes.inc
+@@ -361,6 +361,7 @@ OPCODE(GlobalAtomicAnd32,                                   U32,            U64,
+ OPCODE(GlobalAtomicOr32,                                    U32,            U64,            U32,                                                            )
+ OPCODE(GlobalAtomicXor32,                                   U32,            U64,            U32,                                                            )
+ OPCODE(GlobalAtomicExchange32,                              U32,            U64,            U32,                                                            )
++OPCODE(GlobalAtomicCompareExchange32,                       U32,            U64,            U32,            U32,                                            )
+ OPCODE(GlobalAtomicIAdd64,                                  U64,            U64,            U64,                                                            )
+ OPCODE(GlobalAtomicSMin64,                                  U64,            U64,            U64,                                                            )
+ OPCODE(GlobalAtomicUMin64,                                  U64,            U64,            U64,                                                            )
+@@ -398,6 +399,7 @@ OPCODE(StorageAtomicAnd32,                                  U32,            U32,
+ OPCODE(StorageAtomicOr32,                                   U32,            U32,            U32,            U32,                                            )
+ OPCODE(StorageAtomicXor32,                                  U32,            U32,            U32,            U32,                                            )
+ OPCODE(StorageAtomicExchange32,                             U32,            U32,            U32,            U32,                                            )
++OPCODE(StorageAtomicCompareExchange32,                      U32,            U32,            U32,            U32,            U32,                            )
+ OPCODE(StorageAtomicIAdd64,                                 U64,            U32,            U32,            U64,                                            )
+ OPCODE(StorageAtomicSMin64,                                 U64,            U32,            U32,            U64,                                            )
+ OPCODE(StorageAtomicUMin64,                                 U64,            U32,            U32,            U64,                                            )
+diff --git a/src/shader_recompiler/frontend/maxwell/translate/impl/atomic_operations_global_memory.cpp b/src/shader_recompiler/frontend/maxwell/translate/impl/atomic_operations_global_memory.cpp
+index 7508777..804916c 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate/impl/atomic_operations_global_memory.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate/impl/atomic_operations_global_memory.cpp
+@@ -201,6 +201,27 @@ void TranslatorVisitor::ATOM(u64 insn) {
+     GlobalAtomic(*this, atom.dest_reg, atom.operand_reg, offset, atom.size, atom.op, true);
+ }
+ 
++// ATOM (cas): comparar e intercambiar sobre memoria global. Codificación (como la emite el compilador de NVIDIA y recoge
++// nouveau, emitATOM de gm107): destino en los bits 0-7, dirección como en ATOM, el valor de comparar en el registro de
++// los bits 20-27 y el nuevo en el siguiente, tamaño en 49-51 (0: 32 bits, 1: 64 bits). Devuelve lo que había.
++// Unreal Engine 5 lo usa en GPUFeedbackCompaction.usf (BuildFeedbackHashTableCS, InterlockedCompareExchange): sin él no hay
++// realimentación de las texturas virtuales y los materiales se quedan sin páginas (todo blanco).
++void TranslatorVisitor::ATOM_cas(u64 insn) {
++    union {
++        u64 raw;
++        BitField<0, 8, IR::Reg> dest_reg;
++        BitField<20, 8, IR::Reg> compare_reg;
++        BitField<49, 3, u64> size;
++    } const atom{insn};
++    if (atom.size != 0) {
++        throw NotImplementedException("ATOM (cas) size {}", atom.size.Value());
++    }
++    const IR::U64 offset{AtomOffset(*this, insn)};
++    const IR::U32 compare{X(atom.compare_reg)};
++    const IR::U32 value{X(atom.compare_reg + 1)};
++    X(atom.dest_reg, ir.GlobalAtomicCompareExchange(offset, compare, value));
++}
++
+ void TranslatorVisitor::RED(u64 insn) {
+     union {
+         u64 raw;
+diff --git a/src/shader_recompiler/frontend/maxwell/translate/impl/not_implemented.cpp b/src/shader_recompiler/frontend/maxwell/translate/impl/not_implemented.cpp
+index aed4dc5..9080fda 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate/impl/not_implemented.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate/impl/not_implemented.cpp
+@@ -16,10 +16,6 @@ namespace Shader::Maxwell {
+     throw NotImplementedException("Instruction {} is not implemented", opcode);
+ }
+ 
+-void TranslatorVisitor::ATOM_cas(u64) {
+-    ThrowNotImplemented(Opcode::ATOM_cas);
+-}
+-
+ void TranslatorVisitor::ATOMS_cas(u64) {
+     ThrowNotImplemented(Opcode::ATOMS_cas);
+ }
+diff --git a/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp b/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
+index 9010c2b..90f2d0a 100644
+--- a/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
++++ b/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
+@@ -388,6 +388,7 @@ void VisitUsages(Info& info, IR::Inst& inst) {
+     case IR::Opcode::GlobalAtomicOr32:
+     case IR::Opcode::GlobalAtomicXor32:
+     case IR::Opcode::GlobalAtomicExchange32:
++    case IR::Opcode::GlobalAtomicCompareExchange32:
+     case IR::Opcode::GlobalAtomicIAdd64:
+     case IR::Opcode::GlobalAtomicSMin64:
+     case IR::Opcode::GlobalAtomicUMin64:
+@@ -630,6 +631,7 @@ void VisitUsages(Info& info, IR::Inst& inst) {
+     case IR::Opcode::StorageAtomicOr32:
+     case IR::Opcode::StorageAtomicXor32:
+     case IR::Opcode::StorageAtomicExchange32:
++    case IR::Opcode::StorageAtomicCompareExchange32:
+         info.used_storage_buffer_types |= IR::Type::U32;
+         break;
+     case IR::Opcode::LoadStorage64:
+diff --git a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+index f49d54e..7fcbc96 100644
+--- a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
++++ b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+@@ -84,6 +84,7 @@ bool IsGlobalMemory(const IR::Inst& inst) {
+     case IR::Opcode::GlobalAtomicOr32:
+     case IR::Opcode::GlobalAtomicXor32:
+     case IR::Opcode::GlobalAtomicExchange32:
++    case IR::Opcode::GlobalAtomicCompareExchange32:
+     case IR::Opcode::GlobalAtomicIAdd64:
+     case IR::Opcode::GlobalAtomicSMin64:
+     case IR::Opcode::GlobalAtomicUMin64:
+@@ -136,6 +137,7 @@ bool IsGlobalMemoryWrite(const IR::Inst& inst) {
+     case IR::Opcode::GlobalAtomicOr32:
+     case IR::Opcode::GlobalAtomicXor32:
+     case IR::Opcode::GlobalAtomicExchange32:
++    case IR::Opcode::GlobalAtomicCompareExchange32:
+     case IR::Opcode::GlobalAtomicIAdd64:
+     case IR::Opcode::GlobalAtomicSMin64:
+     case IR::Opcode::GlobalAtomicUMin64:
+@@ -220,6 +222,8 @@ IR::Opcode GlobalToStorage(IR::Opcode opcode) {
+         return IR::Opcode::StorageAtomicXor32;
+     case IR::Opcode::GlobalAtomicExchange32:
+         return IR::Opcode::StorageAtomicExchange32;
++    case IR::Opcode::GlobalAtomicCompareExchange32:
++        return IR::Opcode::StorageAtomicCompareExchange32;
+     case IR::Opcode::GlobalAtomicIAdd64:
+         return IR::Opcode::StorageAtomicIAdd64;
+     case IR::Opcode::GlobalAtomicSMin64:
+@@ -455,8 +459,11 @@ void ReplaceAtomic(IR::Block& block, IR::Inst& inst, const IR::U32& storage_inde
+                    const IR::U32& offset) {
+     const IR::Opcode new_opcode{GlobalToStorage(inst.GetOpcode())};
+     const auto it{IR::Block::InstructionList::s_iterator_to(inst)};
++    // Comparar e intercambiar lleva dos valores (el de comparar y el nuevo).
++    const bool cas{inst.GetOpcode() == IR::Opcode::GlobalAtomicCompareExchange32};
+     const IR::Value value{
+-        &*block.PrependNewInst(it, new_opcode, {storage_index, offset, inst.Arg(1)})};
++        cas ? &*block.PrependNewInst(it, new_opcode, {storage_index, offset, inst.Arg(1), inst.Arg(2)})
++            : &*block.PrependNewInst(it, new_opcode, {storage_index, offset, inst.Arg(1)})};
+     inst.ReplaceUsesWith(value);
+ }
+ 
+@@ -491,6 +498,7 @@ void Replace(IR::Block& block, IR::Inst& inst, const IR::U32& storage_index,
+     case IR::Opcode::GlobalAtomicOr32:
+     case IR::Opcode::GlobalAtomicXor32:
+     case IR::Opcode::GlobalAtomicExchange32:
++    case IR::Opcode::GlobalAtomicCompareExchange32:
+     case IR::Opcode::GlobalAtomicIAdd64:
+     case IR::Opcode::GlobalAtomicSMin64:
+     case IR::Opcode::GlobalAtomicUMin64:
+diff --git a/src/shader_recompiler/ir_opt/texture_pass.cpp b/src/shader_recompiler/ir_opt/texture_pass.cpp
+index b43e9cd..cbbd368 100644
+--- a/src/shader_recompiler/ir_opt/texture_pass.cpp
++++ b/src/shader_recompiler/ir_opt/texture_pass.cpp
+@@ -717,7 +717,7 @@ public:
+           texture_descriptors{texture_descriptors_}, image_descriptors{image_descriptors_} {}
+ 
+     u32 Add(const TextureBufferDescriptor& desc) {
+-        return Add(texture_buffer_descriptors, desc, [&desc](const auto& existing) {
++        const u32 index{Add(texture_buffer_descriptors, desc, [&desc](const auto& existing) {
+             return desc.cbuf_index == existing.cbuf_index &&
+                    desc.cbuf_offset == existing.cbuf_offset &&
+                    desc.shift_left == existing.shift_left &&
+@@ -726,7 +726,9 @@ public:
+                    desc.secondary_shift_left == existing.secondary_shift_left &&
+                    desc.count == existing.count && desc.size_shift == existing.size_shift &&
+                    desc.has_secondary == existing.has_secondary;
+-        });
++        })};
++        texture_buffer_descriptors[index].is_integer |= desc.is_integer;
++        return index;
+     }
+ 
+     u32 Add(const ImageBufferDescriptor& desc) {
+@@ -937,7 +939,9 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
+             if (flags.type != TextureType::Color1D) {
+                 break;
+             }
+-            if (ReadTextureTypeCached(env, cbuf) == TextureType::Buffer) {
++            // (Not for arrays indexed at run time: there are no arrays of texture buffers.)
++            if ((env.Fetch1DIsBuffer() && cbuf.count <= 1) ||
++                ReadTextureTypeCached(env, cbuf) == TextureType::Buffer) {
+                 // Replace with the bound texture type only when it's a texture buffer
+                 // If the instruction is 1D and the bound type is 2D, don't change the code and let
+                 // the rasterizer robustness handle it
+@@ -1006,6 +1010,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
+             if (flags.type == TextureType::Buffer) {
+                 index = descriptors.Add(TextureBufferDescriptor{
+                     .has_secondary = cbuf.has_secondary,
++                    .is_integer = is_texture_pixel_format_integer(cbuf),
+                     .cbuf_index = cbuf.index,
+                     .cbuf_offset = cbuf.offset,
+                     .shift_left = cbuf.shift_left,
+diff --git a/src/shader_recompiler/shader_info.h b/src/shader_recompiler/shader_info.h
+index 8a32017..1325121 100644
+--- a/src/shader_recompiler/shader_info.h
++++ b/src/shader_recompiler/shader_info.h
+@@ -182,6 +182,7 @@ struct StorageBufferDescriptor {
+ 
+ struct TextureBufferDescriptor {
+     bool has_secondary;
++    bool is_integer;  // usamplerBuffer: the program only uses what it fetches as integers
+     u32 cbuf_index;
+     u32 cbuf_offset;
+     u32 shift_left;

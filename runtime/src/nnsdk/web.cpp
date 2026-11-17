@@ -9,6 +9,10 @@
 
 #include "nnsdk/types.h"
 
+namespace nn::account {
+struct Uid;
+}
+
 namespace nn::web {
 
 namespace {
@@ -22,6 +26,11 @@ constexpr Result kResultWebNotAvailable{210 | (1 << 9)};
 class ShowWebPageArg {
 public:
     explicit ShowWebPageArg(const char* url);
+    // Opciones del navegador (Unreal las pone antes de abrir una página): no hay applet que las lea.
+    void SetCallbackUrl(const char* url);
+    void SetCallbackableUrl(const char* url);
+    void SetPointerEnabled(bool enabled);
+    void SetUid(const account::Uid& uid);
 
 private:
     uint8_t data_[0x2000];
@@ -30,6 +39,8 @@ private:
 class WebPageReturnValue {
 public:
     WebPageReturnValue();
+    int GetWebExitReason() const;
+    const char* GetLastUrl() const;
 
 private:
     uint8_t data_[0x2000];
@@ -38,6 +49,7 @@ private:
 class ShowOfflineHtmlPageArg {
 public:
     explicit ShowOfflineHtmlPageArg(const char* path);
+    void SetPointerEnabled(bool enabled);
 
 private:
     uint8_t data_[0x2000];
@@ -46,6 +58,8 @@ private:
 class OfflineHtmlPageReturnValue {
 public:
     OfflineHtmlPageReturnValue();
+    int GetOfflineExitReason() const;
+    const char* GetLastUrl() const;
 
 private:
     [[maybe_unused]] uint64_t exit_reason_;
@@ -77,6 +91,17 @@ ShowOfflineHtmlPageArg::ShowOfflineHtmlPageArg(const char*) { memset(data_, 0, s
 
 // 0x14: lo que pone el SDK antes de que el applet conteste.
 OfflineHtmlPageReturnValue::OfflineHtmlPageReturnValue() : exit_reason_(0x14) { memset(last_url_, 0, sizeof last_url_); }
+
+void ShowWebPageArg::SetCallbackUrl(const char*) {}
+void ShowWebPageArg::SetCallbackableUrl(const char*) {}
+void ShowWebPageArg::SetPointerEnabled(bool) {}
+void ShowWebPageArg::SetUid(const account::Uid&) {}
+void ShowOfflineHtmlPageArg::SetPointerEnabled(bool) {}
+// El navegador no llegó a abrirse: motivo 0 (cerrado por el usuario, sin página de vuelta) y URL vacía.
+int WebPageReturnValue::GetWebExitReason() const { return 0; }
+const char* WebPageReturnValue::GetLastUrl() const { return ""; }
+int OfflineHtmlPageReturnValue::GetOfflineExitReason() const { return 0; }
+const char* OfflineHtmlPageReturnValue::GetLastUrl() const { return last_url_; }
 
 Result ShowWebPage(WebPageReturnValue*, const ShowWebPageArg&) {
     printf("[web] ShowWebPage: no hay navegador\n");

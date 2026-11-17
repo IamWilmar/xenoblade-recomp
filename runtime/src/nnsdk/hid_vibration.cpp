@@ -52,6 +52,26 @@ struct VibrationFileInfo {
 };
 static_assert(sizeof(VibrationFileInfo) == 0x20);
 
+// Con lo que se saca una muestra de un .bnvib ya analizado, sin VibrationPlayer. Para el juego es opaco (10 palabras
+// en el plugin de C#, IntPtrArray10); el sdk de Disco Elysium solo le pone el puntero a las muestras y cuántas hay
+// (sdk+0x220208) y solo eso lee (sdk+0x225620), así que aquí no se toca nada más allá de esos 16 bytes.
+struct VibrationFileParserContext {
+    const uint8_t* samples;
+    uint32_t reserved;
+    int32_t sample_count;
+};
+
+// Lo que hay que decir de una lista de valores para hacer con ella un .bnvib (0x14 bytes, el plugin lo copia entero:
+// main+0x1ce2e0c): cuántas muestras y, si hace bucle, entre cuáles y con cuántas de pausa entre vueltas.
+struct VibrationValueArrayInfo {
+    int32_t sample_length;
+    bool is_loop;
+    uint32_t loop_start_position;
+    uint32_t loop_end_position;
+    int32_t loop_interval;
+};
+static_assert(sizeof(VibrationValueArrayInfo) == 0x14);
+
 namespace detail {
 // Nodo de nn::util::IntrusiveList: lista circular con cabecera, {anterior, siguiente}.
 struct ListNode {
@@ -165,6 +185,7 @@ public:
     void SetCurrentPosition(int position);
     int GetCurrentPosition() const;
     void SetLoop(bool loop);
+    bool IsLoop() const;  // SDK 12 (Xenoblade 3)
     void SetLoopStartPosition(int position);
     void SetLoopEndPosition(int position);
     void SetLoopInterval(int interval);
@@ -304,6 +325,33 @@ Result parse_vibration_file(VibrationFileInfo* info, const uint8_t** data, int32
     *count = info->sample_length;
     return header + info->data_size > size ? kResultTruncatedData : ResultSuccess;
 }
+
+// Una muestra son 4 bytes: amplitud baja, frecuencia baja, amplitud alta, frecuencia alta. La amplitud va en 1/255;
+// la frecuencia son 10 Hz · 2^(b/32): 3 bits de octava (10 Hz << n) y 5 de fracción (sdk+0x220240). La fracción sale
+// de la tabla del sdk (sdk+0xa6c1cc), que es 2^(k/32) con seis decimales: con exp2 el resultado se va en los últimos
+// bits (tools/tests/sdk_puro_test.cpp lo compara con el sdk).
+constexpr float kOctaveFraction[32] = {
+    1.000000f, 1.021897f, 1.044274f, 1.067140f, 1.090508f, 1.114387f, 1.138789f, 1.163725f,
+    1.189207f, 1.215247f, 1.241858f, 1.269051f, 1.296840f, 1.325237f, 1.354256f, 1.383910f,
+    1.414214f, 1.445181f, 1.476826f, 1.509164f, 1.542211f, 1.575981f, 1.610490f, 1.645755f,
+    1.681793f, 1.718619f, 1.756252f, 1.794709f, 1.834008f, 1.874168f, 1.915207f, 1.957144f,
+};
+void decode_sample(VibrationValue* value, const uint8_t* s) {
+    auto frequency = [](uint8_t b) { return kOctaveFraction[b & 0x1F] * float(10 << (b >> 5)); };
+    *value = {s[0] / 255.0f, frequency(s[1]), s[2] / 255.0f, frequency(s[3])};
+}
+
+// Lo contrario, como lo hace el sdk al generar un fichero (sdk+0x2203f4): redondeo al más cercano y tope en 0..255
+// (una frecuencia de menos de 10 Hz, o un NaN, se quedan en 0).
+uint8_t encode_byte(float v) {
+    v = std::fmin(std::fmax(std::round(v), 0.0f), 255.0f);
+    return static_cast<uint8_t>(static_cast<int>(v));
+}
+uint8_t encode_amplitude(float amplitude) { return encode_byte(amplitude * 255.0f); }
+uint8_t encode_frequency(float hz) { return encode_byte(std::log2(hz / 10.0f) * 32.0f); }
+
+void write32(uint8_t* p, uint32_t v) { memcpy(p, &v, sizeof v); }
+void write16(uint8_t* p, uint16_t v) { memcpy(p, &v, sizeof v); }
 
 }  // namespace
 
@@ -559,6 +607,11 @@ void VibrationPlayer::SetLoop(bool loop) {
     if (playable_) loop_ = loop;
 }
 
+bool VibrationPlayer::IsLoop() const {
+    std::lock_guard lock(graph_mutex());
+    return loop_;
+}
+
 void VibrationPlayer::SetLoopStartPosition(int position) {
     std::lock_guard lock(graph_mutex());
     if (playable_ && position >= 0) loop_start_ = position;
@@ -574,16 +627,12 @@ void VibrationPlayer::SetLoopInterval(int interval) {
     if (playable_ && interval >= 0) loop_interval_ = interval;
 }
 
-// Muestra de 4 bytes: amplitud baja, frecuencia baja, amplitud alta, frecuencia alta. Amplitud en 1/255; frecuencia
-// con 3 bits de octava (10 Hz << n) y 5 de semitono fino (2^(k/32)).
 void VibrationPlayer::Retrieve(VibrationValue* value, int index) const {
     if (!data_ || index < 0 || index >= sample_count_) {
         *value = kSilence;
         return;
     }
-    const uint8_t* s = data_ + size_t(index) * 4;
-    auto frequency = [](uint8_t b) { return std::exp2(float(b & 0x1F) / 32.0f) * float(10 << (b >> 5)); };
-    *value = {s[0] / 255.0f, frequency(s[1]), s[2] / 255.0f, frequency(s[3])};
+    decode_sample(value, data_ + size_t(index) * 4);
 }
 
 // La misma máquina que el SDK: la espera inicial, luego tantas muestras como diga la velocidad acumulada; con bucle,
@@ -624,6 +673,75 @@ void VibrationPlayer::OnNextSampleRequired(VibrationValue* value, detail::ListNo
     speed_acc_ = acc + speed_;
 }
 
+// --- Ficheros .bnvib sin VibrationPlayer ---
+// Disco Elysium solo los tiene porque el plugin de C# trae todo nn::hid (VibrationFile.Parse y compañía, envoltorios
+// en main+0x155c5c0..0x155c600): ningún método del juego los llama. Son cuentas que el sdk hace en el propio proceso,
+// así que están hechas igual.
+
+// Como el sdk (sdk+0x220110), con sus mismos errores (202-141..145). El contexto solo queda listo si el fichero se
+// pudo recorrer entero (éxito, o datos más cortos de lo que dice la cabecera).
+Result ParseVibrationFile(VibrationFileInfo* info, VibrationFileParserContext* context, const void* file, size_t size) {
+    if (!info || !context) return kResultInvalidVibrationFile;  // el sdk aborta
+    const uint8_t* samples = nullptr;
+    int32_t count = 0;
+    const Result r = parse_vibration_file(info, &samples, &count, static_cast<const uint8_t*>(file), size);
+    if (samples) {
+        context->samples = samples;
+        context->sample_count = count;
+    }
+    return r;
+}
+
+// La muestra `position` del fichero. Fuera de rango o sin contexto el sdk aborta (sdk+0x22562c): aquí no escribe.
+void RetrieveVibrationValue(VibrationValue* value, int position, VibrationFileParserContext* context) {
+    if (!value || !context || !context->samples || position < 0 || position >= context->sample_count) return;
+    decode_sample(value, context->samples + size_t(position) * 4);
+}
+
+// Cabecera de 12, 20 o 24 bytes (sin bucle, con bucle, con bucle y pausa) más 4 por muestra (sdk+0x2204c0, en 32
+// bits como él).
+size_t CalculateVibrationFileSize(const VibrationValueArrayInfo& info) {
+    const uint32_t header = !info.is_loop ? 0xc : info.loop_interval == 0 ? 0x14 : 0x18;
+    return static_cast<uint32_t>(header + (static_cast<uint32_t>(info.sample_length) << 2));
+}
+
+// Escribe el .bnvib de una lista de valores (sdk+0x2202d0): metainformación (4, 12 o 16 bytes según el bucle),
+// formato 3 a 200 muestras por segundo, tamaño de los datos y las muestras. El sdk aborta si falta algo, si el
+// fichero no cabe o si el bucle no es coherente (sdk+0x2256cc..0x225718): aquí vuelve con tamaño 0 sin escribir.
+void GenerateVibrationFile(size_t* out_size, void* buffer, size_t buffer_size, const VibrationValueArrayInfo& info,
+                           const VibrationValue* values) {
+    if (!out_size) return;
+    *out_size = 0;
+    if (!buffer || !values || buffer_size == 0 || CalculateVibrationFileSize(info) > buffer_size ||
+        info.sample_length <= 0 || info.loop_start_position > info.loop_end_position ||
+        info.loop_end_position > static_cast<uint32_t>(info.sample_length) || info.loop_interval < 0)
+        return;
+    auto* p = static_cast<uint8_t*>(buffer);
+    size_t offset = 8;
+    write32(p, 4);
+    write16(p + 4, 3);
+    write16(p + 6, 200);
+    if (info.is_loop) {
+        write32(p, info.loop_interval == 0 ? 0xc : 0x10);
+        write32(p + 8, info.loop_start_position);
+        write32(p + 0xc, info.loop_end_position);
+        offset = 0x10;
+        if (info.loop_interval != 0) {
+            write32(p + 0x10, static_cast<uint32_t>(info.loop_interval));
+            offset = 0x14;
+        }
+    }
+    write32(p + offset, static_cast<uint32_t>(info.sample_length) << 2);
+    uint8_t* s = p + offset + 4;
+    for (int32_t k = 0; k < info.sample_length; k++, s += 4) {
+        s[0] = encode_amplitude(values[k].amplitude_low);
+        s[1] = encode_frequency(values[k].frequency_low);
+        s[2] = encode_amplitude(values[k].amplitude_high);
+        s[3] = encode_frequency(values[k].frequency_high);
+    }
+    *out_size = CalculateVibrationFileSize(info);
+}
+
 }  // namespace nn::hid
 
 // VibrationPlayer::OnNextSampleRequired(VibrationValue*, IntrusiveList<VibrationNodeConnection, …>*) del SDK 9.
@@ -632,3 +750,33 @@ _ZN2nn3hid15VibrationPlayer20OnNextSampleRequiredEPNS0_14VibrationValueEPNS_4uti
     nn::hid::VibrationPlayer* player, nn::hid::VibrationValue* value, nn::hid::detail::ListNode* inputs) {
     nn::hid::VibrationPlayer::next_sample_sdk9(player, value, inputs);
 }
+
+// --- VibrationConverter ---------------------------------------------------------------------------------------------
+// Convierte audio PCM16 en valores de vibración, un trozo de 5 ms cada vez (Unreal Engine: sus efectos de vibración
+// "por audio"). El del SDK analiza el espectro del trozo; aquí la amplitud de las dos bandas sale del nivel (RMS) del
+// trozo, a las frecuencias de serie (160 y 320 Hz). No guarda estado en el objeto del juego, cuyo tamaño real no se
+// conoce.
+namespace nn::hid {
+
+class VibrationConverter {
+public:
+    explicit VibrationConverter(int sample_rate);
+    ~VibrationConverter();
+    void ProcessChunk(VibrationValue* out, const int16_t* samples, int count);
+    static const TimeSpan ChunkDuration;
+};
+
+const TimeSpan VibrationConverter::ChunkDuration{5'000'000};  // 5 ms, un valor de vibración por trozo
+
+VibrationConverter::VibrationConverter(int) {}
+VibrationConverter::~VibrationConverter() {}
+void VibrationConverter::ProcessChunk(VibrationValue* out, const int16_t* samples, int count) {
+    if (!out) return;
+    double sum = 0;
+    for (int i = 0; samples && i < count; i++) sum += double(samples[i]) * double(samples[i]);
+    const float level = count > 0 && samples ? static_cast<float>(std::sqrt(sum / count) / 32768.0) : 0.0f;
+    const float amplitude = level > 1.0f ? 1.0f : level;
+    *out = {amplitude, 160.0f, amplitude, 320.0f};
+}
+
+}  // namespace nn::hid

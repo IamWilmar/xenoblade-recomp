@@ -3,16 +3,19 @@
      the game. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.iamwilmar.xenobladeport"
-    android:versionCode="3"
-    android:versionName="0.11.0">
+    android:versionCode="4"
+    android:versionName="0.12.0">
 
     <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="33" />
     <!-- Reads the game files wherever the user put them: SetupActivity asks for it (or adb appops, tools/apk.sh). -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- Controller rumble (nn::hid vibration). -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
         android:label="Xenoblade DE port"
         android:icon="@mipmap/ic_launcher"
+        android:allowNativeHeapPointerTagging="false"
         android:extractNativeLibs="true">
         <activity
             android:name=".SetupActivity"

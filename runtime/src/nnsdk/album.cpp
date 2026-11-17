@@ -115,6 +115,11 @@ int GetImageWidth(ImageSize size) { return size == ImageSize_1280x720 ? kWidth :
 int GetImageHeight(ImageSize size) { return size == ImageSize_1280x720 ? kHeight : 0; }
 
 // La orientación solo es un dato para el visor del álbum: la imagen llega ya como se ve.
+// SDK 12 (Xenoblade 3): la captura de pantalla de lo que se ve. Sin álbum en Android: éxito sin guardar nada.
+Result SaveCurrentScreenshot(AlbumReportOption) {
+    printf("[album] SaveCurrentScreenshot: sin álbum, no se guarda\n");
+    return ResultSuccess;
+}
 Result SaveScreenshot(const void* image, size_t size, ImageSize image_size, ImageOrientation, AlbumReportOption) {
     return save(image, size, image_size);
 }

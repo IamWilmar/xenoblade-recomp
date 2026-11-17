@@ -109,7 +109,9 @@ void serialize(const nvnshader::Translated& t, std::vector<uint8_t>& out) {
                                             r.texture_type, r.is_depth, r.is_written, r.has_secondary,
                                             r.secondary_cbuf_index, r.secondary_cbuf_offset, r.shift_left,
                                             r.secondary_shift_left, r.count, r.size_shift, r.handle_and_mask, r.handle_or,
-                                            r.set, r.is_integer};
+                                            r.set,
+                                            // is_integer (bit 0) e input_attachment + 1 (bits 8-15; 0: ninguno)
+                                            uint32_t{r.is_integer} | (static_cast<uint32_t>(r.input_attachment + 1) & 0xff) << 8};
         o.put(w, sizeof w);
     }
     o.u32(t.constant_buffer_mask);
@@ -118,8 +120,11 @@ void serialize(const nvnshader::Translated& t, std::vector<uint8_t>& out) {
     o.u64(t.output_generics);
     o.u32(t.color_outputs);
     o.u32(t.has_brx);
-    o.u32(t.has_bindless_set);
+    // bit 1: GS de paso; bit 2: variante de tanda con recorte (a 0 en lo guardado antes de que existiera: su clave es otra)
+    o.u32(uint32_t{t.has_bindless_set} | uint32_t{t.geometry_passthrough} << 1 | uint32_t{t.layer_cull} << 2);
     o.u32(static_cast<uint32_t>(t.conditional_barriers));
+    o.u32(static_cast<uint32_t>(t.layer_gs.size()));
+    o.put(t.layer_gs.data(), t.layer_gs.size() * sizeof(uint32_t));
 }
 
 bool deserialize(const uint8_t* data, size_t size, nvnshader::Translated& t) {
@@ -144,7 +149,8 @@ bool deserialize(const uint8_t* data, size_t size, nvnshader::Translated& t) {
         r.is_depth = w[5] != 0, r.is_written = w[6] != 0, r.has_secondary = w[7] != 0;
         r.secondary_cbuf_index = w[8], r.secondary_cbuf_offset = w[9], r.shift_left = w[10], r.secondary_shift_left = w[11];
         r.count = w[12], r.size_shift = w[13], r.handle_and_mask = w[14], r.handle_or = w[15], r.set = w[16];
-        r.is_integer = w[17] != 0;  // antes la palabra de reserva (0): las de un traductor anterior no se leen (huella)
+        r.is_integer = (w[17] & 1) != 0;
+        r.input_attachment = static_cast<int8_t>(static_cast<int>((w[17] >> 8) & 0xff) - 1);  // antes la palabra de reserva (0): las de un traductor anterior no se leen (huella)
     }
     t.constant_buffer_mask = in.u32();
     in.get(t.constant_buffer_used, sizeof t.constant_buffer_used);
@@ -152,8 +158,15 @@ bool deserialize(const uint8_t* data, size_t size, nvnshader::Translated& t) {
     t.output_generics = in.u64();
     t.color_outputs = in.u32();
     t.has_brx = in.u32() != 0;
-    t.has_bindless_set = in.u32() != 0;
+    const uint32_t flags = in.u32();
+    t.has_bindless_set = flags & 1;
+    t.geometry_passthrough = (flags >> 1) & 1;
+    t.layer_cull = (flags >> 2) & 1;
     t.conditional_barriers = static_cast<int>(in.u32());
+    const uint32_t layer_words = in.u32();
+    if (!in.ok || layer_words > in.n / 4) return false;
+    t.layer_gs.resize(layer_words);
+    in.get(t.layer_gs.data(), layer_words * sizeof(uint32_t));
     // SPIR-V de verdad (número mágico) y nada sobrante.
     return in.ok && in.n == 0 && t.spirv.size() >= 5 && t.spirv[0] == 0x07230203;
 }

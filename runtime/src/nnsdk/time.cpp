@@ -7,6 +7,7 @@
 #include <sys/system_properties.h>
 #include <time.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -42,9 +43,12 @@ struct TimeZoneRule {
 };
 static_assert(sizeof(CalendarTime) == 8 && sizeof(CalendarAdditionalInfo) == 24 && sizeof(LocationName) == 36);
 
+struct SteadyClockTimePoint;
+struct SystemClockContext;
 class StandardUserSystemClock {
 public:
     static Result GetCurrentTime(PosixTime* out);
+    static Result GetSystemClockContext(SystemClockContext* out);
 };
 class StandardNetworkSystemClock {
 public:
@@ -58,6 +62,11 @@ struct SteadyClockTimePoint {
     uint8_t source_id[16];
 };
 static_assert(sizeof(SteadyClockTimePoint) == 24);
+// El reloj de usuario es el monotónico más un desfase: hora POSIX = puntos del monotónico + offset.
+struct SystemClockContext {
+    int64_t offset;
+    SteadyClockTimePoint timestamp;
+};
 class StandardSteadyClock {
 public:
     static Result GetCurrentTimePoint(SteadyClockTimePoint* out);
@@ -124,6 +133,49 @@ Result StandardUserSystemClock::GetCurrentTime(PosixTime* out) {
 Result StandardNetworkSystemClock::GetCurrentTime(PosixTime* out) {
     out->value = ::time(nullptr);
     return ResultSuccess;
+}
+
+// ClockSnapshot (SDK 6+): una foto de los relojes de usuario y de red, con su hora de calendario ya calculada. Es un
+// objeto de 0xD0 bytes del juego con el layout del servicio (el de libnx, TimeClockSnapshot): contextos +0x00/+0x20,
+// horas POSIX +0x40/+0x48, calendario +0x50/+0x58, info adicional +0x60/+0x78, punto del monotónico +0x90, zona +0xA8.
+// Catherine: Full Body la usa para la fecha de sus partidas guardadas.
+class ClockSnapshot {
+public:
+    ClockSnapshot();
+    static void CreateWithStandardSystemClock(ClockSnapshot* out);
+    CalendarTime GetStandardNetworkSystemClockCalendarTime() const;
+
+private:
+    uint8_t data_[0xD0];
+};
+static_assert(sizeof(ClockSnapshot) == 0xD0);
+
+ClockSnapshot::ClockSnapshot() { memset(data_, 0, sizeof data_); }
+
+void ClockSnapshot::CreateWithStandardSystemClock(ClockSnapshot* out) {
+    memset(out->data_, 0, sizeof out->data_);
+    const time_t now = ::time(nullptr);
+    tm local{};
+    localtime_r(&now, &local);
+    const int64_t posix = now;
+    memcpy(out->data_ + 0x40, &posix, 8);
+    memcpy(out->data_ + 0x48, &posix, 8);
+    CalendarTime cal;
+    CalendarAdditionalInfo info;
+    fill(&cal, &info, local);
+    memcpy(out->data_ + 0x50, &cal, sizeof cal);
+    memcpy(out->data_ + 0x58, &cal, sizeof cal);
+    memcpy(out->data_ + 0x60, &info, sizeof info);
+    memcpy(out->data_ + 0x78, &info, sizeof info);
+    const std::string zone = device_location();
+    memcpy(out->data_ + 0xA8, zone.c_str(), std::min<size_t>(zone.size(), 35));
+    out->data_[0xCC] = 1;  // reloj automático
+}
+
+CalendarTime ClockSnapshot::GetStandardNetworkSystemClockCalendarTime() const {
+    CalendarTime cal;
+    memcpy(&cal, data_ + 0x58, sizeof cal);
+    return cal;
 }
 // El reloj de Android se sincroniza por red (NTP/operador): la hora de "red" es buena.
 bool StandardNetworkSystemClock::IsAccuracySufficient() { return true; }
@@ -222,11 +274,45 @@ int GetDayOfWeek(int year, int month, int day) {
     return t.tm_wday;
 }
 
+// SDK 12 (Xenoblade 3): fecha menos un intervalo (TimeSpan = nanosegundos). El juego compara así la fecha de hoy con
+// la del último premio periódico (main+0x1274a5c). Fechas sin zona: se cuentan como UTC, ida y vuelta.
+CalendarTime operator-(const CalendarTime& c, const nn::TimeSpan& span) {
+    time_t s = static_cast<time_t>(ToPosixTimeFromUtc(c).value) - static_cast<time_t>(span.ns / 1'000'000'000);
+    tm t{};
+    gmtime_r(&s, &t);
+    return CalendarTime{static_cast<int16_t>(t.tm_year + 1900), static_cast<int8_t>(t.tm_mon + 1),
+                        static_cast<int8_t>(t.tm_mday), static_cast<int8_t>(t.tm_hour), static_cast<int8_t>(t.tm_min),
+                        static_cast<int8_t>(t.tm_sec), 0};
+}
+
+// SDK 12: premio periódico (uno por día/periodo según la hora del usuario). Devuelve PeriodicBenefitClaimResult; el
+// juego (main+0x12749ec) trata 0..2 y convierte lo demás en 1. Sin servicio de tiempo que lleve la cuenta, se contesta
+// 1 (no reclamable ahora) y no se toca el contexto: el juego sigue como si ya se hubiera reclamado.
+struct PeriodicBenefitClaimContext;
+struct CheckCalendarTimeCallback;
+int ClaimPeriodicBenefitWithUserSystemClock(PeriodicBenefitClaimContext*, const ClockSnapshot&, const nn::TimeSpan&,
+                                            const nn::TimeSpan&, const CheckCalendarTimeCallback*) {
+    printf("[time] ClaimPeriodicBenefitWithUserSystemClock: 1 (no reclamable)\n");
+    return 1;
+}
+
 bool IsValidDate(int year, int month, int day) {
     if (month < 1 || month > 12 || day < 1) return false;
     static const int kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
     bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
     return day <= kDays[month - 1] + (month == 2 && leap ? 1 : 0);
+}
+
+}  // namespace nn::time
+
+namespace nn::time {
+
+Result StandardUserSystemClock::GetSystemClockContext(SystemClockContext* out) {
+    PosixTime now{};
+    GetCurrentTime(&now);
+    StandardSteadyClock::GetCurrentTimePoint(&out->timestamp);
+    out->offset = now.value - out->timestamp.value;
+    return ResultSuccess;
 }
 
 }  // namespace nn::time

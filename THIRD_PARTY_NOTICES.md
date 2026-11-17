@@ -13,6 +13,7 @@ This project is licensed under GPL-3.0-or-later. It uses or includes the followi
 | [{fmt}](https://github.com/fmtlib/fmt) | Formatting library used by Eden's code | MIT |
 | [Boost](https://www.boost.org/) (headers) | Used by Eden's shader recompiler | BSL-1.0 |
 | [libopus](https://opus-codec.org/) | Opus audio decoding (nn::codec) | BSD-3-Clause |
+| [stb_truetype](https://github.com/nothings/stb) | Font rasteriser behind nn::fontll (`runtime/src/third/stb_truetype.h`) | Public domain or MIT, Sean Barrett |
 | Android NDK `native_app_glue` | NativeActivity glue | Apache-2.0 |
 
 Lossless Scaling and its `Lossless.dll` are not distributed here; the DLL must come from the user's own purchase.

@@ -338,6 +338,33 @@ void SetHeaderText(KeyboardConfig* config, const char16_t* text) { copy_text(con
 void SetSubText(KeyboardConfig* config, const char16_t* text) { copy_text(config->sub_text, 129, text); }
 void SetGuideText(KeyboardConfig* config, const char16_t* text) { copy_text(config->guide_text, 257, text); }
 
+// Los mismos con el texto en UTF-8: el SDK lo convierte a UTF-16 sobre el mismo campo (SetOkTextUtf8 en +0x4 con sitio
+// para 9, SetHeaderTextUtf8 en +0x24 para 65, SetSubTextUtf8 en +0xa6 para 129 y SetGuideTextUtf8 en +0x1a8 para 257:
+// sdk+0x3a7290, +0x3a74d0, +0x3a7610 y +0x3a7740), con nullptr lo deja vacío y aborta si el texto no es UTF-8 válido o
+// no cabe. Aquí lo que no vale se salta y lo que no cabe se corta: un texto de la interfaz no merece tumbar el juego.
+// En Disco Elysium solo los alcanza el plugin de Unity del SDK (nn.swkbd.Swkbd, main+0x155ca40…0x155cae0), que no tiene
+// llamadores.
+namespace {
+std::u16string from_utf8(const char* text) { return text ? utf8_to_utf16(text) : std::u16string(); }
+}  // namespace
+
+void SetOkTextUtf8(KeyboardConfig* config, const char* text) { copy_text(config->ok_text, 9, from_utf8(text).c_str()); }
+void SetHeaderTextUtf8(KeyboardConfig* config, const char* text) {
+    copy_text(config->header_text, 65, from_utf8(text).c_str());
+}
+void SetSubTextUtf8(KeyboardConfig* config, const char* text) { copy_text(config->sub_text, 129, from_utf8(text).c_str()); }
+void SetGuideTextUtf8(KeyboardConfig* config, const char* text) {
+    copy_text(config->guide_text, 257, from_utf8(text).c_str());
+}
+// La tecla de símbolo es un solo carácter UTF-16 (el SDK convierte con sitio para uno, sdk+0x3a7374): el primero del
+// texto. Con un texto vacío el campo se queda como estaba, como en el SDK.
+void SetLeftOptionalSymbolKeyUtf8(KeyboardConfig* config, const char* text) {
+    if (const std::u16string key = from_utf8(text); !key.empty()) config->left_optional_symbol_key = key[0];
+}
+void SetRightOptionalSymbolKeyUtf8(KeyboardConfig* config, const char* text) {
+    if (const std::u16string key = from_utf8(text); !key.empty()) config->right_optional_symbol_key = key[0];
+}
+
 // --- ShowKeyboardArg ---
 
 size_t GetRequiredWorkBufferSize(bool use_dictionary) { return use_dictionary ? 0xd000 : 0x1000; }
@@ -366,6 +393,14 @@ void SetInitialText(ShowKeyboardArg* arg, const char16_t* text) {
     g_initial.assign(text, n);
     if (arg->work_buf && 0x14 + n * sizeof(char16_t) <= arg->work_buf_size)
         memcpy(static_cast<uint8_t*>(arg->work_buf) + 0x14, text, n * sizeof(char16_t));
+}
+
+// El texto inicial en UTF-8: el SDK lo deja en el mismo sitio y en UTF-16 (sdk+0x3a7870), así que es el de arriba con
+// el texto convertido. Es el que usa el teclado de Unity (TouchScreenKeyboard, main+0x3e3ad8) con el texto que ya tenía
+// el campo; Unity reserva el work buffer antes (main+0x3e38e0) y lee la respuesta en UTF-16 (main+0x3e3b0c).
+void SetInitialTextUtf8(ShowKeyboardArg* arg, const char* text) {
+    if (!text) return SetInitialText(arg, nullptr);
+    SetInitialText(arg, utf8_to_utf16(text).c_str());
 }
 
 // Las palabras del diccionario de usuario solo las usaría el applet para sugerir: se apuntan cuántas hay y dónde irían

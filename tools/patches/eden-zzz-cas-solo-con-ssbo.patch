@@ -1,0 +1,17 @@
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -896,6 +896,13 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
+     if (!info.uses_int8 && !info.uses_int16) {
+         return;
+     }
++    // Solo la llama WriteStorageByCasLoop (escrituras de 8 y 16 bits en un storage buffer): sin storage buffers es
++    // código muerto, y su parámetro puntero obliga a declarar VariablePointersStorageBuffer. A 52 pixel shaders de
++    // Disco Elysium (las variantes de textura virtual de FO/FO-BG y compañía) les caía solo por convertir a entero de
++    // 16 bits la capa de un array de texturas (ConvertF32U16 marca uses_int16), y el dispositivo no activa esa feature.
++    if (info.storage_buffers_descriptors.empty()) {
++        return;
++    }
+
+     AddCapability(spv::Capability::VariablePointersStorageBuffer);
+

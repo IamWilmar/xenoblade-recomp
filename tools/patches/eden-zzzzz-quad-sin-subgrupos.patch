@@ -1,0 +1,26 @@
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
+index 8d83509..ee11fc8 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
+@@ -312,6 +312,11 @@ Id EmitShuffleButterfly(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id
+ }
+ 
+ Id EmitQuadBroadcast(EmitContext& ctx, Id value, Id lane) {
++    // Sin subgrupos en esta etapa (Adreno: solo compute) no se puede emitir nada de subgrupos: el valor propio, como
++    // los demás shuffles. Antes salía OpGroupNonUniformBroadcast sin su capacidad (SPIR-V inválido).
++    if (!StageSupportsSubgroups(ctx)) {
++        return value;
++    }
+     if (ctx.profile.support_quad_shuffles) {
+         return ctx.OpGroupNonUniformQuadBroadcast(ctx.U32[1], SubgroupScope(ctx), value, lane);
+     }
+@@ -322,6 +327,9 @@ Id EmitQuadBroadcast(EmitContext& ctx, Id value, Id lane) {
+ }
+ 
+ Id EmitQuadSwap(EmitContext& ctx, Id value, Id direction) {
++    if (!StageSupportsSubgroups(ctx)) {
++        return value;
++    }
+     if (ctx.profile.support_quad_shuffles) {
+         const Id result{
+             ctx.OpGroupNonUniformQuadBroadcast(ctx.U32[1], SubgroupScope(ctx), value, direction)};

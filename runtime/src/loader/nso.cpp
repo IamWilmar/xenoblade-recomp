@@ -12,7 +12,7 @@ namespace {
 
 constexpr int64_t DT_NULL = 0, DT_PLTRELSZ = 2, DT_HASH = 4, DT_STRTAB = 5, DT_SYMTAB = 6, DT_RELA = 7,
                   DT_RELASZ = 8, DT_INIT = 12, DT_JMPREL = 23, DT_INIT_ARRAY = 25, DT_INIT_ARRAYSZ = 27,
-                  DT_GNU_HASH = 0x6FFFFEF5;
+                  DT_RELRSZ = 35, DT_RELR = 36, DT_GNU_HASH = 0x6FFFFEF5;
 constexpr uint32_t R_AARCH64_ABS64 = 257, R_AARCH64_GLOB_DAT = 1025, R_AARCH64_JUMP_SLOT = 1026,
                    R_AARCH64_RELATIVE = 1027;
 constexpr uint16_t SHN_ABS = 0xFFF1;
@@ -111,6 +111,27 @@ bool parse_dynamic(Module& mod, std::string& err) {
         for (uint64_t off = tags[start]; off < tags[start] + tags[size]; off += 24)
             mod.relocs.push_back({rd<uint64_t>(b + off), rd<uint64_t>(b + off + 8), rd<int64_t>(b + off + 16)});
     }
+    // DT_RELR (el enlazador de los SDK nuevos, p. ej. Castlevania con el 21.4): las relativas, comprimidas. Una entrada
+    // par es una dirección; una impar, un mapa de bits de las 63 palabras que siguen a la última. El sumando es lo que
+    // ya hay en esa palabra (estilo REL), así que se pasan a RELATIVE normales leyéndolo de la imagen recién cargada.
+    if (tags.count(DT_RELR)) {
+        uint64_t where = 0;
+        auto add = [&](uint64_t off) {
+            if (off + 8 <= mod.size)
+                mod.relocs.push_back({off, R_AARCH64_RELATIVE, rd<int64_t>(b + off)});
+        };
+        for (uint64_t off = tags[DT_RELR]; off < tags[DT_RELR] + tags[DT_RELRSZ]; off += 8) {
+            const uint64_t e = rd<uint64_t>(b + off);
+            if (!(e & 1)) {
+                add(e);
+                where = e + 8;
+                continue;
+            }
+            for (int i = 0; i < 63; i++)
+                if (e >> (i + 1) & 1) add(where + 8 * i);
+            where += 8 * 63;
+        }
+    }
     mod.init = tags.count(DT_INIT) ? tags[DT_INIT] : 0;
     mod.init_array = tags.count(DT_INIT_ARRAY) ? tags[DT_INIT_ARRAY] : 0;
     mod.init_array_size = tags.count(DT_INIT_ARRAYSZ) ? tags[DT_INIT_ARRAYSZ] : 0;
@@ -146,6 +167,7 @@ bool load_nso(const std::string& path, Module& mod, std::string& err) {
     }
     mod.name = path.substr(path.find_last_of('/') + 1);
     mod.bss_size = rd<uint32_t>(h + 0x3C);
+    memcpy(mod.build_id, h + 0x40, sizeof mod.build_id);
     mod.size = page_up(size_t{mod.seg_off[2]} + mod.seg_size[2] + mod.bss_size);
     void* mem = mmap(nullptr, Module::kPatchAreaSize + mod.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
                      -1, 0);
@@ -170,6 +192,37 @@ bool load_nso(const std::string& path, Module& mod, std::string& err) {
             return false;
         }
     }
+    return parse_dynamic(mod, err);
+}
+
+bool load_nro(const void* image, size_t image_size, const std::string& name, Module& mod, std::string& err) {
+    const auto* h = static_cast<const uint8_t*>(image);
+    if (image_size < 0x80 || memcmp(h + 0x10, "NRO0", 4) != 0) {
+        err = name + " no es un NRO";
+        return false;
+    }
+    // El NRO es el módulo ya desplegado: text, rodata y data seguidos desde el principio del archivo.
+    const uint32_t total = rd<uint32_t>(h + 0x18);
+    for (int s = 0; s < 3; s++) {
+        mod.seg_off[s] = rd<uint32_t>(h + 0x20 + 8 * s);
+        mod.seg_size[s] = rd<uint32_t>(h + 0x24 + 8 * s);
+    }
+    if (total > image_size || size_t{mod.seg_off[2]} + mod.seg_size[2] > total) {
+        err = name + ": tamaño incoherente";
+        return false;
+    }
+    mod.name = name;
+    mod.bss_size = rd<uint32_t>(h + 0x38);
+    mod.size = page_up(size_t{mod.seg_off[2]} + mod.seg_size[2] + mod.bss_size);
+    void* mem = mmap(nullptr, Module::kPatchAreaSize + mod.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+                     -1, 0);
+    if (mem == MAP_FAILED) {
+        err = std::string("mmap: ") + strerror(errno);
+        return false;
+    }
+    mod.patch_area = static_cast<uint8_t*>(mem);
+    mod.base = mod.patch_area + Module::kPatchAreaSize;
+    memcpy(mod.base, h, total);
     return parse_dynamic(mod, err);
 }
 

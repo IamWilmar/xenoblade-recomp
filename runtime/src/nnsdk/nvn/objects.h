@@ -1,4 +1,5 @@
 #pragma once
+#include <memory>
 #include <atomic>
 // Objetos NVN inicializados que comparten varios archivos (pools, texturas, samplers, programas,
 // ventana). Los objetos del juego son opacos: se asocian por dirección a estos.
@@ -26,6 +27,10 @@ struct MemoryPool {
     // Pool virtual (memory.cpp): sin memoria propia; storage es una reserva nuestra donde MapVirtual hace aparecer las
     // páginas de pools físicos (lo no mapeado se lee como ceros).
     bool reserved = false;
+    // Algún nvnBuffer vive en él o el juego pidió su dirección de GPU: los comandos leen de su memoria al reproducirse
+    // (vértices, uniformes), así que finalizarlo espera a la cola (replay_barrier). Los que solo dan memoria a texturas
+    // (uno por textura temporal en Unity) no: sus texels ya están subidos o copiados (limbo de texture.cpp).
+    bool buffers = false;
 };
 // NVNmemoryPoolFlags que cambian lo que hacemos (el resto son de caché y acceso).
 constexpr int kPoolFlagPhysical = 0x100, kPoolFlagVirtual = 0x200;
@@ -56,16 +61,20 @@ constexpr int kTarget1D = 0, kTarget2D = 1, kTarget3D = 2, kTarget1DArray = 3, k
               kTargetCubeArray = 9, kTargetBuffer = 10;
 
 // NVNtextureView: vive dentro del struct del juego (≤ 40 bytes). flags dice qué campos valen.
+// Cabe en 16 bytes: Xenoblade 3 (SDK 12) guarda el puntero de su textura justo detrás de su NVNtextureView
+// (vista en +0x88, textura en +0x98, main+0xe9b17c) y luego llama a SetDefaults/SetFormat/SetTarget; con la vista
+// de 28 bytes de antes, SetFormat dejaba formato y target (0x1'00000025) donde el juego tenía la textura.
 struct TextureViewDesc {
-    uint16_t flags;
-    uint8_t depth_stencil_mode, pad;
-    int16_t base_level, levels;
-    int32_t base_layer, layers;
-    int32_t format, target;
+    uint8_t flags;
+    uint8_t depth_stencil_mode;
+    int8_t base_level, levels;
+    int16_t base_layer, layers;
+    uint16_t format;
+    uint8_t target;
     uint8_t swizzle[4];
 };
-static_assert(sizeof(TextureViewDesc) <= 40);
-constexpr uint16_t kViewLevels = 1, kViewLayers = 2, kViewFormat = 4, kViewTarget = 8, kViewDepthStencil = 16,
+static_assert(sizeof(TextureViewDesc) == 16);
+constexpr uint8_t kViewLevels = 1, kViewLayers = 2, kViewFormat = 4, kViewTarget = 8, kViewDepthStencil = 16,
                    kViewSwizzle = 32;
 
 struct Texture {
@@ -99,11 +108,15 @@ struct Texture {
     uint64_t rt_frame = 0;
     bool rt_recurring = false;
     bool storage_image = false;  // la imagen se creó con STORAGE: se puede enlazar como imagen (ejecutor)
+    bool input_usage = false;    // la imagen se creó con INPUT_ATTACHMENT: vale de adjunto de un pase con realimentación
     bool uploaded = false;
     uint64_t content_hash = 0;   // de su memoria al subirla: si cambia, el juego la ha reescrito
     uint64_t checked_frame = ~uint64_t{0};
     // huella_cada_4 (ejecutor): revisiones seguidas con la misma huella; pasadas unas cuantas, se revisa 1 frame de cada 4.
     uint8_t hash_stable = 0;
+    // Huellas por adelantado (ejecutor, HashAhead): su trabajo en el envío en curso, si lo tiene (se comprueba contra el
+    // trabajo: un índice viejo no coincide con esta textura).
+    uint32_t ahead_slot = ~uint32_t{0};
     float clear_color[4] = {};  // último ClearColor (para presentar antes de tener render real)
     bool cleared = false;
     // Ejecutor: la última vista muestreada (válida si view_memo_serial == serial).
@@ -145,6 +158,20 @@ struct Texture {
         BlockBox box;
     };
     std::vector<TexelWrite> texel_writes;
+    // Reproducción en diferido (replay_barrier, commands.h). last_ticket: el último envío del juego cuyas listas la nombran
+    // por puntero (copias, render targets, borrados). open_refs: comandos grabados que la nombran en listas que aún no se
+    // han enviado. record_frame: el frame del juego (sus PresentTexture) en que se grabó el último. Enteros sueltos y no
+    // std::atomic (la textura se asigna entera al reiniciarla); quien los toca usa operaciones atómicas (__atomic_*).
+    uint64_t last_ticket = 0;
+    int32_t open_refs = 0;
+    uint32_t record_frame = 0;
+    // El juego ya la finalizó y sigue entera para los comandos que quedan por reproducir (el limbo de texture.cpp). Su
+    // memoria ya no es suya: storage es una copia nuestra, nulo, o (si la pintó la GPU) solo la clave de sus alias, y lo
+    // que el ejecutor devolvería a la memoria del juego (Executor::readback_1x1_targets) ya no tiene quien lo lea.
+    bool limbo = false;
+    // Frame del juego (sus PresentTexture) en que se inicializó: para saber si se finaliza recién creada, antes de que la
+    // cola haya podido usarla (texture.cpp, limbo_recientes).
+    uint32_t init_frame = 0;
 };
 
 std::mutex& texel_writes_mutex();
@@ -185,6 +212,13 @@ struct DescriptorPool {
     int64_t offset = 0;
     int count = 0;
     std::vector<TexturePoolEntry> textures;  // pool de texturas: id -> textura + vista
+    // Un buffer registrado como textura (target BUFFER: los Buffer<T> de los shaders): en NVN el descriptor del pool lleva
+    // la dirección y el formato y sigue valiendo sin el NVNtexture, que el juego finaliza enseguida (Unity nada más
+    // registrarlo; Unreal Engine 5 crea, registra y finaliza unos mil por frame). Cada id guarda aquí su propia copia de lo
+    // que el ejecutor lee (desc y dirección), y la entrada apunta a ella: así el objeto del juego se puede borrar al
+    // finalizarse. Una por id, la primera vez que se registra un buffer en él; no se borra (el ejecutor la puede estar
+    // leyendo), se reescribe.
+    std::vector<std::unique_ptr<Texture>> buffer_objects;
     std::vector<Sampler*> samplers;          // pool de samplers: id -> sampler
 };
 
@@ -193,15 +227,33 @@ struct ProgramStage {
     // argumentos indirectos, que ya no usamos (el pase de color dibuja la malla entera, ver culled_draws_).
     bool compaction_gs = false;
     uint64_t code = 0;  // dirección del código (NVN solo lo lee al dibujar: se traduce en el executor)
+    // Copia del código y de la sección de control tomada al grabar el BindProgram (snapshot_stage): code y control apuntan
+    // a ella y code_size dice cuánto se puede leer. Unity (Disco Elysium) reutiliza la memoria de sus shaders con comandos
+    // aún en cola: traduciendo de la dirección del juego, el ejecutor (que va por detrás) leía el código de otro shader.
+    size_t code_size = 0;
     uint64_t print = 0;  // huella del código (la de los logs), al traducirlo
-    const void* control = nullptr;  // sección de control (memoria de CPU del juego)
+    // Sección de control: la copia que se toma dentro de nvnProgramSetShaders (program.cpp, keep_control), que es cuando
+    // NVN la consume; el juego puede soltar la suya nada más volver. game_control: el puntero que dio el juego, solo para
+    // contar en snapshot_program cuántas ya no estaban en su sitio al enlazar el programa.
+    const void* control = nullptr;
+    const void* game_control = nullptr;
     // Constantes del propio shader (su c1): el compilador las deja tras el código, en
     // code + control[0x700] hasta code + control[0x704].
     uint64_t constants = 0;
     uint32_t constants_size = 0;
     bool tried = false;
     nvnshader::Translated shader;
+    // ¿El módulo lee gl_VertexIndex? -1: sin mirar (Executor::reads_vertex_index). Esos draws no desplazan su ventana de
+    // vértices.
+    mutable int8_t vertex_index = -1;
     VkShaderModule module = VK_NULL_HANDLE;
+    // Vertex shader que escribe la capa: el módulo de su geometry shader de paso (nvnshader::Translated::layer_gs), que el
+    // ejecutor crea la primera vez que hace falta (pipeline()).
+    VkShaderModule layer_gs_module = VK_NULL_HANDLE;
+    bool layer_gs_tried = false;
+    // Variante de un geometry shader para pintar una tanda de capas (nvnshader::Options::layer_chunk_base). -1 en las del juego.
+    int layer_chunk_base = -1;
+    bool layer_chunk_cull = false;  // y con lo de fuera de la tanda recortado (nvnshader::Options::layer_chunk_cull)
     // Compute de kUniformBarrierShaders (program.cpp), a los que se les dejan las barreras de sus bucles: la traducción
     // sin ellas, para sus interruptores en vivo (use_stripped_module). Los mismos recursos que module (el mismo layout).
     VkShaderModule stripped_module = VK_NULL_HANDLE;
@@ -219,16 +271,31 @@ struct ProgramStage {
         VkShaderModule module = VK_NULL_HANDLE;
         uint64_t spirv_id = 0;
         spirv_cache::Key cache_key;
+        bool layer_cull = false;  // nvnshader::Translated::layer_cull de la variante
     };
     std::unordered_map<uint64_t, Variant> variants;
     // Pixel shader: render targets con la operación lógica OR emulada en el shader (nvnshader::Options::logic_or_targets;
     // solo en las etapas de logic_or_variant). 0 en las del juego.
     uint32_t logic_or_targets = 0;
+    // Pixel shader: genéricos que le llegan de la etapa anterior (generics_variant: los demás no se declaran y se leen a
+    // cero, que es lo que pide el Adreno para enlazar). ~0 en las del juego.
+    uint64_t previous_stores = ~0ull;
     // Pixel shader: tipos enteros del draw (solo en las etapas de integer_variant; 0 y vacío en las del juego). Salidas de
     // color uvec4/ivec4 (bit k: el render target k) y texturas declaradas enteras por la dirección de su handle
     // (nvnshader::Options::unsigned_color_targets, signed_color_targets e integer_handles).
     uint32_t unsigned_color_targets = 0, signed_color_targets = 0;
     std::vector<std::pair<uint32_t, uint32_t>> integer_handles;
+    // Pixel shader: texturas que son adjuntos de color del pase y se leen en su píxel (solo en las etapas de
+    // feedback_variant; vacío en las del juego). nvnshader::Options::input_attachment_handles.
+    std::vector<nvnshader::Options::InputAttachment> input_attachments;
+    // Vertex shader: variante de captura de transform feedback (xfb_variant; false en las del juego).
+    bool xfb_capture_always = false;
+    // Geometry shader: variante de captura de transform feedback con contador en la GPU (xfb_gs_variant; false en las
+    // del juego).
+    bool xfb_gs_capture = false;
+    // Vertex shader: entradas enteras del draw (vertex_input_variant; 0 en las del juego). Ver
+    // nvnshader::Options::uint_vertex_inputs.
+    uint32_t uint_vertex_inputs = 0, sint_vertex_inputs = 0, uscaled_vertex_inputs = 0, sscaled_vertex_inputs = 0;
 };
 
 struct Program {
@@ -256,12 +323,20 @@ struct Window {
 
 extern Objects<MemoryPool> g_memory_pools;
 extern Objects<Texture> g_textures;
+// Los 8 primeros bytes de un NVNtexture inicializado (y de cualquier copia suya); los 8 siguientes, el original.
+constexpr uint64_t kTextureTag = 0x4E564E5465787452ull;  // "RtxeTNVN"
+// El Texture de un NVNtexture del juego, o del original si es una copia de su struct (por la marca).
+Texture* texture_lookup(const void* p);
 extern Objects<Window> g_windows;
 extern Objects<DescriptorPool> g_texture_pools, g_sampler_pools;
 
 Program* find_program(const void* program);
 // Traduce la etapa la primera vez que se usa (program.cpp); false si no se pudo.
-bool ensure_translated(ProgramStage& stage);
+// defer_graphics: sus draws van a targets que se pintan cada frame, así que una etapa gráfica que no esté en la caché de
+// SPIR-V puede traducirse en segundo plano (devuelve false con stage.tried a false: aún no). Ver program.cpp.
+bool ensure_translated(ProgramStage& stage, bool defer_graphics = false);
+// Copia el código de las etapas del programa (una vez por etapa): ver ProgramStage::code_size.
+void snapshot_program(Program& program);
 // Precarga (program.cpp): el hilo que traduce los shaders al fijarlos le pasa al ejecutor cada compute traducido, para
 // crear su pipeline antes del primer dispatch (la toma warm_take).
 void prefetch_compute_pipeline(const ProgramStage& stage);
@@ -273,6 +348,14 @@ struct DropStats {
     // En la GPU, del timestamp del final de un frame del juego al del comienzo del siguiente: lo que la GPU no estuvo con
     // el frame del juego (presentar, el FSR, y lo que esperó a que llegara el primer envío del siguiente).
     std::atomic<uint64_t> gap_sum_ns{0}, gap_frames{0};
+    // Entre los dos timestamps de un frame, lo que la GPU estuvo ocupada con los command buffers del juego (sin lo que
+    // esperó parada al envío siguiente), y con <datos>/sello_ocupado lo que se le dijo al juego en vez del tramo entero
+    // (Executor::busy_end).
+    std::atomic<uint64_t> busy_sum_ns{0}, busy_max_ns{0}, busy_frames{0};
+    std::atomic<uint64_t> told_sum_ns{0}, told_frames{0};
+    // El último frame con esa medida, para el regulador de resolución de Xenoblade 3 (window.cpp, game_gpu_busy): lo
+    // ocupado, el tramo entre los dos sellos y un número que sube con cada uno. Estos no los pone a cero el ritmo.
+    std::atomic<uint64_t> busy_serial{0}, busy_last_ns{0}, busy_span_last_ns{0};
     std::atomic<uint64_t> run_ns{0}, run_max_ns{0}, wait_ns{0};  // run_max: el peor frame (suma de sus envíos)
     std::atomic<uint64_t> pipelines_live{0}, pipelines_live_ns{0};   // creadas en NvnSubmit con el frame parado
     std::atomic<uint64_t> pipelines_async{0}, draws_skipped{0};     // mandadas al hilo y draws sin dibujar esperándolas
@@ -293,17 +376,35 @@ inline void note_max(std::atomic<uint64_t>& a, uint64_t v) {
 bool use_stripped_module(const ProgramStage& stage);
 // Geometry: el módulo para un vertex shader que escribe `previous_stores` y una topología de entrada de
 // Eden; module a VK_NULL_HANDLE si no se puede traducir.
-ProgramStage::Variant geometry_variant(ProgramStage& stage, uint64_t previous_stores, int input_topology);
+ProgramStage::Variant geometry_variant(ProgramStage& stage, uint64_t previous_stores, int input_topology,
+                                       int layer_chunk_base = -1, bool layer_chunk_cull = false);
 // Pixel shader con la operación lógica OR emulada en los render targets de `targets` (bit k: el k): una etapa entera (su
 // propio SPIR-V, recursos y spirv_id: una textura más, ver nvnshader::kLogicOrBank) que el ejecutor pone en lugar de la
 // del juego durante el draw. Una por huella y máscara para toda la partida; nula si no se puede traducir.
 const ProgramStage* logic_or_variant(const ProgramStage& stage, uint32_t targets);
+// Pixel shader que lee genéricos que la etapa anterior no escribe: su variante completa (recursos, layout y descriptores
+// propios) solo con los de previous_stores. nullptr si no se pudo traducir.
+const ProgramStage* generics_variant(const ProgramStage& stage, uint64_t previous_stores, const ProgramStage* vs = nullptr);
 // Pixel shader con los tipos enteros de lo que tiene enlazado el draw: en Vulkan el tipo de cada salida de color y de cada
 // textura del shader tiene que coincidir con el formato numérico del adjunto o de la vista (si no, lo que sale es
 // indefinido; en el Adreno, una vista de stencil leída como float da 0), y Eden lo declara todo float porque aquí los
 // formatos solo se saben al dibujar. Salidas uvec4 en los render targets de uint_targets, ivec4 en los de sint_targets y
 // usampler en las texturas de `textures` (bit i: stage.shader.resources[i]), encima de `stage` (la del juego o su variante
 // con OR). Los mismos recursos y bindings que stage (si no, nula). Una por huella y claves para toda la partida.
+// El vertex shader con transform feedback emulado aunque no sea de captura evidente (nullptr si no se pudo).
+const ProgramStage* xfb_variant(const ProgramStage& stage);
+// El geometry shader (no de paso) con transform feedback emulado desde sus EmitVertex y la cuenta en la GPU
+// (nvnshader::Options::xfb_gs_capture). nullptr si no se pudo.
+const ProgramStage* xfb_gs_variant(const ProgramStage& stage);
+// El vertex shader con las entradas de los atributos enteros del draw declaradas con su tipo (bit k: el genérico k; ver
+// nvnshader::Options::uint_vertex_inputs), encima de `stage` (la del juego o su variante de captura). Los mismos recursos
+// que stage (si no, nula). Una por huella y máscaras para toda la partida.
+const ProgramStage* vertex_input_variant(const ProgramStage& stage, uint32_t uint_inputs, uint32_t sint_inputs,
+                                         uint32_t uscaled_inputs, uint32_t sscaled_inputs);
+// La variante de un pixel shader que lee como input attachment (subpassLoad) las texturas de `attachments`: adjuntos de
+// color del pase que el propio draw escribe (mezcla programable). Parte de la etapa dada (con sus variantes ya puestas).
+// nullptr si no se puede (muestreo que no es de su píxel, textura que no es una 2D sencilla…): el ejecutor copia.
+const ProgramStage* feedback_variant(const ProgramStage& stage, const std::vector<nvnshader::Options::InputAttachment>& attachments);
 const ProgramStage* integer_variant(const ProgramStage& stage, uint32_t uint_targets, uint32_t sint_targets,
                                     uint64_t textures);
 // Identidad de una traducción (ProgramStage::spirv_id): huella del SPIR-V, de la etapa, de los genéricos y de lo que el

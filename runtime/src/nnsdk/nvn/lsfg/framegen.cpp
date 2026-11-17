@@ -106,6 +106,11 @@ private:
     bool guard(double dt, Clock::time_point now, bool enabled);
     void log_stats(Clock::time_point now);
     bool record_lsfg(int index, const Texture& t, uint64_t n, bool generate);
+    // La zona de la textura de la ventana que va a la pantalla (nvnWindowSetCrop; ancho 0: entera). Disco Elysium pinta
+    // 1280x720 en la esquina de texturas de 1920x1080: la cadena trabaja solo con esa zona (2,25 veces menos que la textura
+    // entera) y el frame generado muestra lo mismo que el real (antes salía la textura entera: la imagen encogida en una
+    // esquina, un frame sí y otro no). Se fija en present() antes de grabar.
+    VkRect2D src_{};
     bool record_blit(Slot& s, const Window& w, uint32_t image);
 
     enum class State { Off, Waiting, Ready, Failed };
@@ -484,15 +489,18 @@ bool FrameGen::record_lsfg(int index, const Texture& t, uint64_t n, bool generat
     }
     if (!chain_->initialized()) chain_->record_init(cmd);
     const Image& in = chain_->input(n);
-    if (in.extent.width == static_cast<uint32_t>(t.desc.width) && in.extent.height == static_cast<uint32_t>(t.desc.height)) {
+    if (in.extent.width == src_.extent.width && in.extent.height == src_.extent.height) {  // la zona que se ve, tal cual
         VkImageCopy region{};
         region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.srcOffset = {src_.offset.x, src_.offset.y, 0};
         region.extent = {in.extent.width, in.extent.height, 1};
         vkCmdCopyImage(cmd, t.image, VK_IMAGE_LAYOUT_GENERAL, in.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-    } else {  // lsfg_media: la cadena es más pequeña que la textura de la ventana
+    } else {  // lsfg_media: la cadena es más pequeña que la zona que se ve
         VkImageBlit region{};
         region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.srcOffsets[1] = {t.desc.width, t.desc.height, 1};
+        region.srcOffsets[0] = {src_.offset.x, src_.offset.y, 0};
+        region.srcOffsets[1] = {src_.offset.x + static_cast<int32_t>(src_.extent.width),
+                                src_.offset.y + static_cast<int32_t>(src_.extent.height), 1};
         region.dstOffsets[1] = {static_cast<int32_t>(in.extent.width), static_cast<int32_t>(in.extent.height), 1};
         vkCmdBlitImage(cmd, t.image, VK_IMAGE_LAYOUT_GENERAL, in.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_LINEAR);
     }
@@ -601,8 +609,15 @@ void FrameGen::present(Window& w, Texture* t) {
         warm_ = 0;
         return;
     }
-    const VkExtent2D extent{static_cast<uint32_t>(t->desc.width) * (reduced ? 3 : 4) / 4,
-                            static_cast<uint32_t>(t->desc.height) * (reduced ? 3 : 4) / 4};
+    {  // la zona que se ve: el recorte de la ventana si lo hay y cabe en la textura; si no, la textura entera
+        const VkRect2D& c = w.crop;
+        const bool cropped = c.extent.width && c.extent.height && c.offset.x >= 0 && c.offset.y >= 0 &&
+                             c.offset.x + c.extent.width <= static_cast<uint32_t>(t->desc.width) &&
+                             c.offset.y + c.extent.height <= static_cast<uint32_t>(t->desc.height) &&
+                             !NVN_FLAG("lsfg_textura_entera");
+        src_ = cropped ? c : VkRect2D{{0, 0}, {static_cast<uint32_t>(t->desc.width), static_cast<uint32_t>(t->desc.height)}};
+    }
+    const VkExtent2D extent{src_.extent.width * (reduced ? 3 : 4) / 4, src_.extent.height * (reduced ? 3 : 4) / 4};
     if (!chain_ || chain_->extent().width != extent.width || chain_->extent().height != extent.height ||
         chain_->format() != t->vk_format || chain_->flow() != flow) {
         if (chain_) retire();

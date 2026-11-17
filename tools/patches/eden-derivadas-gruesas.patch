@@ -1,0 +1,144 @@
+diff --git a/src/shader_recompiler/ir_opt/constant_propagation_pass.cpp b/src/shader_recompiler/ir_opt/constant_propagation_pass.cpp
+index 6285fef..573c174 100644
+--- a/src/shader_recompiler/ir_opt/constant_propagation_pass.cpp
++++ b/src/shader_recompiler/ir_opt/constant_propagation_pass.cpp
+@@ -437,7 +437,7 @@ bool FoldDerivativeYFromCorrection(IR::Inst& inst) {
+     IR::Inst* const lhs_op{lhs_value.InstRecursive()};
+     IR::Inst* const rhs_op{rhs_value.InstRecursive()};
+     if (lhs_op->GetOpcode() == IR::Opcode::YDirection) {
+-        if (rhs_op->GetOpcode() != IR::Opcode::DPdyFine) {
++        if (rhs_op->GetOpcode() != IR::Opcode::DPdyFine && rhs_op->GetOpcode() != IR::Opcode::DPdyCoarse) {
+             return false;
+         }
+         inst.ReplaceUsesWith(rhs_value);
+@@ -446,7 +446,7 @@ bool FoldDerivativeYFromCorrection(IR::Inst& inst) {
+     if (rhs_op->GetOpcode() != IR::Opcode::YDirection) {
+         return false;
+     }
+-    if (lhs_op->GetOpcode() != IR::Opcode::DPdyFine) {
++    if (lhs_op->GetOpcode() != IR::Opcode::DPdyFine && lhs_op->GetOpcode() != IR::Opcode::DPdyCoarse) {
+         return false;
+     }
+     inst.ReplaceUsesWith(lhs_value);
+@@ -717,6 +717,97 @@ void FoldFSwizzleAdd(IR::Block& block, IR::Inst& inst) {
+     }
+ }
+ 
++// Derivadas gruesas a la NVIDIA (ddx_coarse/ddy_coarse): d = FSWZADD(SHFL.IDX(x, carril 0 del quad), x, 0xD7)
++// deja x1 - x0 en el carril 1 y x2 - x0 en el 2, y QuadBroadcast(d, 1 | 2) las reparte por el quad. Sin subgrupos en
++// fragment (Adreno: solo compute) la emulación de Eden devuelve el valor propio y la derivada sale basura (el feedback
++// de AmplifyTexture pedía mips 5-6 por pantalla). Se cambian por OpDPdxCoarse / OpDPdyCoarse.
++void FoldQuadBroadcastDerivative(IR::Block& block, IR::Inst& inst) {
++    const IR::Value lane{inst.Arg(1)};
++    if (!lane.IsImmediate() || (lane.U32() != 1 && lane.U32() != 2)) {
++        return;
++    }
++    const IR::Value swz_value{GetThroughCast(inst.Arg(0).Resolve(), IR::Opcode::BitCastU32F32)};
++    if (swz_value.IsImmediate() || swz_value.InstRecursive()->GetOpcode() != IR::Opcode::FSwizzleAdd) {
++        return;
++    }
++    IR::Inst* const swz{swz_value.InstRecursive()};
++    const IR::Value swizzle{swz->Arg(2)};
++    if (!swizzle.IsImmediate() || swizzle.U32() != 0xD7) {
++        return;
++    }
++    const IR::Value first{GetThroughCast(swz->Arg(0).Resolve(), IR::Opcode::BitCastF32U32)};
++    const IR::Value value{GetThroughCast(swz->Arg(1).Resolve(), IR::Opcode::BitCastF32U32)};
++    if (first.IsImmediate() || value.IsImmediate()) {
++        return;
++    }
++    IR::Inst* const shfl{first.InstRecursive()};
++    if (shfl->GetOpcode() != IR::Opcode::ShuffleIndex) {
++        return;
++    }
++    const IR::Value index{shfl->Arg(1)};
++    const IR::Value clamp{shfl->Arg(2)};
++    const IR::Value segmentation_mask{shfl->Arg(3)};
++    if (!index.IsImmediate() || !clamp.IsImmediate() || !segmentation_mask.IsImmediate() ||
++        index.U32() != 0 || clamp.U32() != 3 || segmentation_mask.U32() != 28) {
++        return;
++    }
++    const IR::Value shuffled{GetThroughCast(shfl->Arg(0).Resolve(), IR::Opcode::BitCastU32F32)};
++    if (shuffled != value) {
++        return;
++    }
++    IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
++    // El operando del FSWZADD tal cual (F32): sin el cast, el valor puede ser un U32 reinterpretado (Unity 2022 en
++    // Castlevania: x sale de una operación entera y se pasa a float con un BitCastF32U32) y envolverlo como F32 lanza.
++    const IR::F32 x{swz->Arg(1).Resolve()};
++    const IR::F32 d{lane.U32() == 1 ? ir.DPdxCoarse(x) : ir.DPdyCoarse(x)};
++    inst.ReplaceUsesWith(ir.BitCast<IR::U32>(d));
++}
++
++// Lo que queda del mismo patrón cuando el resultado del FSWZADD se usa también sin QuadBroadcast (Unity 2022 en
++// Castlevania: el registro llega por un Phi a SetFragColor en Internal-UIRDefault, RimPass, GlypheEnergy...). Por
++// carril del quad el hardware da: 0 -> x (x0), 1 -> x1 - x0, 2 -> x2 - x0, 3 -> x (x3). Sin subgrupos en fragment
++// (Adreno) la emulación de Eden devolvía x en los cuatro. Se emula exacto con el carril de gl_FragCoord (los quads
++// son de 2x2 alineados en pantalla) y las derivadas gruesas, las mismas que el pliegue de QuadBroadcast.
++void FoldQuadSwizzleLanes(IR::Block& block, IR::Inst& inst) {
++    if (inst.GetOpcode() != IR::Opcode::FSwizzleAdd || !inst.HasUses()) {
++        return;
++    }
++    const IR::Value swizzle{inst.Arg(2)};
++    if (!swizzle.IsImmediate() || swizzle.U32() != 0xD7) {
++        return;
++    }
++    const IR::Value first{GetThroughCast(inst.Arg(0).Resolve(), IR::Opcode::BitCastF32U32)};
++    const IR::Value value{GetThroughCast(inst.Arg(1).Resolve(), IR::Opcode::BitCastF32U32)};
++    if (first.IsImmediate() || value.IsImmediate()) {
++        return;
++    }
++    IR::Inst* const shfl{first.InstRecursive()};
++    if (shfl->GetOpcode() != IR::Opcode::ShuffleIndex) {
++        return;
++    }
++    const IR::Value index{shfl->Arg(1)};
++    const IR::Value clamp{shfl->Arg(2)};
++    const IR::Value segmentation_mask{shfl->Arg(3)};
++    if (!index.IsImmediate() || !clamp.IsImmediate() || !segmentation_mask.IsImmediate() ||
++        index.U32() != 0 || clamp.U32() != 3 || segmentation_mask.U32() != 28) {
++        return;
++    }
++    if (GetThroughCast(shfl->Arg(0).Resolve(), IR::Opcode::BitCastU32F32) != value) {
++        return;
++    }
++    IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
++    const IR::F32 x{inst.Arg(1).Resolve()};
++    const IR::U32 one{ir.Imm32(1u)};
++    const IR::U32 px{ir.ConvertFToU(32, ir.FPFloor(ir.GetAttribute(IR::Attribute::PositionX)))};
++    const IR::U32 py{ir.ConvertFToU(32, ir.FPFloor(ir.GetAttribute(IR::Attribute::PositionY)))};
++    const IR::U32 lane{ir.BitwiseOr(ir.BitwiseAnd(px, one), IR::U32{ir.ShiftLeftLogical(ir.BitwiseAnd(py, one), one)})};
++    const IR::F32 dx{ir.DPdxCoarse(x)};
++    const IR::F32 dy{ir.DPdyCoarse(x)};
++    const IR::F32 r1{ir.Select(ir.IEqual(lane, one), dx, x)};
++    const IR::F32 r2{ir.Select(ir.IEqual(lane, ir.Imm32(2u)), dy, r1)};
++    inst.ReplaceUsesWith(r2);
++}
++
+ bool FindGradient3DDerivatives(std::array<IR::Value, 3>& results, IR::Value coord) {
+     if (coord.IsImmediate()) {
+         return false;
+@@ -1104,6 +1195,8 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
+                                     IR::Opcode::CompositeInsertF16x4);
+     case IR::Opcode::FSwizzleAdd:
+         return FoldFSwizzleAdd(block, inst);
++    case IR::Opcode::QuadBroadcast:
++        return FoldQuadBroadcastDerivative(block, inst);
+     case IR::Opcode::GetCbufF32:
+     case IR::Opcode::GetCbufU32:
+         if (env.HasHLEMacroState()) {
+@@ -1133,6 +1226,14 @@ void ConstantPropagationPass(Environment& env, IR::Program& program) {
+             ConstantPropagation(env, *block, inst);
+         }
+     }
++    // Después de plegar los QuadBroadcast (que dejan de usar el FSWZADD): los usos directos que queden.
++    if (program.stage == Stage::Fragment) {
++        for (IR::Block* const block : program.blocks) {
++            for (IR::Inst& inst : block->Instructions()) {
++                FoldQuadSwizzleLanes(*block, inst);
++            }
++        }
++    }
+ }
+ 
+ } // namespace Shader::Optimization

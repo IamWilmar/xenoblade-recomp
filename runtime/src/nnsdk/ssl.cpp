@@ -24,6 +24,7 @@ int Close(int fd);  // socket.cpp: solo cierra descriptores que dio nn::socket
 namespace nn::ssl {
 
 enum CaCertificateId : int32_t {};
+enum CertificateFormat : int32_t {};  // PEM o DER
 
 class Context {
 public:
@@ -34,6 +35,10 @@ public:
     Result Create(SslVersion version);
     Result Destroy();
     Result GetContextId(unsigned long* id);
+    Result ImportServerPki(unsigned long* id, const char* data, unsigned int size, CertificateFormat format);
+    Result ImportClientPki(unsigned long* id, const char* p12, const char* password, unsigned int p12_size,
+                           unsigned int password_size);
+    Result ImportCrl(unsigned long* id, const char* data, unsigned int size);
 
 private:
     uint64_t id_;
@@ -103,6 +108,7 @@ constexpr Result kResultConnectionNotCreated{123 | (109 << 9)};  // Connection s
 constexpr Result kResultContextNotCreated{123 | (110 << 9)};     // Context sin Create
 constexpr Result kResultInvalidSize{123 | (112 << 9)};           // tamaño 0
 constexpr Result kResultInvalidPointer{123 | (113 << 9)};        // puntero nulo
+constexpr Result kResultInvalidPassword{123 | (118 << 9)};       // contraseña de un PKCS#12 con tamaño 0
 constexpr Result kResultInvalidCount{123 | (127 << 9)};          // 0 certificados
 constexpr Result kResultConnectionReset{123 | (209 << 9)};
 
@@ -130,6 +136,35 @@ Result Context::Destroy() {
 Result Context::GetContextId(unsigned long* id) {
     if (!id) return kResultInvalidPointer;
     *id = id_;
+    return ResultSuccess;
+}
+
+// Certificados propios de la aplicación para el contexto: los de servidor en los que confiar, el de cliente (un
+// PKCS#12 con su contraseña) y una lista de revocación. Importar no toca la red: el sdk valida los punteros
+// (sdk+0x3a050c, +0x3a05dc y +0x3a0948) y el servicio guarda el certificado y da su id. Aquí ningún handshake llega a
+// usarlos, así que el contexto solo reparte el id. Los pide el callback de contexto TLS que Unity le pone a su libcurl
+// (main+0x3e41c4, +0x3e4248 y +0x3e42cc), que repite la llamada cada milisegundo mientras el resultado sea del módulo
+// ssl con descripción 204 o 115 (main+0x3e4214…0x3e4224): ninguno de los de aquí lo es.
+Result Context::ImportServerPki(unsigned long* id, const char* data, unsigned int, CertificateFormat) {
+    if (!id || !data) return kResultInvalidPointer;
+    if (!id_) return kResultContextNotCreated;
+    *id = g_next_id++;
+    return ResultSuccess;
+}
+
+Result Context::ImportClientPki(unsigned long* id, const char* p12, const char* password, unsigned int,
+                                unsigned int password_size) {
+    if (!id || !p12 || (!password && password_size)) return kResultInvalidPointer;
+    if (password && !password_size) return kResultInvalidPassword;
+    if (!id_) return kResultContextNotCreated;
+    *id = g_next_id++;
+    return ResultSuccess;
+}
+
+Result Context::ImportCrl(unsigned long* id, const char* data, unsigned int) {
+    if (!id || !data) return kResultInvalidPointer;
+    if (!id_) return kResultContextNotCreated;
+    *id = g_next_id++;
     return ResultSuccess;
 }
 
@@ -356,6 +391,14 @@ Result nnsslConnectionPeek(Connection* c, char* buf, int* out_size, unsigned int
 Result nnsslConnectionPending(Connection* c, int* out) { return c ? c->Pending(out) : kResultInvalidPointer; }
 Result nnsslConnectionGetVerifyCertError(Connection* c, Result* out) {
     return c ? c->GetVerifyCertError(out) : kResultInvalidPointer;
+}
+// El buffer donde el SDK dejaría el certificado del servidor tras el handshake y el detalle de uno de ellos: sin red
+// nunca hay handshake que los llene.
+Result nnsslConnectionSetServerCertBuffer(Connection* c, char*, unsigned int) {
+    return c ? ResultSuccess : kResultInvalidPointer;
+}
+Result nnsslConnectionGetServerCertDetail(Connection* c, void*, const char*, unsigned int) {
+    return c ? kResultConnectionNotCreated : kResultInvalidPointer;
 }
 Result nnsslConnectionGetConnectionId(Connection* c, unsigned long* id) {
     return c ? c->GetConnectionId(id) : kResultInvalidPointer;

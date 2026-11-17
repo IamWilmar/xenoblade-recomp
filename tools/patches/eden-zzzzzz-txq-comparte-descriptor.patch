@@ -1,0 +1,89 @@
+--- a/src/shader_recompiler/ir_opt/texture_pass.cpp
++++ b/src/shader_recompiler/ir_opt/texture_pass.cpp
+@@ -795,9 +795,18 @@
+         }
+     }
+     // Sort instructions to visit textures by constant buffer index, then by offset
+-    std::ranges::sort(to_replace, [](const auto& a, const auto& b) {
++    // Y, con la misma palabra de textura, las consultas de tamaño (TXQ) detrás de las que la muestrean: así la consulta
++    // puede usar el descriptor de una de ellas (más abajo). stable_sort: el orden de los descriptores ya no depende de la
++    // implementación de sort.
++    const auto is_query{[](const TextureInst& t) {
++        const IR::Opcode op{t.inst->GetOpcode()};
++        return op == IR::Opcode::BoundImageQueryDimensions || op == IR::Opcode::BindlessImageQueryDimensions ||
++               op == IR::Opcode::ImageQueryDimensions;
++    }};
++    std::ranges::stable_sort(to_replace, [&](const auto& a, const auto& b) {
+         if (a.cbuf.index != b.cbuf.index) return a.cbuf.index < b.cbuf.index;
+-        return a.cbuf.offset < b.cbuf.offset;
++        if (a.cbuf.offset != b.cbuf.offset) return a.cbuf.offset < b.cbuf.offset;
++        return !is_query(a) && is_query(b);
+     });
+     Descriptors descriptors{
+         program.info.texture_buffer_descriptors,
+@@ -928,24 +937,47 @@
+             } else {
+                 count = std::min(count, sampled_dynamic_cap);
+                 const bool is_integer{is_texture_pixel_format_integer(cbuf)};
+-                index = descriptors.Add(TextureDescriptor{
+-                    .type = flags.type,
+-                    .is_depth = flags.is_depth != 0,
+-                    .is_multisample = is_multisample,
+-                    .is_integer = is_integer,
+-                    .has_secondary = cbuf.has_secondary,
+-                    .cbuf_index = cbuf.index,
+-                    .cbuf_offset = cbuf.offset,
+-                    .shift_left = cbuf.shift_left,
+-                    .secondary_cbuf_index = cbuf.secondary_index,
+-                    .secondary_cbuf_offset = cbuf.secondary_offset,
+-                    .secondary_shift_left = cbuf.secondary_shift_left,
+-                    .count = count,
+-                    .size_shift = size_shift,
+-                    .handle_and_mask = cbuf.and_mask,
+-                    .handle_or = cbuf.or_imm,
+-                });
+-                flags.is_integer.Assign(is_integer ? 1 : 0);
++                // textureSize() no depende del sampler. GLSLC empareja la textura con el sampler de la ranura 0 en el TXQ
++                // y con el suyo en el TEX (c2[0x178]|c2[0x568] y c2[0x178]|c2[0x578] en los 234 pixel shaders de mapa de
++                // degradado de Castlevania): salían dos combined image samplers de la misma textura, uno solo para la
++                // consulta, y en el Adreno el TEX filtraba con el sampler del otro (LINEAR + REPEAT en vez de POINT +
++                // CLAMP: los efectos, rellenos de un color plano). La consulta usa el descriptor de quien la muestrea.
++                bool shared{false};
++                if (inst->GetOpcode() == IR::Opcode::ImageQueryDimensions) {
++                    const auto& all{program.info.texture_descriptors};
++                    for (u32 k = 0; k < all.size(); k++) {
++                        const TextureDescriptor& e{all[k]};
++                        if (e.cbuf_index == cbuf.index && e.cbuf_offset == cbuf.offset &&
++                            e.shift_left == cbuf.shift_left && e.count == count && e.size_shift == size_shift &&
++                            e.handle_and_mask == cbuf.and_mask) {
++                            index = k;
++                            flags.type.Assign(e.type);
++                            flags.is_integer.Assign(e.is_integer ? 1 : 0);
++                            shared = true;
++                            break;
++                        }
++                    }
++                }
++                if (!shared) {
++                    index = descriptors.Add(TextureDescriptor{
++                        .type = flags.type,
++                        .is_depth = flags.is_depth != 0,
++                        .is_multisample = is_multisample,
++                        .is_integer = is_integer,
++                        .has_secondary = cbuf.has_secondary,
++                        .cbuf_index = cbuf.index,
++                        .cbuf_offset = cbuf.offset,
++                        .shift_left = cbuf.shift_left,
++                        .secondary_cbuf_index = cbuf.secondary_index,
++                        .secondary_cbuf_offset = cbuf.secondary_offset,
++                        .secondary_shift_left = cbuf.secondary_shift_left,
++                        .count = count,
++                        .size_shift = size_shift,
++                        .handle_and_mask = cbuf.and_mask,
++                        .handle_or = cbuf.or_imm,
++                    });
++                    flags.is_integer.Assign(is_integer ? 1 : 0);
++                }
+             }
+             break;
+         }

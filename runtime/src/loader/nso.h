@@ -34,6 +34,7 @@ struct Module {
     static constexpr size_t kProbeAreaSize = 64 << 10;  // el final del área: sondas de depuración (probe.cpp)
     uint32_t seg_off[3] = {}, seg_size[3] = {};
     uint32_t bss_size = 0;
+    uint8_t build_id[0x20] = {};  // de la cabecera NSO (0x40): identifica la versión exacta del ejecutable
     std::vector<ElfSym> symbols;
     std::vector<Rela> relocs;
     uint64_t init = 0, init_array = 0, init_array_size = 0;
@@ -46,6 +47,9 @@ struct Module {
 
 // Descomprime los segmentos en memoria propia (RW) y lee la tabla dinámica.
 bool load_nso(const std::string& path, Module& mod, std::string& err);
+
+// Un NRO (módulo que el juego carga en marcha con nn::ro) desde su imagen en memoria.
+bool load_nro(const void* image, size_t image_size, const std::string& name, Module& mod, std::string& err);
 
 // Aplica las relocaciones. resolve da la dirección de cada símbolo que el módulo importa.
 using ImportResolver = std::function<uint64_t(const ElfSym&)>;

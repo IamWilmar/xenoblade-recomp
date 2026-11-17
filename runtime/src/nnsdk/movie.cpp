@@ -15,6 +15,7 @@
 #include <media/NdkMediaExtractor.h>
 #include <media/NdkMediaFormat.h>
 
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -28,7 +29,9 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
+#include "nnsdk/nvn/flags.h"
 #include "nnsdk/nvn/nvn.h"
 #include "nnsdk/os.h"
 #include "nnsdk/runtime.h"
@@ -78,6 +81,7 @@ public:
     void SetDataAndCapacity(void* data, size_t capacity);
     void SetRange(int offset, int size);
     void* Base() const;
+    void* Data() const;
     size_t Capacity() const;
     int Offset() const;
     int Size() const;
@@ -86,6 +90,8 @@ public:
     void SetInt64Data(long value);
     uint32_t GetUint32Data() const;
     long GetInt64Data() const;
+    void SetNvnDev(void* device);
+    void SetNvnSync(void* sync);
 
     void copy_from(const Buffer& other);
 
@@ -152,6 +158,8 @@ void Buffer::SetRange(int offset, int size) {
     size_ = size;
 }
 void* Buffer::Base() const { return base_; }
+// Donde empiezan los datos válidos: la base más el offset (Unity lee así los frames y las muestras).
+void* Buffer::Data() const { return base_ ? static_cast<uint8_t*>(base_) + offset_ : nullptr; }
 size_t Buffer::Capacity() const { return capacity_; }
 int Buffer::Offset() const { return offset_; }
 int Buffer::Size() const { return size_; }
@@ -160,6 +168,11 @@ void Buffer::SetUint32Data(uint32_t value) { uint32_data_ = value; }
 void Buffer::SetInt64Data(long value) { int64_data_ = value; }
 uint32_t Buffer::GetUint32Data() const { return uint32_data_; }
 long Buffer::GetInt64Data() const { return int64_data_; }
+// El dispositivo NVN y el sync del frame cuando el decoder escribe en una textura (el reproductor propio de Unreal
+// los pone antes de pedir el frame): en subsdk0 son dos punteros en +0x30 y +0x38 que solo se guardan. Aquí los
+// frames se entregan siempre copiados a la memoria del juego, así que nadie los lee.
+void Buffer::SetNvnDev(void* device) { reserved_[0] = reinterpret_cast<uint64_t>(device); }
+void Buffer::SetNvnSync(void* sync) { reserved_[1] = reinterpret_cast<uint64_t>(sync); }
 
 // En subsdk0 es un puntero a su almacén interno (un AMessage de Stagefright); el juego le reserva solo esos 8
 // bytes (main+0x712de0c: la variable siguiente está en +0xc). Aquí apunta a un mapa de claves y, si viene del
@@ -168,6 +181,7 @@ long Buffer::GetInt64Data() const { return int64_data_; }
 class MediaData {
 public:
     MediaData();
+    MediaData(const MediaData& other);
     ~MediaData();
     MediaData& operator=(const MediaData& other);
     void Clear();
@@ -175,6 +189,7 @@ public:
     bool FindInt64(const char* key, long* out) const;
     bool FindString(const char* key, const char** out) const;
     bool FindRect(const char* key, int* left, int* top, int* right, int* bottom) const;
+    void SetInt32(const char* key, int value);
 
     struct Value {
         enum Kind { kInt32, kInt64, kString, kRect } kind = kInt32;
@@ -191,6 +206,7 @@ public:
 static_assert(sizeof(MediaData) == 8);
 
 MediaData::MediaData() : store_(new Store) {}
+MediaData::MediaData(const MediaData& other) : store_(new Store) { *this = other; }
 MediaData::~MediaData() {
     Clear();
     delete store_;
@@ -324,6 +340,175 @@ bool CreateVp9DecoderConfigurationData(int width, int height, int, MediaData* ou
     return true;
 }
 
+// CRI Mana sube así el "max-input-size" del formato VP9 cuando sus fotogramas no caben (main+0x5e18f80).
+void MediaData::SetInt32(const char* key, int value) {
+    if (key) set_int(this, key, value);
+}
+
+namespace {
+
+// Lector de bits de un NAL de H.264 ya sin sus bytes de prevención de emulación (00 00 03).
+struct BitReader {
+    const std::vector<uint8_t>& data;
+    size_t pos = 0;
+    bool overrun = false;
+    uint32_t bit() {
+        if (pos >= data.size() * 8) return overrun = true, 0;
+        const uint32_t b = (data[pos >> 3] >> (7 - (pos & 7))) & 1;
+        pos++;
+        return b;
+    }
+    uint32_t bits(int count) {
+        uint32_t v = 0;
+        while (count-- > 0) v = v << 1 | bit();
+        return v;
+    }
+    uint32_t ue() {  // Exp-Golomb sin signo
+        int zeros = 0;
+        while (!overrun && bit() == 0 && zeros < 32) zeros++;
+        return zeros >= 32 ? 0 : (1u << zeros) - 1 + bits(zeros);
+    }
+    int32_t se() {
+        const uint32_t v = ue();
+        return v & 1 ? static_cast<int32_t>((v + 1) / 2) : -static_cast<int32_t>(v / 2);
+    }
+};
+
+// Ancho y alto visibles (con el recorte) que declara un SPS de H.264 (ITU-T H.264 7.3.2.1.1). El NAL llega sin
+// código de inicio, con su byte de cabecera.
+bool sps_dimensions(const uint8_t* sps, size_t size, int* width, int* height) {
+    if (!sps || size < 5 || (sps[0] & 0x1F) != 7) return false;
+    std::vector<uint8_t> rbsp;
+    rbsp.reserve(size);
+    for (size_t k = 1; k < size; k++) {
+        if (k + 2 < size && sps[k] == 0 && sps[k + 1] == 0 && sps[k + 2] == 3) {
+            rbsp.push_back(0), rbsp.push_back(0);
+            k += 2;
+        } else {
+            rbsp.push_back(sps[k]);
+        }
+    }
+    BitReader r{rbsp};
+    const uint32_t profile = r.bits(8);
+    r.bits(16);  // restricciones y nivel
+    r.ue();      // seq_parameter_set_id
+    uint32_t chroma = 1;
+    bool separate_planes = false;
+    switch (profile) {
+    case 100: case 110: case 122: case 244: case 44: case 83: case 86: case 118: case 128: case 138: case 139:
+    case 134: case 135:
+        chroma = r.ue();
+        if (chroma == 3) separate_planes = r.bit();
+        r.ue(), r.ue();  // bit_depth_luma_minus8, bit_depth_chroma_minus8
+        r.bit();         // qpprime_y_zero_transform_bypass_flag
+        if (r.bit()) {   // seq_scaling_matrix_present_flag
+            const int lists = chroma != 3 ? 8 : 12;
+            for (int i = 0; i < lists; i++) {
+                if (!r.bit()) continue;
+                int last = 8, next = 8;
+                for (int j = 0, n = i < 6 ? 16 : 64; j < n; j++) {
+                    if (next != 0) next = (last + r.se() + 256) % 256;
+                    last = next == 0 ? last : next;
+                }
+            }
+        }
+        break;
+    default: break;
+    }
+    r.ue();  // log2_max_frame_num_minus4
+    const uint32_t poc_type = r.ue();
+    if (poc_type == 0) {
+        r.ue();
+    } else if (poc_type == 1) {
+        r.bit(), r.se(), r.se();
+        for (uint32_t k = 0, n = r.ue(); k < n && k < 256; k++) r.se();
+    }
+    r.ue();   // max_num_ref_frames
+    r.bit();  // gaps_in_frame_num_value_allowed_flag
+    const uint32_t width_mbs = r.ue() + 1, height_units = r.ue() + 1;
+    const uint32_t frame_only = r.bit();
+    if (!frame_only) r.bit();  // mb_adaptive_frame_field_flag
+    r.bit();                   // direct_8x8_inference_flag
+    uint32_t left = 0, right = 0, top = 0, bottom = 0;
+    if (r.bit()) left = r.ue(), right = r.ue(), top = r.ue(), bottom = r.ue();
+    if (r.overrun) return false;
+    const uint32_t array_type = separate_planes ? 0 : chroma;
+    const uint32_t unit_x = array_type == 1 || array_type == 2 ? 2 : 1;
+    const uint32_t unit_y = (array_type == 1 ? 2 : 1) * (2 - frame_only);
+    const int64_t w = int64_t{width_mbs} * 16 - int64_t{unit_x} * (left + right);
+    const int64_t h = int64_t{2 - frame_only} * height_units * 16 - int64_t{unit_y} * (top + bottom);
+    if (w <= 0 || h <= 0 || w > 8192 || h > 8192) return false;
+    *width = static_cast<int>(w), *height = static_cast<int>(h);
+    return true;
+}
+
+void set_csd(AMediaFormat* f, const char* key, const uint8_t* nal, size_t size) {
+    std::vector<uint8_t> csd{0, 0, 0, 1};
+    csd.insert(csd.end(), nal, nal + size);
+    AMediaFormat_setBuffer(f, key, csd.data(), csd.size());
+}
+
+}  // namespace
+
+// La configuración de un decoder de H.264 a partir del SPS y el PPS sueltos (sin código de inicio), como la saca
+// CRI Mana de la cabecera de sus vídeos (main+0x5e18764). La librería de la consola arma con ellos un avcC para su
+// Stagefright (subsdk0+0x129210: "mime", "width", "height", "avcc", "max-input-size" = ancho·alto); MediaCodec quiere
+// lo mismo como csd-0 y csd-1, cada uno con su código de inicio. Devuelve false solo si falta algún argumento.
+bool CreateH264DecoderConfigurationData(const uint8_t* sps, size_t sps_size, const uint8_t* pps, size_t pps_size,
+                                        MediaData* out) {
+    if (!sps || !pps || !sps_size || !out) return false;
+    int width = 0, height = 0;
+    if (!sps_dimensions(sps, sps_size, &width, &height)) {
+        printf("[movie] SPS de H.264 ilegible (%zu bytes, cabecera %#x): sin dimensiones\n", sps_size, sps[0]);
+        width = 1280, height = 720;
+    }
+    set_string(out, "mime", "video/avc");
+    set_int(out, "width", width);
+    set_int(out, "height", height);
+    set_int(out, "max-input-size", width * height);
+    if (!out->store_->format) out->store_->format = AMediaFormat_new();
+    set_csd(out->store_->format, "csd-0", sps, sps_size);
+    if (pps_size) set_csd(out->store_->format, "csd-1", pps, pps_size);
+    printf("[movie] H.264 %dx%d (SPS %zu bytes, PPS %zu)\n", width, height, sps_size, pps_size);
+    return true;
+}
+
+// El siguiente NAL de un flujo Annex B: su principio (tras el código de inicio 00 00 01) y su tamaño, sin los ceros
+// que preceden al código siguiente; *data y *size pasan a lo que queda desde ese código (nulo y 0 si era el último).
+// Sin ningún código de inicio devuelve false y deja los dos últimos bytes por mirar, como subsdk0+0x128400.
+bool GetH264NalUnitStartPositionAndNalSize(uint8_t** data, size_t* size, uint8_t** nal, size_t* nal_size) {
+    if (!data || !size || !nal || !nal_size) return false;
+    uint8_t* p = *data;
+    const size_t n = *size;
+    *nal = nullptr;
+    *nal_size = 0;
+    if (n < 3 || !p) return false;
+    size_t i = 0;
+    while (i + 2 < n && !(p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1)) i++;
+    if (i + 2 >= n) {
+        *data = p + n - 2;
+        *size = 2;
+        return false;
+    }
+    const size_t start = i + 3;
+    size_t next = start;  // primer cero del código de inicio siguiente
+    while (next + 2 < n && !(p[next] == 0 && p[next + 1] == 0 && p[next + 2] == 1)) next++;
+    const bool more = next + 2 < n;
+    size_t end = more ? next : n;
+    if (more)
+        while (end > start + 1 && p[end - 1] == 0) end--;
+    *nal = p + start;
+    *nal_size = end - start;
+    if (more && next + 4 < n) {
+        *data = p + next;
+        *size = n - next;
+    } else {
+        *data = nullptr;
+        *size = 0;
+    }
+    return true;
+}
+
 void SetAllocator(void* (*)(size_t, size_t, void*), void (*)(void*, void*), void* (*)(void*, size_t, void*), void*) {}
 void SetCoreMask(uint64_t) {}
 int GetThreadPriority() { return 16; }
@@ -380,6 +565,12 @@ struct FrameLayout {
 struct Decoder::Impl {
     std::mutex m;
     AMediaCodec* codec = nullptr;
+    // Estado de MediaCodec visto desde la API de Nintendo: la de NVIDIA acepta Start dos veces (tras Flush) y Start
+    // tras Stop; MediaCodec no (Stop vuelve a "sin configurar", y un segundo start es INVALID_OPERATION, -38).
+    enum class State { kNone, kConfigured, kRunning, kStopped } state = State::kNone;
+    AMediaFormat* configured = nullptr;  // el formato con que se configuró: Start tras Stop lo vuelve a configurar
+    std::string mime;
+    AMediaFormat* last_output = nullptr;  // el último formato de salida dado al juego (GetOutputFormat sin codec)
     DecoderEvents events{};
     std::deque<int> inputs;
     std::deque<std::pair<int, AMediaCodecBufferInfo>> outputs;
@@ -415,6 +606,9 @@ namespace {
 using Impl = Decoder::Impl;
 
 constexpr int32_t kColorYuv420Planar = 19, kColorYuv420SemiPlanar = 21;
+// COLOR_FormatYUV420Flexible: lo que dicen los decoders por software (c2.android.*); en buffers de memoria es I420.
+constexpr int32_t kColorYuv420Flexible = 0x7F420888;
+bool is_planar(int32_t color) { return color == kColorYuv420Planar || color == kColorYuv420Flexible; }
 
 FrameLayout layout_of(AMediaFormat* f) {
     FrameLayout l;
@@ -437,7 +631,7 @@ size_t pack_nv12(const FrameLayout& l, const uint8_t* src, size_t src_size, uint
     if (w <= 0 || h <= 0 || l.stride < w) return 0;
     h = std::min<int64_t>(h, capacity * 2 / 3 / w) & ~1;  // si el juego reservó menos, las filas que quepan
     size_t chroma = size_t(l.stride) * l.slice;           // inicio del plano UV (o U en I420)
-    bool planar = l.color == kColorYuv420Planar;
+    bool planar = is_planar(l.color);
     size_t c_stride = planar ? l.stride / 2 : l.stride, c_rows = (l.slice + 1) / 2;
     if (chroma + c_stride * c_rows * (planar ? 2 : 1) > src_size) return 0;
     const uint8_t* y = src + size_t(l.crop[1]) * l.stride + l.crop[0];
@@ -475,7 +669,9 @@ void on_output(AMediaCodec*, void* user, int32_t index, AMediaCodecBufferInfo* i
         std::lock_guard lock(d->m);
         d->outputs.emplace_back(index, *info);
         static int n = 0;
-        if (++n <= 40) printf("[movie] on_output %d (índice %d, t=%lld, flags %u)\n", n, index, static_cast<long long>(info->presentationTimeUs), info->flags);
+        if (++n <= 40 || info->flags)
+            printf("[movie] on_output %d (índice %d, t=%lld, flags %u, %d bytes)\n", n, index,
+                   static_cast<long long>(info->presentationTimeUs), info->flags, info->size);
         if (++d->decoded % 60 == 0)
             printf("[movie] %d frames decodificados (t=%lld us), %d entradas enviadas, %d liberados\n", d->decoded,
                    static_cast<long long>(info->presentationTimeUs), d->sent, d->released);
@@ -520,12 +716,34 @@ Decoder::~Decoder() {
         AMediaCodec_stop(impl_->codec);
         AMediaCodec_delete(impl_->codec);
     }
+    if (impl_->configured) AMediaFormat_delete(impl_->configured);
+    if (impl_->last_output) AMediaFormat_delete(impl_->last_output);
     delete impl_;
 }
 
 Status Decoder::RegisterClientEvents(DecoderEvents* events) {
     impl_->events = *events;
     return kOk;
+}
+
+// Vídeo VP9/VP8 por software (libvpx de Android, c2.android.*). El de Qualcomm (OMX.qcom.video.decoder.vp9), al dar
+// los frames en buffers de memoria, convierte cada uno de su formato en mosaico a NV12 lineal con el blitter C2D de la
+// GPU: 40 ms por frame con la GPU del juego al 99 % (Xenoblade 3, la película de la intro), 25 fps para un vídeo de 30.
+// Todos los frames llegaban tarde, el juego los tiraba sin pedirlos (2300 sacados, 57 copiados) y la pantalla se quedaba
+// en el primero (negro) mientras el audio y los subtítulos seguían. 720p VP9 por CPU son pocos ms en los A77.
+// <datos>/video_hw: el decoder de hardware de antes.
+AMediaCodec* create_decoder(const std::string& type) {
+    if (!NVN_FLAG("video_hw")) {
+        const char* sw = type == "video/x-vnd.on2.vp9"   ? "c2.android.vp9.decoder"
+                         : type == "video/x-vnd.on2.vp8" ? "c2.android.vp8.decoder"
+                                                         : nullptr;
+        if (sw)
+            if (AMediaCodec* c = AMediaCodec_createCodecByName(sw)) {
+                printf("[movie] %s por software (%s)\n", type.c_str(), sw);
+                return c;
+            }
+    }
+    return AMediaCodec_createDecoderByType(type.c_str());
 }
 
 Status Decoder::Configure(MediaData* format) {
@@ -542,7 +760,7 @@ Status Decoder::Configure(MediaData* format) {
         impl_->clear_queues();
     }
     static int failures = 0;
-    AMediaCodec* codec = AMediaCodec_createDecoderByType(type.c_str());
+    AMediaCodec* codec = create_decoder(type);
     if (!codec) {
         if (failures++ < 8) printf("[movie] no hay decoder para %s\n", type.c_str());
         return kError;
@@ -557,13 +775,13 @@ Status Decoder::Configure(MediaData* format) {
     media_status_t r = AMediaCodec_configure(codec, f, nullptr, nullptr, 0);
     if (r != AMEDIA_OK && asked_color) {
         AMediaCodec_delete(codec);
-        codec = AMediaCodec_createDecoderByType(type.c_str());
+        codec = create_decoder(type);
         AMediaFormat_delete(f);
         f = to_format(format);
         r = codec ? AMediaCodec_configure(codec, f, nullptr, nullptr, 0) : AMEDIA_ERROR_UNKNOWN;
     }
-    AMediaFormat_delete(f);
     if (r != AMEDIA_OK) {
+        AMediaFormat_delete(f);
         if (failures++ < 8) printf("[movie] AMediaCodec_configure: %d\n", r);
         if (codec) AMediaCodec_delete(codec);
         return from_media(r);
@@ -571,6 +789,10 @@ Status Decoder::Configure(MediaData* format) {
     AMediaCodecOnAsyncNotifyCallback callbacks{on_input, on_output, on_format, on_error};
     AMediaCodec_setAsyncNotifyCallback(codec, callbacks, impl_);
     impl_->codec = codec;
+    impl_->state = Impl::State::kConfigured;
+    if (impl_->configured) AMediaFormat_delete(impl_->configured);
+    impl_->configured = f;  // el mismo que se pasó a configure (con la petición de NV12): Flush y Start tras Stop
+    impl_->mime = type;
     char* name = nullptr;
     AMediaCodec_getName(codec, &name);
     printf("[movie] decoder %s listo (%s)\n", type.c_str(), name ? name : "?");
@@ -581,32 +803,82 @@ Status Decoder::Configure(MediaData* format) {
 Status Decoder::GetOutputFormat(MediaData* out) {
     static int calls = 0;
     trace("GetOutputFormat", ++calls);
-    if (!impl_->codec) return kError;
+    // Sin codec (entre Flush y Start): el último formato de salida que se dio.
+    if (!impl_->codec) {
+        if (!impl_->last_output) return kError;
+        fill_from(out, impl_->last_output);
+        return kOk;
+    }
     AMediaFormat* f = AMediaCodec_getOutputFormat(impl_->codec);
     fill_from(out, f);
-    AMediaFormat_delete(f);
+    if (impl_->last_output) AMediaFormat_delete(impl_->last_output);
+    impl_->last_output = f;
     return kOk;
 }
 
+// Xenoblade 3 encadena las películas de la intro con el mismo decoder: Flush (que aquí ya arranca) y Start. Con el
+// decoder por software el segundo start daba -38 y la película siguiente no empezaba (se quedaba la última imagen).
 Status Decoder::Start() {
-    media_status_t r = impl_->codec ? AMediaCodec_start(impl_->codec) : AMEDIA_ERROR_UNKNOWN;
+    printf("[movie] Start (estado %d)\n", static_cast<int>(impl_->state));
+    if (impl_->state == Impl::State::kRunning && impl_->codec) return kOk;
+    // Tras Flush (o Stop) el codec no existe o está parado: uno nuevo con el formato de Configure (stop + configure del
+    // mismo no vuelve a avisar con el decoder por software).
+    if (!impl_->codec || impl_->state == Impl::State::kStopped) {
+        if (!impl_->configured) return kError;
+        if (impl_->codec) {
+            AMediaCodec_delete(impl_->codec);
+            impl_->codec = nullptr;
+        }
+        impl_->clear_queues();
+        AMediaCodec* codec = create_decoder(impl_->mime);
+        media_status_t c = codec ? AMediaCodec_configure(codec, impl_->configured, nullptr, nullptr, 0) : AMEDIA_ERROR_UNKNOWN;
+        if (c != AMEDIA_OK) {
+            printf("[movie] Start: no se pudo reconfigurar (%d)\n", c);
+            if (codec) AMediaCodec_delete(codec);
+            return from_media(c);
+        }
+        AMediaCodecOnAsyncNotifyCallback callbacks{on_input, on_output, on_format, on_error};
+        AMediaCodec_setAsyncNotifyCallback(codec, callbacks, impl_);
+        impl_->codec = codec;
+    }
+    media_status_t r = AMediaCodec_start(impl_->codec);
+    if (r == AMEDIA_OK) impl_->state = Impl::State::kRunning;
+    else printf("[movie] AMediaCodec_start: %d\n", r);
     return from_media(r);
 }
 
 Status Decoder::Stop() {
+    printf("[movie] Stop (estado %d)\n", static_cast<int>(impl_->state));
     if (impl_->codec) AMediaCodec_stop(impl_->codec);
     impl_->clear_queues();
+    if (impl_->state != Impl::State::kNone) impl_->state = Impl::State::kStopped;
     return kOk;
 }
 
 Status Decoder::Reset() { return Stop(); }
 
-// En modo asíncrono, tras flush hay que volver a llamar a start.
+// Flush de NVIDIA: vacía y deja el decoder parado hasta el siguiente Start. Xenoblade 3 encadena así las películas de la
+// intro (Flush, abre la siguiente, Start); entre medias su hilo de entrada, aún en el final de la película anterior,
+// sigue mandando marcas de fin. Con flush + start de MediaCodec el decoder las aceptaba y devolvía el fin de stream
+// en el codec ya arrancado: la película siguiente "terminaba" sin empezar y el juego se quedaba esperando (se congelaba
+// la última imagen). Aquí el codec se suelta y Start crea uno nuevo: sin buffers de entrada entre medias, como en la
+// consola. <datos>/flush_mediacodec: el flush + start de MediaCodec de antes.
 Status Decoder::Flush() {
+    printf("[movie] Flush (estado %d)\n", static_cast<int>(impl_->state));
     if (!impl_->codec) return kError;
-    AMediaCodec_flush(impl_->codec);
+    if (NVN_FLAG("flush_mediacodec") || !impl_->configured) {
+        AMediaCodec_flush(impl_->codec);
+        impl_->clear_queues();
+        media_status_t r = AMediaCodec_start(impl_->codec);
+        if (r != AMEDIA_OK) printf("[movie] start tras flush: %d\n", r);
+        return from_media(r);
+    }
+    AMediaCodec_stop(impl_->codec);
+    AMediaCodec_delete(impl_->codec);
+    impl_->codec = nullptr;
     impl_->clear_queues();
-    return from_media(AMediaCodec_start(impl_->codec));
+    impl_->state = Impl::State::kStopped;
+    return kOk;
 }
 
 Status Decoder::AcquireInputBufferIndex(int* index, int* remaining) {
@@ -637,8 +909,10 @@ Status Decoder::SendInputBufferForDecode(int index, int offset, int size, long t
     if (!impl_->codec) return kError;
     if (impl_->sent++ < 40 || (flags & 4))
         printf("[movie] entrada %d: %d bytes t=%ld flags 0x%x\n", impl_->sent, size, time_us, flags);
-    return from_media(AMediaCodec_queueInputBuffer(impl_->codec, index, offset, size, time_us < 0 ? 0 : time_us,
-                                                   flags));
+    const media_status_t r =
+        AMediaCodec_queueInputBuffer(impl_->codec, index, offset, size, time_us < 0 ? 0 : time_us, flags);
+    if (r != AMEDIA_OK) printf("[movie] queueInputBuffer %d (flags 0x%x): %d\n", index, flags, r);
+    return from_media(r);
 }
 
 Status Decoder::AcquireOutputBufferIndex(int* index, long* time_us, unsigned* flags, int* remaining) {
@@ -653,6 +927,7 @@ Status Decoder::AcquireOutputBufferIndex(int* index, long* time_us, unsigned* fl
     impl_->outputs.pop_front();
     if (impl_->outputs.empty()) impl_->clear(impl_->events.output_available);
     impl_->given[i] = info;
+    if (info.flags) printf("[movie] AcquireOutput entrega índice %d con flags %u (%d bytes)\n", i, info.flags, info.size);
     *index = i;
     *time_us = info.presentationTimeUs;
     *flags = info.flags;
@@ -681,13 +956,22 @@ Status Decoder::GetOutputBuffer(int index, Buffer* out) {
         return kOk;
     }
     if (impl_->video && info.size > 0 && layout.width > 0 &&
-        (out->Capacity() < static_cast<size_t>(info.size) || layout.color == kColorYuv420Planar)) {
+        (out->Capacity() < static_cast<size_t>(info.size) || is_planar(layout.color))) {
         size_t n = pack_nv12(layout, data + info.offset, info.size, static_cast<uint8_t*>(out->Base()),
                              out->Capacity());
         static int logged = 0;
-        if (nvn::first_times(logged, 2))
-            printf("[movie] frame recolocado en NV12 compacto: %zu de %zu bytes (el juego da %zu)\n", n,
-                   static_cast<size_t>(info.size), out->Capacity());
+        if (nvn::first_times(logged, 2) || NVN_FLAG("diag_video")) {
+            // DEPURACIÓN: brillo medio (Y) del frame del decoder y del que queda en la memoria del juego.
+            const uint8_t* src = data + info.offset;
+            const auto* dst = static_cast<const uint8_t*>(out->Base());
+            uint64_t ys = 0, yd = 0, k = 0;
+            for (size_t i = 0; i < size_t(layout.stride) * layout.height && i < size_t(info.size); i += 4093, k++)
+                ys += src[i], yd += dst[std::min(i, n - 1)];
+            printf("[movie] frame recolocado en NV12 compacto: %zu de %zu bytes (el juego da %zu en %p) t=%lld, Y medio "
+                   "decoder %llu juego %llu\n", n, static_cast<size_t>(info.size), out->Capacity(), out->Base(),
+                   static_cast<long long>(info.presentationTimeUs), static_cast<unsigned long long>(k ? ys / k : 0),
+                   static_cast<unsigned long long>(k ? yd / k : 0));
+        }
         out->SetRange(0, static_cast<int>(n));
         return n ? kOk : kError;
     }
@@ -923,19 +1207,8 @@ Status Extractor::SetDataSource(ClientStreamReader* reader, const char* path) {
     // no lee de una fuente por callbacks ("FileSourceWrapper::New Init returned -1004", 0 pistas): necesita un archivo.
     // Si el vídeo es un archivo de la RomFS en la SD, va su descriptor (los MP4 de MH Rise venían de dentro de sus pak y
     // no lo son); si no, el lector del juego como antes.
-    if (const std::string host = path ? nnsdk::fs_host_path(path) : std::string{}; !host.empty()) {
-        const int fd = open(host.c_str(), O_RDONLY | O_CLOEXEC);
-        struct stat st {};
-        if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0) {
-            impl_->fd = fd;
-            impl_->ex = AMediaExtractor_new();
-            printf("[movie] extractor sobre %s (descriptor, %lld bytes)\n", host.c_str(), static_cast<long long>(st.st_size));
-            if (impl_->report(AMediaExtractor_setDataSourceFd(impl_->ex, fd, 0, st.st_size)) == kOk) return kOk;
-            impl_->reset();
-        } else if (fd >= 0) {
-            close(fd);
-        }
-    }
+    // Unity (Disco Elysium) guarda los VideoClip dentro de los .resource y su lector entrega solo ese trozo: se busca
+    // dónde empieza dentro del archivo (sus primeros bytes) y se le da al extractor el descriptor con ese desplazamiento.
     void* handle = nullptr;
     if (!reader->Open(path, &handle) || !handle) {
         printf("[movie] el lector del juego no abre %s\n", path ? path : "(sin nombre)");
@@ -943,6 +1216,43 @@ Status Extractor::SetDataSource(ClientStreamReader* reader, const char* path) {
     }
     long size = -1;
     reader->GetSize(handle, &size);
+    if (const std::string host = path ? nnsdk::fs_host_path(path) : std::string{}; !host.empty()) {
+        const int fd = open(host.c_str(), O_RDONLY | O_CLOEXEC);
+        struct stat st {};
+        if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0) {
+            int64_t offset = 0, length = st.st_size;
+            if (size > 0 && size < st.st_size) {
+                offset = -1;
+                uint8_t head[256];
+                const long want = std::min<long>(size, sizeof head);
+                if (reader->ReadAt(handle, 0, head, want) == want) {
+                    void* map = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                    if (map != MAP_FAILED) {
+                        const auto* bytes = static_cast<const uint8_t*>(map);
+                        if (const void* hit = memmem(bytes, st.st_size, head, want))
+                            offset = static_cast<const uint8_t*>(hit) - bytes;
+                        munmap(map, st.st_size);
+                    }
+                }
+                length = size;
+            }
+            if (offset >= 0 && offset + length <= st.st_size) {
+                impl_->fd = fd;
+                impl_->ex = AMediaExtractor_new();
+                printf("[movie] extractor sobre %s (descriptor, %lld bytes desde %lld)\n", host.c_str(),
+                       static_cast<long long>(length), static_cast<long long>(offset));
+                if (impl_->report(AMediaExtractor_setDataSourceFd(impl_->ex, fd, offset, length)) == kOk) {
+                    reader->Close(handle);
+                    return kOk;
+                }
+                impl_->reset();
+            } else {
+                close(fd);
+            }
+        } else if (fd >= 0) {
+            close(fd);
+        }
+    }
     auto* s = new Source;
     s->reader = reader;
     s->handle = handle;

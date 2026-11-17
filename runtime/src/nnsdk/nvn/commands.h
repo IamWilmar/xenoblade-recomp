@@ -193,7 +193,40 @@ struct CopyBufferToTexture {
     CopyRegion region;
     // SetCopyRowStride / SetCopyImageStride del command buffer al grabar: las zancadas del buffer (0: compacto).
     int64_t row_stride = 0, image_stride = 0;
+    // DIAGNÓSTICO (reproducción en diferido): los bytes del buffer que la copia va a leer y la huella de sus extremos al
+    // grabar (edge_print; span 0: sin tomar). La cola lee el buffer al reproducir: si para entonces el juego ha reutilizado
+    // esa memoria, la textura se queda para siempre con los texels de otra. Unity (Disco Elysium) sube así sus texturas sin
+    // comprimir (main+0x95be60, con un buffer temporal que suelta nada más grabar la copia, main+0x95beb8) y no reutiliza
+    // esa memoria hasta 3 presentaciones después (main+0x9915e8), así que no debería pasar: el ejecutor lo cuenta.
+    uint32_t span = 0;
+    uint64_t print = 0;
+    // DIAGNÓSTICO (Castlevania, ruido de los poderes a 0xCD): en las copias grandes, una muestra de todo el buffer (1 byte
+    // de cada 64) y cuántos de esos bytes valen 0xCD, al grabar.
+    uint64_t sample_print = 0;
+    uint32_t sample_cd = 0, samples = 0;
 };
+// Muestra de todo el buffer: 1 byte de cada 64 (huella FNV y cuántos valen 0xCD).
+inline void sample_stats(const void* p, size_t size, uint64_t& print, uint32_t& cd, uint32_t& n) {
+    const auto* b = static_cast<const uint8_t*>(p);
+    uint64_t h = 1469598103934665603ull;
+    cd = 0, n = 0;
+    for (size_t k = 0; k < size; k += 64, n++) {
+        h = (h ^ b[k]) * 0x100000001b3ull;
+        cd += b[k] == 0xCD;
+    }
+    print = h;
+}
+// Huella de los extremos de [p, p + size): hasta 64 bytes del principio y 64 del final (lo que basta para ver que un buffer
+// temporal de subida ya es de otra textura sin recorrerlo entero al grabar y al reproducir).
+inline uint64_t edge_print(const void* p, size_t size) {
+    const auto* b = static_cast<const uint8_t*>(p);
+    uint64_t h = 1469598103934665603ull ^ size;
+    const size_t head = size < 64 ? size : 64;
+    for (size_t k = 0; k < head; k++) h = (h ^ b[k]) * 0x100000001b3ull;
+    const size_t tail = size - head < 64 ? size - head : 64;
+    for (size_t k = size - tail; k < size; k++) h = (h ^ b[k]) * 0x100000001b3ull;
+    return h ? h : 1;
+}
 // nvnCommandBufferCopyTextureToBuffer: la región de la textura a un buffer (memoria del juego), con las zancadas del
 // command buffer. Al reproducir, desde la memoria de la textura (como ReadTexels).
 struct CopyTextureToBuffer {
@@ -257,9 +290,10 @@ struct PrimitiveRestart {
 };
 // Transform feedback (emulado con un SSBO, ver nvnshader::kXfbBank): buffers de captura y Begin/End/Pause/Resume.
 struct TransformFeedback {
-    enum Op { Bind, Begin, End, Pause, Resume } op;
-    int index;          // Bind: buffer de captura (0..3)
+    enum Op { Bind, Begin, End, Pause, Resume, Draw } op;
+    int index;          // Bind: buffer de captura (0..3); Draw: la primitiva
     BufferRange range;  // Bind
+    uint64_t control = 0;  // Begin/End/Pause/Resume/Draw: el buffer de control del juego (dónde va la cuenta)
 };
 
 }  // namespace cmd
@@ -313,7 +347,63 @@ struct CommandList {
     // la única con flags IMAGE a secas): al enviarla, la cola se reproduce y se espera a la GPU ahí mismo, para que la
     // devolución (Executor::readback_1x1_targets) esté en la memoria del juego antes de que la lea.
     bool cpu_capture = false;
+    // Reproducción en diferido: las texturas que sus comandos nombran por puntero (una entrada por mención) y si la lista ya
+    // se envió alguna vez. Al enviarla, cada una apunta el ticket (Texture::last_ticket) y deja de contar en open_refs; si
+    // se recicla sin enviarse, solo lo segundo (note_list_dropped).
+    // submitted también cuando sus menciones pasaron a la lista que la llamó (nvnCommandBufferCallCommands copia sus
+    // comandos en ella): desde entonces quien las cuenta, y quien les pondrá el ticket, es esa.
+    std::vector<Texture*> texture_refs;
+    bool submitted = false;
 };
+
+// Reproducción en diferido. El juego destruye o reinicia AL MOMENTO (nvnTextureFinalize, nvnMemoryPoolFinalize…) cosas que
+// los comandos ya enviados necesitan cuando la cola los reproduce, que aquí es más tarde y en otro hilo. En la consola eso
+// no pasa: el juego solo las suelta cuando la GPU ya ejecutó esos comandos. Disco Elysium (Unity + AmplifyTexture): cada
+// página del fondo se sube a una textura temporal de 136x136, se graba su copia a la caché y la temporal se finaliza; con
+// la copia aún sin reproducir se quedaba sin origen y la capa de la caché seguía con su relleno (teselas negras en media
+// habitación). replay_barrier espera a que la cola haya reproducido hasta ese envío (0: todo lo enviado hasta ahora); no
+// espera a la GPU. No hace nada desde el propio hilo de la cola ni en modo síncrono.
+void replay_barrier(uint64_t ticket, const char* what);
+// El último envío por el que este hilo esperó a la GPU con un NVNsync del juego (nvnSyncWait con plazo y señalado); 0 si
+// nunca. Un hilo así libera recursos cuando la GPU ha acabado el envío que los usaba (Unreal Engine 5: el
+// RHIInterruptThread espera el sync de cada envío y luego finaliza sus pools, buffers y texturas), así que lo que
+// finaliza no lo nombra ningún envío posterior y su barrera solo tiene que cubrir hasta ese: con la barrera general
+// (todo lo encolado) cada nvnMemoryPoolFinalize esperaba a que la cola reprodujera el frame que el juego acababa de
+// enviar, el hilo soltaba menos envíos de los que el juego creaba (iba 1500 envíos por detrás al minuto y medio) y
+// Unreal agotaba su presupuesto de memoria (3 GB comprometidos, aborto en su aviso de memoria agotada).
+void note_thread_completion(uint64_t ticket);
+uint64_t thread_completion_ticket();
+uint64_t replayed_ticket();  // el último envío del juego ya reproducido
+// Los PresentTexture del juego (su número de frame), para saber cuántos frames después de usar algo lo suelta.
+uint32_t game_frame();
+void note_game_present();
+// El intervalo de presentación en curso (el de la ventana, o 1 con <datos>/60fps): lo apunta present() y lo lee la guarda
+// del FSR (a intervalo 1 el frame tiene 16,7 ms).
+void set_present_interval(int interval);
+int present_interval();
+// ¿Acabó ya el frame `frame` del juego (presentó) y la cola reprodujo todo lo que envió hasta entonces?
+bool game_frame_replayed(uint32_t frame, uint64_t replayed);
+// Una lista grabada que se recicla sin haberse enviado: sus texturas dejan de contarla (Texture::open_refs).
+void note_list_dropped(CommandList& list);
+// Para el log de ritmo (window.cpp), desde la última vez: barreras pedidas, las que esperaron y cuánto; y texturas
+// finalizadas o reiniciadas (texture.cpp): con un envío suyo aún sin reproducir, con comandos grabados sin enviar, y cuántos
+// frames del juego después del último comando que las nombraba (0, 1, 2, 3, 4 o más).
+void take_barrier_stats(uint64_t& calls, uint64_t& waits, uint64_t& wait_ns, uint64_t& max_ns);
+void take_teardown_stats(uint64_t& total, uint64_t& pending, uint64_t& unsent, uint64_t& limbo, uint64_t& copied_bytes,
+                         uint64_t frames_after[5]);
+// Texturas finalizadas por el juego que comandos sin reproducir aún nombran (texture.cpp, "limbo"): la cola las finaliza de
+// verdad tras reproducir el último envío que las nombra. Cuántas hay ahora.
+void reap_limbo_textures(uint64_t replayed);
+size_t limbo_textures();
+// Más cuentas para el log de ritmo, desde la última vez. Del limbo (texture.cpp): cuántas texturas y cuántos bytes (imágenes
+// y copias de texels) llegó a tener, las que soltaron sus válvulas (por edad y por tope de memoria) y las texturas
+// finalizadas recién creadas, sin imagen y sin que ningún comando las nombre (las que limbo_recientes conservaría). De la
+// cola (executor.cpp): cuántos envíos llegó a tener pendientes y cuántos CopyBufferToTexture encontraron su buffer
+// cambiado al reproducirse (cmd::CopyBufferToTexture::print). kept_total no es del tramo: las texturas finalizadas del todo
+// en lo que va de ejecución, cuyos objetos se conservan para siempre (los pools de texturas y la cola pueden nombrarlos).
+void take_limbo_stats(uint64_t& max_count, uint64_t& max_bytes, uint64_t& forced_age, uint64_t& forced_budget, uint64_t& young,
+                      uint64_t& kept_total);
+void take_queue_stats(uint64_t& max_pending, uint64_t& stale_uploads);
 
 // Ejecuta en Vulkan las listas que el juego envía a la cola (executor.cpp).
 void execute(const std::vector<const CommandList*>& lists);
@@ -344,6 +434,17 @@ void next_frame();
 // frame presentado (la suma de sus envíos).
 bool game_gpu_frame(uint64_t& serial, int64_t& ns);
 uint64_t last_frame_run_ns();
+// La GPU ocupada entre los dos sellos del último frame del juego que se pudo medir (Executor::busy_end) y el tramo entre
+// ellos, con un número que sube con cada uno (true si hay uno más nuevo que `serial`). El número se publica el último:
+// quien lo ve nuevo lee los dos valores de ese frame o de uno posterior.
+inline bool game_gpu_busy(uint64_t& serial, int64_t& busy_ns, int64_t& span_ns) {
+    const uint64_t now = g_drop_stats.busy_serial.load(std::memory_order_acquire);
+    if (now == serial) return false;
+    serial = now;
+    busy_ns = static_cast<int64_t>(g_drop_stats.busy_last_ns.load(std::memory_order_relaxed));
+    span_ns = static_cast<int64_t>(g_drop_stats.busy_span_last_ns.load(std::memory_order_relaxed));
+    return true;
+}
 // DEPURACIÓN: traza del frame siguiente pedida desde el código (el detector de destellos de window.cpp); full: con los
 // render targets, como <datos>/trazar con "completa".
 void request_trace(bool full);
@@ -393,6 +494,7 @@ inline void lock_executor(std::unique_lock<std::recursive_mutex>& lock) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
 }
 void retire_texture_gpu(Texture& t);  // deja la textura sin imagen
+void forget_texture_storage(Texture& t);  // su memoria del juego deja de ser suya (antes de cambiar Texture::storage)
 void retire_sampler(VkSampler sampler);
 
 }  // namespace nvn

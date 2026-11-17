@@ -48,6 +48,7 @@ nvn::Boolean nvnBufferInitialize(void* buffer, const BufferBuilder* b) {
     }
     Buffer& buf = g_buffers.create(buffer);
     buf.data = pool->storage + b->offset;
+    pool->buffers = true;  // finalizar el pool espera a que la cola reproduzca lo que lee de él (memory.cpp)
     buf.size = b->size;
     buf.pool = b->pool;
     buf.offset = b->offset;

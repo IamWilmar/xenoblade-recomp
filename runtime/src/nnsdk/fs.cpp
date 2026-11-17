@@ -3,7 +3,7 @@
 //   rom:   -> romfs/      (RomFS del juego con el update aplicado; solo lectura)
 //   aoc:   -> aoc/<n>/    (DLC; solo lectura)
 // salvo que <datos>/rutas.txt diga otra cosa para rom: y aoc: (rutas.h).
-//   save:  -> save/       (partidas)
+//   save:  -> save/       (partidas; save_prueba/ si existe al abrir el juego: ver save_dir)
 //   cache: -> cache/      (cache storage de la aplicación)
 //
 // La partida guardada de la consola es transaccional (nada cambia hasta CommitSaveData); aquí se escribe en los
@@ -24,12 +24,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "nnsdk/fs_remoto.h"
 #include "nnsdk/rutas.h"
 #include "nnsdk/watch.h"
 #include "nnsdk/nvn/flags.h"
@@ -61,6 +63,9 @@ struct DirectoryEntry {
     int64_t size;
 };
 struct WriteOption {
+    int flags;
+};
+struct ReadOption {
     int flags;
 };
 // El juego monta rom: con un FsContext propio (main+0x236eb88) para recibir el error en vez de abortar: un
@@ -110,6 +115,8 @@ struct File {
     int fd;
     int mode;
     std::string path;  // DEPURACIÓN: para traza_fs
+    std::string remoto;  // RomFS remota (emulador): ruta "tcp:..." y su tamaño; fd = -1
+    int64_t size = 0;
 };
 struct Directory {
     std::vector<DirectoryEntry> entries;
@@ -129,7 +136,7 @@ Result from_errno() {
 }
 
 void mount(const char* name, const std::string& dir, bool read_only = false, bool journaled = false) {
-    mkdir(dir.c_str(), 0775);
+    if (!fs_remoto::es_remota(dir)) mkdir(dir.c_str(), 0775);
     std::lock_guard lock(g_mounts_m);
     g_mounts[name] = Mount{dir, read_only, journaled};
     printf("[fs] %s: -> %s%s\n", name, dir.c_str(), read_only ? " (solo lectura)" : "");
@@ -149,7 +156,20 @@ std::string host_path(const char* path, Mount* out = nullptr) {
     return it->second.dir + "/" + rest;
 }
 
-std::string backup_dir() { return data_dir() + "/save.bak"; }
+// La carpeta de la partida. DEPURACIÓN: si al abrir el juego existe <datos>/save_prueba, se usa esa (y save_prueba.bak) y
+// la del jugador no se toca: las pruebas en la Flip cargan ahí una copia de su partida y el autoguardado del juego va a
+// esa copia. Se mira una vez por proceso.
+std::string save_dir() {
+    static const std::string dir = [] {
+        const std::string test = data_dir() + "/save_prueba";
+        struct stat st;
+        const bool use_test = stat(test.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+        if (use_test) printf("[fs] PARTIDA DE PRUEBA: %s (la del jugador, en save/, no se toca)\n", test.c_str());
+        return use_test ? test : data_dir() + "/save";
+    }();
+    return dir;
+}
+std::string backup_dir() { return save_dir() + ".bak"; }
 
 // Copia a save.bak/ la versión confirmada de un archivo de la partida antes de que el juego lo cambie (abrirlo
 // para escribir o borrarlo; RenameFile no pisa destinos). Una vez por archivo y ciclo de commit. Si el juego se cerró
@@ -188,7 +208,7 @@ void backup(const Mount& m, const std::string& host) {
 void log_open(const char* path, bool ok) {
     if (!ok)
         printf("[fs] no existe: %s\n", path);
-    else if (g_logged_opens++ < 40)
+    else if (g_logged_opens++ < 40 || strstr(path, "Amplify") || strstr(path, "vtc2"))
         printf("[fs] abre %s\n", path);
 }
 
@@ -222,8 +242,79 @@ Result MountAddOnContent(const char* name, int index, void*, size_t) {
     }
     return ResultSuccess;
 }
+// Cache storage y temporary storage: existen solo si el control.nacp del juego los declara, y el de Final Fantasy
+// Resonance no declara ninguno (CacheStorageSize, CacheStorageDataAndJournalSizeMax y TemporaryStorageSize a 0). En la
+// consola montarlos o crearlos falla y Unreal sigue sin ellos (su arranque los prueba: main+0x6340 "cache",
+// main+0x6450 "temp", y la lista por índices en main+0x6520): aquí igual, para que el motor vaya por el mismo camino
+// que en la consola.
+struct CacheStorageListHandle {
+    void* handle;
+};
+struct CacheStorageInfo {
+    int32_t index;
+};
 Result MountCacheStorage(const char* name) {
-    mount(name, data_dir() + "/cache");
+    printf("[fs] MountCacheStorage(%s): el juego no declara cache storage\n", name);
+    return kTargetNotFound;
+}
+Result MountCacheStorage(const char* name, int index) {
+    printf("[fs] MountCacheStorage(%s, %d): el juego no declara cache storage\n", name, index);
+    return kTargetNotFound;
+}
+Result MountTemporaryStorage(const char* name) {
+    printf("[fs] MountTemporaryStorage(%s): el juego no declara temporary storage\n", name);
+    return kTargetNotFound;
+}
+Result CreateCacheStorage(int index, int64_t size, int64_t journal) {
+    printf("[fs] CreateCacheStorage(%d, %lld, %lld): el juego no declara cache storage\n", index,
+           static_cast<long long>(size), static_cast<long long>(journal));
+    return kTargetNotFound;
+}
+Result DeleteCacheStorage(int) { return kTargetNotFound; }
+Result GetCacheStorageSize(int64_t* size, int64_t* journal, int) {
+    if (size) *size = 0;
+    if (journal) *journal = 0;
+    return kTargetNotFound;
+}
+// La lista de los que hay: ninguno.
+Result OpenCacheStorageList(CacheStorageListHandle* out) {
+    static char list;
+    out->handle = &list;
+    return ResultSuccess;
+}
+Result ReadCacheStorageList(int* count, CacheStorageInfo*, CacheStorageListHandle, int) {
+    *count = 0;
+    return ResultSuccess;
+}
+void CloseCacheStorageList(CacheStorageListHandle) {}
+
+// RAM disk (Unity 2022 monta uno para temporales). Aquí es una carpeta que se vacía al montar, como un RAM disk
+// recién creado. El buffer no se usa: se pide poco para no gastarle memoria al juego.
+size_t GetRamDiskBufferSize(size_t size) {
+    printf("[fs] GetRamDiskBufferSize(%zu KB): 64 KB (va a una carpeta)\n", size / 1024);
+    return 64 * 1024;
+}
+Result MountRamDisk(const char* name, void*, size_t) {
+    const std::string dir = data_dir() + "/ramdisk";
+    mkdir(dir.c_str(), 0775);
+    const std::string sub = dir + "/" + name;
+    std::function<void(const std::string&)> vaciar = [&](const std::string& d) {
+        if (DIR* dp = opendir(d.c_str())) {
+            while (dirent* e = readdir(dp)) {
+                if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+                const std::string p = d + "/" + e->d_name;
+                if (e->d_type == DT_DIR) {
+                    vaciar(p);
+                    rmdir(p.c_str());
+                } else {
+                    unlink(p.c_str());
+                }
+            }
+            closedir(dp);
+        }
+    };
+    vaciar(sub);
+    mount(name, sub);
     return ResultSuccess;
 }
 
@@ -231,12 +322,12 @@ Result MountCacheStorage(const char* name) {
 // existe, la crea antes de montarla: main+0x796b1a4).
 Result EnsureSaveData(const account::Uid&) {
     mkdir(data_dir().c_str(), 0775);
-    mkdir((data_dir() + "/save").c_str(), 0775);
+    mkdir(save_dir().c_str(), 0775);
     return ResultSuccess;
 }
 bool IsSaveDataExisting(const account::Uid&) {
     struct stat st;
-    return stat((data_dir() + "/save").c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    return stat(save_dir().c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 // MH Rise busca también las partidas de otros juegos suyos (bonificaciones): aquí no hay ninguna.
 bool IsSaveDataExisting(ApplicationId app, const account::Uid& uid) {
@@ -244,12 +335,12 @@ bool IsSaveDataExisting(ApplicationId app, const account::Uid& uid) {
 }
 Result MountSaveData(const char* name, const account::Uid& uid) {
     EnsureSaveData(uid);
-    mount(name, data_dir() + "/save", false, true);
+    mount(name, save_dir(), false, true);
     return ResultSuccess;
 }
 Result MountSaveDataReadOnly(const char* name, ApplicationId app, const account::Uid& uid) {
     if (app.value != kProgramId || !IsSaveDataExisting(uid)) return kTargetNotFound;
-    mount(name, data_dir() + "/save", true);
+    mount(name, save_dir(), true);
     return ResultSuccess;
 }
 
@@ -258,6 +349,14 @@ Result GetSaveDataSize(int64_t* size, int64_t* journal, const account::Uid&) {
     std::lock_guard lock(g_save_m);
     *size = g_save_size;
     *journal = g_save_journal;
+    return ResultSuccess;
+}
+// SDK 12 (Xenoblade 3): el máximo al que se puede ampliar. Su control.nacp no declara máximos (0): el tamaño de
+// siempre.
+Result GetSaveDataSizeMax(int64_t* size, int64_t* journal) {
+    std::lock_guard lock(g_save_m);
+    *size = std::max(g_save_size, kSaveSize);
+    *journal = std::max(g_save_journal, kSaveJournalSize);
     return ResultSuccess;
 }
 Result ExtendSaveData(const account::Uid&, int64_t size, int64_t journal) {
@@ -310,6 +409,14 @@ Result OpenFile(FileHandle* out, const char* path, int mode) {
     std::string p = host_path(path, &m);
     bool writing = mode & (kOpenWrite | kOpenAppend);
     if (writing && m.read_only) return kWriteNotPermitted;
+    if (fs_remoto::es_remota(p)) {
+        int64_t size = 0;
+        const bool ok = fs_remoto::stat(p, &size) == 1;
+        log_open(path, ok);
+        if (!ok) return kPathNotFound;
+        out->handle = new File{-1, mode, path, p, size};
+        return ResultSuccess;
+    }
     if (writing && !p.empty()) backup(m, p);
     int fd = p.empty() ? -1 : open(p.c_str(), (writing ? O_RDWR : O_RDONLY) | O_CLOEXEC);
     log_open(path, fd >= 0);
@@ -319,17 +426,29 @@ Result OpenFile(FileHandle* out, const char* path, int mode) {
 }
 void CloseFile(FileHandle h) {
     auto* f = static_cast<File*>(h.handle);
-    close(f->fd);
+    if (f->fd >= 0) close(f->fd);
     delete f;
 }
 // Los pak de rom: se leen a trozos al azar: pread directo, repetido si el kernel devuelve menos (señal o FUSE).
 Result ReadFile(size_t* out, FileHandle h, int64_t offset, void* buffer, size_t size) {
-    int fd = static_cast<File*>(h.handle)->fd;
     timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    nnsdk::watch::before_kernel_write(buffer, size);  // pread en memoria vigilada daría EFAULT
     size_t done = 0;
-    while (done < size) {
+    if (const auto* f = static_cast<File*>(h.handle); !f->remoto.empty()) {
+        const int64_t n = fs_remoto::lee(f->remoto, offset, buffer, size);
+        if (n < 0) {
+            static int logged = 0;
+            if (nvn::first_times(logged, 16))
+                printf("[fs] ReadFile remoto de %zu bytes en %s @%#llx falló\n", size, f->path.c_str(),
+                       static_cast<unsigned long long>(offset));
+            return kTargetNotFound;
+        }
+        done = static_cast<size_t>(n);
+        size = done;  // salta el bucle de pread
+    }
+    int fd = static_cast<File*>(h.handle)->fd;
+    if (fd >= 0) nnsdk::watch::before_kernel_write(buffer, size);  // pread en memoria vigilada daría EFAULT
+    while (fd >= 0 && done < size) {
         ssize_t n = pread(fd, static_cast<char*>(buffer) + done, size - done, offset + done);
         if (n < 0 && errno == EINTR) continue;
         if (n < 0) {
@@ -378,6 +497,10 @@ Result FlushFile(FileHandle h) {
     return ResultSuccess;
 }
 Result GetFileSize(int64_t* out, FileHandle h) {
+    if (const auto* f = static_cast<File*>(h.handle); !f->remoto.empty()) {
+        *out = f->size;
+        return ResultSuccess;
+    }
     struct stat st;
     if (fstat(static_cast<File*>(h.handle)->fd, &st) != 0) return from_errno();
     *out = st.st_size;
@@ -420,6 +543,12 @@ Result RenameFile(const char* from, const char* to) {
 }
 Result GetEntryType(DirectoryEntryType* out, const char* path) {
     std::string p = host_path(path);
+    if (fs_remoto::es_remota(p)) {
+        const int tipo = fs_remoto::stat(p, nullptr);
+        if (tipo < 0) return kPathNotFound;
+        *out = tipo == 0 ? DirectoryEntryType_Directory : DirectoryEntryType_File;
+        return ResultSuccess;
+    }
     struct stat st;
     if (p.empty() || stat(p.c_str(), &st) != 0) return kPathNotFound;
     *out = S_ISDIR(st.st_mode) ? DirectoryEntryType_Directory : DirectoryEntryType_File;
@@ -444,6 +573,24 @@ Result DeleteDirectory(const char* path) {
 
 Result OpenDirectory(DirectoryHandle* out, const char* path, int mode) {
     std::string p = host_path(path);
+    if (fs_remoto::es_remota(p)) {
+        std::vector<fs_remoto::Entrada> lista;
+        if (!fs_remoto::lista(p, lista)) {
+            printf("[fs] no existe la carpeta: %s\n", path);
+            return kPathNotFound;
+        }
+        auto* dir = new Directory;
+        for (const auto& e : lista) {
+            if (!(mode & (e.carpeta ? kDirOpenDirs : kDirOpenFiles))) continue;
+            DirectoryEntry entry{};
+            snprintf(entry.name, sizeof entry.name, "%s", e.nombre.c_str());
+            entry.type = e.carpeta ? DirectoryEntryType_Directory : DirectoryEntryType_File;
+            entry.size = e.carpeta ? 0 : e.tamano;
+            dir->entries.push_back(entry);
+        }
+        out->handle = dir;
+        return ResultSuccess;
+    }
     DIR* d = p.empty() ? nullptr : opendir(p.c_str());
     if (!d) {
         printf("[fs] no existe la carpeta: %s\n", path);
@@ -479,11 +626,83 @@ Result ReadDirectory(int64_t* out, DirectoryEntry* entries, DirectoryHandle h, i
     return ResultSuccess;
 }
 
+
+// --- Lo que añade Disco Elysium (Unity) ---
+
+bool IsMounted(const char* name) {
+    std::lock_guard lock(g_mounts_m);
+    return name && g_mounts.count(name);
+}
+Result EnableGlobalFileDataCache(void*, size_t) { return ResultSuccess; }
+void DisableGlobalFileDataCache() {}
+Result ReadFile(FileHandle h, int64_t offset, void* buffer, size_t size, const ReadOption&) {
+    return ReadFile(h, offset, buffer, size);
+}
+Result ReadFile(size_t* out, FileHandle h, int64_t offset, void* buffer, size_t size, const ReadOption&) {
+    return ReadFile(out, h, offset, buffer, size);
+}
+int GetFileOpenMode(FileHandle h) { return static_cast<File*>(h.handle)->mode; }
+Result Commit(const char* const* names, int count) {
+    for (int k = 0; k < count; k++)
+        if (Result r = Commit(names[k]); r.value) return r;
+    return ResultSuccess;
+}
+
+namespace {
+
+// Borra lo que hay dentro de dir (y dir también si also_dir). Cada archivo pasa antes por backup, como DeleteFile.
+Result remove_tree(const char* path, bool also_dir) {
+    Mount m;
+    const std::string root = host_path(path, &m);
+    if (m.read_only) return kWriteNotPermitted;
+    if (root.empty()) return kPathNotFound;
+    printf("[fs] borra el árbol %s%s\n", path, also_dir ? "" : " (solo el contenido)");
+    std::function<bool(const std::string&)> clean = [&](const std::string& dir) {
+        DIR* d = opendir(dir.c_str());
+        if (!d) return false;
+        while (const dirent* e = readdir(d)) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            const std::string p = dir + "/" + e->d_name;
+            struct stat st;
+            if (lstat(p.c_str(), &st) != 0) continue;
+            if (S_ISDIR(st.st_mode)) {
+                clean(p);
+                rmdir(p.c_str());
+            } else {
+                backup(m, p);
+                unlink(p.c_str());
+            }
+        }
+        closedir(d);
+        return true;
+    };
+    if (!clean(root)) return from_errno();
+    if (also_dir && rmdir(root.c_str()) != 0) return from_errno();
+    return ResultSuccess;
+}
+
+}  // namespace
+
+Result DeleteDirectoryRecursively(const char* path) { return remove_tree(path, true); }
+Result CleanDirectoryRecursively(const char* path) { return remove_tree(path, false); }
+Result RenameDirectory(const char* from, const char* to) {
+    Mount m;
+    std::string a = host_path(from, &m), b = host_path(to);
+    if (m.read_only) return kWriteNotPermitted;
+    if (a.empty() || b.empty()) return kPathNotFound;
+    if (access(b.c_str(), F_OK) == 0) return kPathAlreadyExists;
+    return rename(a.c_str(), b.c_str()) == 0 ? ResultSuccess : from_errno();
+}
+
 }  // namespace nn::fs
 
 namespace nnsdk {
 
 // Para libc_file.cpp: la libc del juego también abre rutas "montaje:/..." (librerías de terceros).
-std::string fs_host_path(const char* path) { return host_path(path); }
+// Con la RomFS remota (emulador) devuelve una copia local del archivo: quien llama necesita un descriptor de verdad.
+std::string fs_host_path(const char* path) {
+    std::string p = host_path(path);
+    return fs_remoto::es_remota(p) ? fs_remoto::copia_local(p) : p;
+}
 
 }  // namespace nnsdk

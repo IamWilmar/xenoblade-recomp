@@ -26,5 +26,7 @@ struct FormatInfo {
 
 // nullptr si no lo conocemos todavía (se registra en el log).
 const FormatInfo* format_info(int nvn_format);
+// Al crear el dispositivo: sustitutos para los formatos de profundidad que la GPU no tenga.
+void adapt_formats_to_gpu(VkPhysicalDevice gpu);
 
 }  // namespace nvn

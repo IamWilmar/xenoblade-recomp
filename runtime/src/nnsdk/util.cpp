@@ -918,3 +918,32 @@ int nnutilZlib_inflate(z_streamp stream, int flush) { return inflate(stream, flu
 int nnutilZlib_inflateEnd(z_streamp stream) { return inflateEnd(stream); }
 
 }  // extern "C"
+
+namespace nn::util {
+
+// snprintf "seguro" del SDK: siempre termina en 0 y devuelve lo que habría escrito, como vsnprintf.
+int TSNPrintf(char* out, size_t size, const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    const int n = vsnprintf(out, size, format, args);
+    va_end(args);
+    return n;
+}
+
+}  // namespace nn::util
+
+namespace nn::cstd {
+
+bool IsInf(float x) { return __builtin_isinf(x); }
+bool IsNan(float x) { return __builtin_isnan(x); }
+
+}  // namespace nn::cstd
+
+namespace nn::util {
+// BinaryFileHeader (nn::util): firma +0, versión +8, BOM +0xC, log2 del alineamiento +0xE.
+struct BinaryFileHeader {
+    uint8_t raw[0x20];
+    size_t GetAlignment() const;
+};
+size_t BinaryFileHeader::GetAlignment() const { return size_t{1} << raw[0xE]; }
+}  // namespace nn::util

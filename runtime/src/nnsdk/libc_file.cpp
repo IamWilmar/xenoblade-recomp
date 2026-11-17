@@ -93,11 +93,32 @@ DIR* nngame_opendir(const char* path) {
     return d;
 }
 
+int nngame_mkdir(const char* path, mode_t mode) {
+    std::string p = host_path(path);
+    if (p.empty()) return errno = ENOENT, -1;
+    return mkdirat(AT_FDCWD, p.c_str(), mode);
+}
+
+int nngame_unlink(const char* path) {
+    std::string p = host_path(path);
+    if (p.empty()) return errno = ENOENT, -1;
+    return unlinkat(AT_FDCWD, p.c_str(), 0);
+}
+
+int nngame_rename(const char* from, const char* to) {
+    std::string a = host_path(from), b = host_path(to);
+    if (a.empty() || b.empty()) return errno = ENOENT, -1;
+    return renameat(AT_FDCWD, a.c_str(), AT_FDCWD, b.c_str());
+}
+
 // El FILE* es el de bionic, como stdout/stderr: fread, fputs, vfprintf… del juego van directos a bionic.
 FILE* nngame_fopen(const char* path, const char* mode) {
     std::string p = host_path(path);
     if (p.empty()) return errno = ENOENT, nullptr;
-    return fopen64(p.c_str(), mode);
+    FILE* f = fopen64(p.c_str(), mode);
+    static int logged = 0;
+    if (!f || logged++ < 100) printf("[libc] fopen %s (%s): %s\n", path, mode, f ? "ok" : strerror(errno));
+    return f;
 }
 
 }  // extern "C"

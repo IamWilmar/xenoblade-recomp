@@ -31,6 +31,8 @@ void SubmitNetworkRequest() {
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true)) printf("[nifm] petición de red: rechazada (sin conexión)\n");
 }
+// Pide la red y espera el resultado: sin red vuelve enseguida (el juego mira luego IsNetworkAvailable).
+void SubmitNetworkRequestAndWait() {}
 void CancelNetworkRequest() {}
 void SetLocalNetworkMode(bool) {}
 bool IsNetworkRequestOnHold() { return false; }

@@ -8,6 +8,9 @@
 #include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <ucontext.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -17,6 +20,7 @@
 #include <atomic>
 #include <cerrno>
 #include <climits>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -63,29 +67,69 @@ int64_t deadline_of(TimeSpan t) {
     return t.ns >= kForever - now ? kForever : now + std::max<int64_t>(t.ns, 0);
 }
 
+// Interruptor sin_cache_registro: Registry::get siempre por el cerrojo del trozo y la tabla, como antes (ver la caché).
+bool registry_cache_off() { return NVN_FLAG("sin_cache_registro"); }
+
 // Objeto del juego (por dirección) -> objeto nuestro. 64 trozos para no serializar todo.
-template <typename T>
+// Con kCacheSets > 0, cada hilo recuerda además los últimos objetos que buscó (kCacheSets conjuntos de dos, en su
+// TLS): get no toma el cerrojo del trozo ni busca en la tabla si la clave está ahí. En el primer combate de Xenoblade 3
+// el hilo principal espera a sus trabajos en un bucle que toma y suelta varios mutex por vuelta (main+0x1280e74) y el
+// 39 % de su tiempo era este get (el cerrojo del trozo y la búsqueda en la tabla). La clave sigue siendo la dirección
+// y no se escribe nada en la memoria del juego: lo que el juego pasa como MutexType no siempre lo es (cxx.cpp monta
+// aquí el std::mutex del juego) y puede venir sin inicializar o copiado de otro sitio.
+// Una entrada vale mientras nadie haya rehecho o borrado nada en su trozo: reset y erase suben la época del trozo
+// con su cerrojo tomado, antes de tocar la tabla, y get compara la época que guardó (leída con ese mismo cerrojo al
+// buscar) con la de ahora. Si coinciden, la tabla sigue diciendo lo mismo para esa clave (solo reset y erase cambian
+// lo que hay en una clave que ya existe), así que devuelve justo lo que devolvería buscando. Las épocas empiezan en 1:
+// una caché recién creada (todo a cero) no acierta nunca.
+template <typename T, int kCacheSets = 0>
 class Registry {
 public:
     T& get(const void* key) {
-        Shard& s = shard(key);
+        const size_t index = shard_index(key);
+        if constexpr (kCacheSets > 0) {
+            if (T* hit = cached(key, index)) return *hit;
+        }
+        Shard& s = shards_[index];
         std::lock_guard lock(s.m);
         auto& slot = s.map[key];
         if (!slot) slot = std::make_unique<T>();
+        if constexpr (kCacheSets > 0) remember(key, slot.get(), index);
         return *slot;
     }
     template <typename... Args>
     T& reset(const void* key, Args&&... args) {
-        Shard& s = shard(key);
+        const size_t index = shard_index(key);
+        Shard& s = shards_[index];
         std::lock_guard lock(s.m);
+        epochs_[index].fetch_add(1, std::memory_order_release);  // lo que los hilos recuerden de este trozo ya no vale
         auto& slot = s.map[key];
         slot = std::make_unique<T>(std::forward<Args>(args)...);
         return *slot;
     }
     void erase(const void* key) {
+        const size_t index = shard_index(key);
+        Shard& s = shards_[index];
+        std::lock_guard lock(s.m);
+        epochs_[index].fetch_add(1, std::memory_order_release);
+        s.map.erase(key);
+    }
+    // Para el log (registro): búsquedas resueltas por la caché del hilo y por la tabla desde la última vez. Los
+    // aciertos se suman de 1024 en 1024 por hilo (un contador compartido por búsqueda costaría más que la búsqueda).
+    void take_cache_stats(uint64_t* hits, uint64_t* misses) {
+        *hits = cache_hits_.exchange(0, std::memory_order_relaxed);
+        *misses = cache_misses_.exchange(0, std::memory_order_relaxed);
+    }
+    // fn(objeto) solo si la clave existe, y con su trozo tomado: nadie lo puede borrar ni rehacer mientras corre. Para
+    // quien toca un objeto del juego desde un hilo nuestro sin saber si el juego ya lo ha destruido.
+    template <typename Fn>
+    bool with_existing(const void* key, Fn fn) {
         Shard& s = shard(key);
         std::lock_guard lock(s.m);
-        s.map.erase(key);
+        auto it = s.map.find(key);
+        if (it == s.map.end()) return false;
+        fn(*it->second);
+        return true;
     }
     template <typename Fn>
     void for_each(Fn fn) {
@@ -100,8 +144,59 @@ private:
         std::mutex m;
         std::unordered_map<const void*, std::unique_ptr<T>> map;
     };
-    Shard& shard(const void* key) { return shards_[(reinterpret_cast<uintptr_t>(key) >> 4) % 64]; }
+    static size_t shard_index(const void* key) { return (reinterpret_cast<uintptr_t>(key) >> 4) % 64; }
+    Shard& shard(const void* key) { return shards_[shard_index(key)]; }
     Shard shards_[64];
+
+    // La caché de cada hilo (una Registry por tipo: la caché va con el tipo). Sin constructor ni destructor: nace a
+    // cero con el TLS del hilo y no hay nada que soltar cuando el hilo acaba.
+    struct CacheEntry {
+        const void* key;
+        T* value;
+        uint64_t epoch;
+    };
+    struct Cache {
+        CacheEntry sets[kCacheSets > 0 ? kCacheSets : 1][2];
+        uint32_t hits;  // aciertos aún sin sumar a cache_hits_
+    };
+    static Cache& cache() {
+        static thread_local Cache c;
+        return c;
+    }
+    static CacheEntry* cache_set(Cache& c, const void* key) {
+        static_assert(kCacheSets <= 0 || (kCacheSets & (kCacheSets - 1)) == 0, "potencia de dos");
+        const uintptr_t k = reinterpret_cast<uintptr_t>(key);
+        return c.sets[((k >> 4) ^ (k >> 11) ^ (k >> 19)) & static_cast<uintptr_t>(kCacheSets - 1)];
+    }
+    T* cached(const void* key, size_t index) {
+        if (registry_cache_off()) return nullptr;
+        Cache& c = cache();
+        const CacheEntry* set = cache_set(c, key);
+        const uint64_t epoch = epochs_[index].load(std::memory_order_acquire);
+        for (int way = 0; way < 2; way++) {
+            if (set[way].key != key || set[way].epoch != epoch) continue;
+            if (++c.hits == 1024) {
+                cache_hits_.fetch_add(1024, std::memory_order_relaxed);
+                c.hits = 0;
+            }
+            return set[way].value;
+        }
+        return nullptr;
+    }
+    // Con el cerrojo del trozo: la época que se guarda es la de lo que se acaba de leer de la tabla.
+    void remember(const void* key, T* value, size_t index) {
+        if (registry_cache_off()) return;
+        cache_misses_.fetch_add(1, std::memory_order_relaxed);
+        CacheEntry* set = cache_set(cache(), key);
+        if (set[0].key != key) set[1] = set[0];  // el más antiguo de los dos se va; nunca la misma clave dos veces
+        set[0] = {key, value, epochs_[index].load(std::memory_order_relaxed)};
+    }
+    // Aparte de los trozos: solo se escriben en reset y erase, y así leerlas no comparte línea de caché con el
+    // cerrojo de un trozo que otro hilo esté tomando.
+    std::atomic<uint64_t> epochs_[64] = {
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+    std::atomic<uint64_t> cache_hits_{0}, cache_misses_{0};
 };
 
 struct HostMutex {
@@ -217,12 +312,21 @@ struct HostEvent {
     bool signaled = false;
     bool auto_clear = false;
 
-    void signal() {
+    // signal y set devuelven si el evento no estaba ya señalado (YieldThread: quien señala algo que alguien consumió
+    // está moviendo a otro hilo, no esperando a ciegas).
+    bool signal() {
+        const bool changed = set();
+        notify_any();
+        return changed;
+    }
+    // Sin avisar a WaitAny (notify_any toma su propio mutex: quien llame con otro cerrojo tomado lo hace después).
+    bool set() {
         pthread_mutex_lock(&lock.m);
+        const bool changed = !signaled;
         signaled = true;
         auto_clear ? pthread_cond_signal(&cond.c) : pthread_cond_broadcast(&cond.c);
         pthread_mutex_unlock(&lock.m);
-        notify_any();
+        return changed;
     }
     bool wait(int64_t timeout_ns = -1) {
         int64_t end = timeout_ns < 0 ? -1 : now_ns() + timeout_ns;
@@ -358,6 +462,7 @@ struct HostThread {
     pthread_t pthread{};
     pid_t tid = 0;
     bool started = false, joined = false;
+    struct SuspendState* suspend = nullptr;  // el del propio hilo (thread_local), para SuspendThread
 };
 
 struct HostMultiWait {
@@ -372,9 +477,9 @@ struct HostHolder {
     uintptr_t user_data = 0;
 };
 
-Registry<HostMutex> g_mutexes;
-Registry<GameCond> g_conds;
-Registry<HostEvent> g_events;
+Registry<HostMutex, 64> g_mutexes;  // con caché por hilo (ver Registry): los que se usan en bucles
+Registry<GameCond, 16> g_conds;
+Registry<HostEvent, 16> g_events;
 Registry<HostTimer> g_timers;
 Registry<HostSemaphore> g_semaphores;
 Registry<HostRwLock> g_rwlocks;
@@ -385,6 +490,35 @@ Registry<HostHolder> g_holders;
 
 std::mutex g_regions_m;
 std::unordered_map<uintptr_t, size_t> g_regions;
+std::unordered_map<uintptr_t, size_t> g_regions_rw;  // las que se mapearon ya escribibles (AllocateAddressRegion)
+std::unordered_map<uintptr_t, std::pair<uintptr_t, size_t>> g_regions_map;  // región -> lo mapeado de verdad (munmap)
+// Las de g_regions_rw, a la vista de nnsdk::copy_readable, que las mira sin g_regions_m (una vez por uniform buffer de cada
+// draw, desde NvnSubmit). Cada hueco: base 0 si está libre; end se escribe antes que base. Quien copia se apunta en
+// g_readable_readers antes de mirar los huecos, y quien retira una región pone su base a 0 y luego espera a que no quede
+// nadie apuntado (unpublish_readable): o el que copia ve la base a 0, o el que retira le ve apuntado y le espera. Hace falta
+// el orden total de las cargas y escrituras atómicas por defecto (seq_cst): no relajarlas.
+constexpr int kReadableRegions = 4;
+std::atomic<uintptr_t> g_readable_base[kReadableRegions], g_readable_end[kReadableRegions];
+std::atomic<int> g_readable_readers{0};
+void publish_readable(uintptr_t base, size_t size) {  // con g_regions_m
+    for (int k = 0; k < kReadableRegions; k++)
+        if (!g_readable_base[k].load()) {
+            g_readable_end[k].store(base + size);
+            g_readable_base[k].store(base);
+            return;
+        }
+}
+// Retira lo publicado que toque [address, address + size). Al volver nadie lo está copiando ni lo copiará sin pasar por el
+// kernel: ya se puede desmapear o dejar sin permiso de lectura. true si había algo.
+bool unpublish_readable(uintptr_t address, size_t size) {  // con g_regions_m
+    bool any = false;
+    for (int k = 0; k < kReadableRegions; k++) {
+        const uintptr_t base = g_readable_base[k].load();
+        if (base && address < g_readable_end[k].load() && address + size > base) g_readable_base[k].store(0), any = true;
+    }
+    while (any && g_readable_readers.load() != 0) sched_yield();
+    return any;
+}
 
 thread_local ThreadType* t_current = nullptr;
 
@@ -534,6 +668,10 @@ Result allocate_tls_slot(TlsSlot* slot, TlsDestructor destructor, bool sdk) {
 struct CpuMasks {
     cpu_set_t big, all;
     bool usable = false;  // hay núcleos de al menos dos frecuencias máximas
+    // El núcleo rápido (los de la frecuencia máxima más alta; en el SD865, cpu7) y los grandes sin él (cpu4-6), para
+    // los hilos que giran (ver note_spinning_thread). has_prime: hay grandes que no son el rápido.
+    cpu_set_t prime, gold;
+    bool has_prime = false;
 };
 
 uint64_t mask_bits(const cpu_set_t& set) {  // los 64 primeros, para el log
@@ -566,6 +704,15 @@ const CpuMasks& cpu_masks() {
         m.usable = CPU_COUNT(&m.big) > 0;
         printf("[nnsdk] afinidad: núcleos grandes %#llx de %#llx%s\n", static_cast<unsigned long long>(mask_bits(m.big)),
                static_cast<unsigned long long>(mask_bits(m.all)), m.usable ? "" : " (todos iguales o sin datos: no se usa)");
+        CPU_ZERO(&m.prime);
+        CPU_ZERO(&m.gold);
+        const unsigned long highest = n > 0 ? *std::max_element(freq.begin(), freq.end()) : 0;
+        for (int cpu = 0; cpu < n; cpu++)
+            if (CPU_ISSET(cpu, &m.big)) CPU_SET(cpu, freq[cpu] == highest ? &m.prime : &m.gold);
+        m.has_prime = m.usable && CPU_COUNT(&m.gold) > 0;
+        if (m.has_prime)
+            printf("[nnsdk] afinidad: núcleo rápido %#llx; los hilos que giran en YieldThread, a %#llx\n",
+                   static_cast<unsigned long long>(mask_bits(m.prime)), static_cast<unsigned long long>(mask_bits(m.gold)));
         return m;
     }();
     return masks;
@@ -615,7 +762,116 @@ void pin_current_thread() {
     printf("[nnsdk] hilo crítico '%s' (tid %d): %s\n", t.name, t.tid, off ? "sin afinidad (sin_afinidad)" : "núcleos grandes");
 }
 
+// --- Hilos que giran ---
+// Un hilo del juego que espera dando vueltas con YieldThread gasta un núcleo entero sin hacer nada y, con la máscara
+// completa, el planificador lo pone donde le parece: en el primer combate de Xenoblade 3 el hilo principal (91 % de un
+// núcleo esperando a sus trabajos, nice -10 como NvnSubmit) salía en el núcleo rápido en la mitad de las muestras. No
+// se lo repartía con NvnSubmit a la vez (en el perfil coinciden en un núcleo en 100 ms de 10 000): se pasaba al rápido
+// en cuanto NvnSubmit paraba entre dos frames, y en 195 de sus 217 arranques NvnSubmit lo encontraba ocupado y empezaba
+// el frame en uno de 2,4 GHz en vez de 2,8 (el 43 % de su tiempo; los dos grupos iban a su frecuencia máxima).
+// El hilo que gira (YieldThread lo avisa aquí, como mucho una vez por segundo) se queda en los núcleos grandes
+// sin el rápido: ni le quita el rápido a NvnSubmit ni baja a los pequeños cuando el freno de YieldThread lo deja casi
+// siempre dormido (su trabajo de verdad entre espera y espera sí está en el camino del frame). No se toca a los
+// críticos (tienen su máscara y refresh_critical_threads la repondría). Si lleva kSpinForgetNs sin girar, vuelve a la
+// máscara completa. Interruptores: sin_apartar_giro (máscara completa, como antes) y sin_afinidad; los dos se miran
+// como mucho una vez por segundo, en refresh_spinning_threads.
+struct SpinningThread {
+    CriticalThread thread;
+    int64_t last_ns;  // la última vez que avisó de que gira
+};
+constexpr int64_t kSpinForgetNs = 5'000'000'000;
+std::vector<SpinningThread> g_spinning;  // con g_critical_m
+std::atomic<uint32_t> g_spinning_count{0};  // para el log
+thread_local bool t_spinning = false;  // este hilo está (o estuvo) en g_spinning
+
+bool spin_apart_off() { return NVN_FLAG("sin_apartar_giro") || affinity_off(); }
+
+// Desde YieldThread, en el hilo que gira.
+void note_spinning_thread() {
+    const CpuMasks& m = cpu_masks();
+    if (!m.has_prime || t_critical) return;
+    const pid_t tid = gettid();
+    const bool off = spin_apart_off();
+    std::lock_guard lock(g_critical_m);
+    const auto mine = [&](const SpinningThread& t) { return t.thread.tid == tid; };
+    auto it = std::find_if(g_spinning.begin(), g_spinning.end(), mine);
+    if (it != g_spinning.end()) {
+        it->last_ns = now_ns();  // la máscara la mantiene refresh_spinning_threads
+        return;
+    }
+    SpinningThread t{{tid, {}}, now_ns()};
+    pthread_getname_np(pthread_self(), t.thread.name, sizeof t.thread.name);
+    if (!off) apply_mask(t.thread, m.gold, false);
+    g_spinning.push_back(t);
+    g_spinning_count = static_cast<uint32_t>(g_spinning.size());
+    t_spinning = true;
+    g_any_critical = true;  // ya hay una máscara que un hilo nuevo puede heredar (release_inherited_affinity)
+    static std::atomic<int> logged{0};
+    if (nvn::first_times(logged, 16))
+        printf("[nnsdk] hilo '%s' (tid %d) gira en YieldThread: %s\n", t.thread.name, tid,
+               off ? "se deja donde está (sin_apartar_giro o sin_afinidad)" : "núcleos grandes sin el rápido");
+}
+
+// Una vez por segundo, desde el hilo que presenta: repone la máscara de los que giran (Android la rehace al cambiar
+// el proceso de cpuset), aplica los interruptores y devuelve la completa a los que ya no giran o ya no existen.
+void refresh_spinning_threads(const CpuMasks& m, int64_t now) {
+    if (!m.has_prime) return;
+    const bool off = spin_apart_off();
+    std::lock_guard lock(g_critical_m);
+    std::erase_if(g_spinning, [&](const SpinningThread& t) {
+        // Si después se hizo crítico (el que presenta), manda la máscara de los críticos.
+        const auto same = [&](const CriticalThread& c) { return c.tid == t.thread.tid; };
+        if (std::any_of(g_critical.begin(), g_critical.end(), same)) return true;
+        const bool stale = now - t.last_ns > kSpinForgetNs;
+        return !apply_mask(t.thread, off || stale ? m.all : m.gold, false) || stale;
+    });
+    g_spinning_count = static_cast<uint32_t>(g_spinning.size());
+}
+
+// Lo que YieldThread lleva de cada hilo para saber si gira (allí está el porqué), en unidades del contador de
+// GetSystemTick. busy lo ponen GetSystemTick y las funciones de nn::os con las que un hilo mueve a otro.
+struct SpinState {
+    uint64_t last_end = 0;     // al salir del último YieldThread (lo que duerme o cede no cuenta como trabajo)
+    uint64_t tight_since = 0;  // desde cuándo cada YieldThread llega a menos de kSpinGapNs del anterior
+    uint64_t blind_since = 0;  // lo mismo, y además sin busy entre medias
+    uint64_t next_note = 0;    // cuándo volver a avisar a note_spinning_thread
+    uint32_t calls = 0;        // llamadas aún sin sumar a g_yield_calls
+    bool busy = false;         // desde el último YieldThread leyó el reloj o señaló algo: no espera a ciegas
+};
+thread_local SpinState t_spin;
+
+// Cuentas de YieldThread para el log (las suma YieldThread: las llamadas, de 256 en 256 por hilo).
+std::atomic<uint64_t> g_yield_calls{0}, g_yield_naps{0};
+
+// DEPURACIÓN (con <datos>/registro), cada ~10 s desde refresh_critical_threads: si la caché por hilo de los registros,
+// el freno de YieldThread y el apartado de los hilos que giran están actuando y cuánto.
+void log_thread_stats(int64_t now) {
+    static int64_t next = 0;  // solo el hilo que presenta
+    if (now < next) return;
+    const bool first = next == 0;
+    next = now + 10'000'000'000;
+    uint64_t mh, mm, eh, em, ch, cm;
+    g_mutexes.take_cache_stats(&mh, &mm);
+    g_events.take_cache_stats(&eh, &em);
+    g_conds.take_cache_stats(&ch, &cm);
+    const uint64_t yields = g_yield_calls.exchange(0, std::memory_order_relaxed);
+    const uint64_t naps = g_yield_naps.exchange(0, std::memory_order_relaxed);
+    if (first || !NVN_FLAG("registro")) return;
+    const auto ull = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+    printf("[os] hilos, en 10 s: mutex %llu por la caché del hilo y %llu por el registro (eventos %llu y %llu, variables de "
+           "condición %llu y %llu); YieldThread %llu, de ellos %llu con siesta; %u hilos que giran apartados del núcleo "
+           "rápido%s\n",
+           ull(mh), ull(mm), ull(eh), ull(em), ull(ch), ull(cm), ull(yields), ull(naps),
+           g_spinning_count.load(std::memory_order_relaxed), spin_apart_off() ? " (sin apartar: interruptor)" : "");
+}
+
 void unpin_current_thread() {  // el hilo termina: su tid se puede reutilizar
+    if (t_spinning) {
+        t_spinning = false;
+        const pid_t tid = gettid();
+        std::lock_guard lock(g_critical_m);
+        std::erase_if(g_spinning, [&](const SpinningThread& t) { return t.thread.tid == tid; });
+    }
     if (!t_critical) return;
     t_critical = false;
     const pid_t tid = gettid();
@@ -635,7 +891,8 @@ void release_inherited_affinity() {
 
 // Lo mismo para los hilos que no son de nn::os (del driver de Vulkan, de AAudio, el que guarda la caché de
 // pipelines) si los crea un hilo crítico: una vez por segundo, los que no son críticos y tienen justo la máscara
-// de los grandes (la heredada) vuelven a la completa. Con g_critical_m.
+// de los grandes (la heredada) vuelven a la completa. Con g_critical_m. Igual con la de los hilos que giran (grandes
+// sin el rápido) en un hilo que no es uno de ellos.
 void release_inherited_masks(const CpuMasks& m) {
     DIR* dir = opendir("/proc/self/task");
     if (!dir) return;
@@ -645,8 +902,10 @@ void release_inherited_masks(const CpuMasks& m) {
             continue;
         cpu_set_t now;
         CPU_ZERO(&now);
-        if (sched_getaffinity(tid, sizeof now, &now) == 0 && CPU_EQUAL(&now, &m.big))
-            sched_setaffinity(tid, sizeof m.all, &m.all);
+        if (sched_getaffinity(tid, sizeof now, &now) != 0) continue;
+        const bool from_spinning = m.has_prime && CPU_EQUAL(&now, &m.gold) &&
+            std::none_of(g_spinning.begin(), g_spinning.end(), [&](const SpinningThread& t) { return t.thread.tid == tid; });
+        if (CPU_EQUAL(&now, &m.big) || from_spinning) sched_setaffinity(tid, sizeof m.all, &m.all);
     }
     closedir(dir);
 }
@@ -659,9 +918,77 @@ void set_pthread_name(pthread_t thread, const char* name) {
     pthread_setname_np(thread, buf);
 }
 
+// SuspendThread / GetThreadContext (el GC de IL2CPP para el mundo así para buscar punteros en registros y pilas):
+// una señal al hilo, que guarda sus registros, avisa y se queda esperando en su manejador hasta el ResumeThread.
+// El estado es thread_local y se toca al empezar cada hilo: en un manejador de señal no se puede reservar el TLS
+// dinámico de libnnsdk ni tomar el cerrojo de g_threads.
+struct SuspendState {
+    std::atomic<int> count{0};
+    sem_t ack, resume;
+    uint64_t x[31] = {}, sp = 0, pc = 0, pstate = 0;
+    SuspendState() {
+        sem_init(&ack, 0, 0);
+        sem_init(&resume, 0, 0);
+    }
+};
+thread_local SuspendState t_suspend;
+constexpr int kSuspendSignal = SIGPWR;
+
+void suspend_handler(int, siginfo_t*, void* context) {
+    const int saved_errno = errno;
+    SuspendState& s = t_suspend;
+    const mcontext_t& m = static_cast<ucontext_t*>(context)->uc_mcontext;
+    memcpy(s.x, m.regs, sizeof s.x);
+    s.sp = m.sp;
+    s.pc = m.pc;
+    s.pstate = m.pstate;
+    sem_post(&s.ack);
+    while (sem_wait(&s.resume) != 0) {
+    }
+    errno = saved_errno;
+}
+
+void install_suspend_handler() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        struct sigaction sa = {};
+        sa.sa_sigaction = suspend_handler;
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigfillset(&sa.sa_mask);
+        sigaction(kSuspendSignal, &sa, nullptr);
+    });
+}
+
+// El stack del ThreadType (+0x50 dirección, +0x58 tamaño), que en la consola rellena CreateThread con la pila del juego.
+// El GC de IL2CPP (Disco Elysium, main+0x1176fa0) busca punteros en todo ese rango de cada hilo parado, no desde su
+// sp: los hilos corren en pilas de bionic, así que se apunta ahí la de verdad. Sin esto el GC no veía ninguna pila
+// (la del principal quedaba a 0) y recogía objetos vivos.
+constexpr size_t kThreadStackOffset = 0x50, kThreadStackSizeOffset = 0x58;
+void record_stack(ThreadType* type) {
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) != 0) return;
+    void* stack = nullptr;
+    size_t size = 0, guard = 0;
+    pthread_attr_getstack(&attr, &stack, &size);
+    pthread_attr_getguardsize(&attr, &guard);
+    pthread_attr_destroy(&attr);
+    // bionic cuenta la página de guarda (PROT_NONE) dentro de la pila: el GC la leería entera.
+    if (guard < size) {
+        stack = static_cast<uint8_t*>(stack) + guard;
+        size -= guard;
+    }
+    static std::atomic<int> logged{0};
+    if (logged++ < 4) printf("[os] pila de %p para el GC: %p +%zu KB (guarda %zu)\n", static_cast<void*>(type), stack, size / 1024, guard);
+    auto* bytes = reinterpret_cast<uint8_t*>(type);
+    memcpy(bytes + kThreadStackOffset, &stack, sizeof stack);
+    memcpy(bytes + kThreadStackSizeOffset, &size, sizeof size);
+}
+
 void* thread_entry(void* p) {
     auto* t = static_cast<HostThread*>(p);
     t_current = t->type;
+    t->suspend = &t_suspend;
+    record_stack(t->type);
     t->tid = gettid();
     set_thread_id(t->type, t->tid);
     set_pthread_name(pthread_self(), t->name);
@@ -671,6 +998,7 @@ void* thread_entry(void* p) {
         release_inherited_affinity();
     nnsdk::on_thread_start();
     t->fn(t->arg);
+    nnsdk::run_thread_atexit();  // los thread_local del juego con destructor, antes de soltar nada del hilo
     // Como el SDK al acabar la función del hilo: destructores de los TlsSlot (con el TLS del juego aún vivo),
     // estado Terminated (lo miran el código en línea y MultiWaitHolderOfThread) y aviso a los MultiWait.
     finish_thread_tls();
@@ -689,6 +1017,8 @@ ThreadType* current_thread() {
         t.pthread = pthread_self();
         t.tid = gettid();
         t.started = true;
+        t.suspend = &t_suspend;
+        record_stack(fake);
         t.name = "MainThread";
         set_handle(fake);
         set_thread_id(fake, t.tid);
@@ -802,6 +1132,7 @@ bool send_message(MessageQueueType* q, uintptr_t data, bool front, bool block) {
     bool sent;
     while (!(sent = mq.push(data, front)) && block && mq.capacity) mq.not_full.wait(&mq.lock.m);
     pthread_mutex_unlock(&mq.lock.m);
+    if (sent) t_spin.busy = true;  // mueve a otro hilo: no espera a ciegas (ver YieldThread)
     return sent;
 }
 
@@ -902,10 +1233,12 @@ void InitializeConditionVariable(ConditionVariableType* c) { g_conds.reset(c); }
 void FinalizeConditionVariable(ConditionVariableType* c) { g_conds.erase(c); }
 void SignalConditionVariable(ConditionVariableType* c) {
     nnsdk::log_signal("SignalConditionVariable", c, __builtin_return_address(0));
+    t_spin.busy = true;  // mueve a otro hilo: no espera a ciegas (ver YieldThread)
     g_conds.get(c).signal(false);
 }
 void BroadcastConditionVariable(ConditionVariableType* c) {
     nnsdk::log_signal("BroadcastConditionVariable", c, __builtin_return_address(0));
+    t_spin.busy = true;
     g_conds.get(c).signal(true);
 }
 void WaitConditionVariable(ConditionVariableType* c, MutexType* m) {
@@ -1012,7 +1345,9 @@ void InitializeEvent(EventType* e, bool signaled, EventClearMode mode) {
     ev.auto_clear = mode == EventClearMode_AutoClear;
 }
 void FinalizeEvent(EventType* e) { g_events.erase(e); }
-void SignalEvent(EventType* e) { g_events.get(e).signal(); }
+void SignalEvent(EventType* e) {
+    if (g_events.get(e).signal()) t_spin.busy = true;  // alguien había consumido el anterior (ver YieldThread)
+}
 void WaitEvent(EventType* e) {
     const int64_t start = nnsdk::wait_clock_ns();
     g_events.get(e).wait();
@@ -1055,14 +1390,29 @@ bool TimedAcquireSemaphore(SemaphoreType* s, TimeSpan t) {
     return ok;
 }
 void ReleaseSemaphore(SemaphoreType* s, int count) {
+    t_spin.busy = true;  // mueve a otro hilo: no espera a ciegas (ver YieldThread)
     HostSemaphore& sem = g_semaphores.get(s);
     pthread_mutex_lock(&sem.lock.m);
     // El SDK aborta si se pasa del máximo; aquí se queda en el máximo.
+    if (sem.count + std::max(count, 0) > sem.max) {  // DEPURACIÓN: un aviso perdido así cuelga a quien espere
+        static std::atomic<int> logged{0};
+        if (logged++ < 16)
+            printf("[os] ReleaseSemaphore %p por encima del máximo (%d + %d > %d), desde %p\n", static_cast<void*>(s),
+                   sem.count, count, sem.max, __builtin_return_address(0));
+    }
     sem.count = std::min(sem.count + std::max(count, 0), sem.max);
     count > 1 ? pthread_cond_broadcast(&sem.cond.c) : pthread_cond_signal(&sem.cond.c);
     pthread_mutex_unlock(&sem.lock.m);
 }
 void ReleaseSemaphore(SemaphoreType* s) { ReleaseSemaphore(s, 1); }
+// Catherine: Full Body la mira antes de esperar en el semáforo de su hilo de carga.
+int GetCurrentSemaphoreCount(const SemaphoreType* s) {
+    HostSemaphore& sem = g_semaphores.get(const_cast<SemaphoreType*>(s));
+    pthread_mutex_lock(&sem.lock.m);
+    const int count = sem.count;
+    pthread_mutex_unlock(&sem.lock.m);
+    return count;
+}
 
 // --- Temporizadores ---
 
@@ -1213,7 +1563,177 @@ void DestroyThread(ThreadType* type) {
 }
 
 ThreadType* GetCurrentThread() { return current_thread(); }
-void YieldThread() { sched_yield(); }
+
+bool TryWaitThread(ThreadType* type) {
+    if (get_state(type) != Terminated) return false;
+    WaitThread(type);
+    return true;
+}
+
+struct ThreadContextInfoAarch64 {
+    uint64_t r[29], fp, lr, sp, pc;
+    uint32_t pstate, padding;
+    uint8_t v[32][16];
+    uint32_t fpcr, fpsr;
+};
+
+// Devuelve cuántas veces estaba suspendido antes.
+int SuspendThread(ThreadType* type) {
+    install_suspend_handler();
+    HostThread& t = g_threads.get(type);
+    static std::atomic<int> logged{0};
+    if (logged++ < 8)
+        printf("[os] SuspendThread '%s' desde %p\n", t.name, __builtin_return_address(0));
+    SuspendState* s = t.suspend;
+    if (!s || !t.started || type == current_thread()) return 0;
+    const int before = s->count.fetch_add(1);
+    if (before == 0) {
+        pthread_kill(t.pthread, kSuspendSignal);
+        while (sem_wait(&s->ack) != 0) {
+        }
+    }
+    return before;
+}
+int ResumeThread(ThreadType* type) {
+    SuspendState* s = g_threads.get(type).suspend;
+    if (!s) return 0;
+    int before = s->count.load();
+    while (before > 0 && !s->count.compare_exchange_weak(before, before - 1)) {
+    }
+    if (before == 1) sem_post(&s->resume);
+    return before;
+}
+int GetThreadSuspendCount(const ThreadType* type) {
+    SuspendState* s = g_threads.get(const_cast<ThreadType*>(type)).suspend;
+    return s ? s->count.load() : 0;
+}
+// Solo los registros enteros (hasta pstate, 0x110 bytes): el GC solo busca punteros ahí y en la pila, y si el
+// ThreadContextInfo del juego fuera más corto que el de Horizon, escribir los v[] le pisaría la pila.
+Result GetThreadContext(ThreadContextInfoAarch64* out, const ThreadType* type) {
+    SuspendState* s = g_threads.get(const_cast<ThreadType*>(type)).suspend;
+    static std::atomic<int> logged{0};
+    if (logged++ < 8)
+        printf("[os] GetThreadContext de '%s' (%p) suspendido %d, desde %p\n", g_threads.get(const_cast<ThreadType*>(type)).name,
+               static_cast<const void*>(type), s ? s->count.load() : -1, __builtin_return_address(0));
+    memset(out, 0, offsetof(ThreadContextInfoAarch64, v));
+    if (!s) return ResultSuccess;
+    memcpy(out->r, s->x, sizeof out->r);
+    out->fp = s->x[29];
+    out->lr = s->x[30];
+    out->sp = s->sp;
+    out->pc = s->pc;
+    out->pstate = static_cast<uint32_t>(s->pstate);
+    return ResultSuccess;
+}
+
+Result CreateSystemEvent(SystemEventType* e, EventClearMode mode, bool) {
+    nnsdk::create_system_event(e, mode == EventClearMode_AutoClear, false);
+    return ResultSuccess;
+}
+void SignalSystemEvent(SystemEventType* e) {
+    t_spin.busy = true;  // mueve a otro hilo: no espera a ciegas (ver YieldThread)
+    nnsdk::signal_system_event(e);
+}
+
+bool TryAcquireSemaphore(SemaphoreType* s) { return acquire_semaphore(s, 0); }
+
+// Memoria de direcciones virtuales (VammManager del SDK): existe cuando el main.npdm del juego reserva "system
+// resource" para sus tablas de páginas (Final Fantasy Resonance: 0x1400000, 20 MB). Unreal Engine la exige: si no
+// está, su arranque llama a exit(1) (main+0x13820). Con ella reserva 62 GB de direcciones (AllocateAddressRegion) y
+// compromete y suelta páginas a demanda (AllocateMemoryPages / FreeMemoryPages).
+constexpr size_t kSystemResourceSize = 0x1400000;
+std::atomic<size_t> g_va_committed{0};
+std::atomic<size_t> g_va_allocated_total{0}, g_va_freed_total{0};  // DEPURACIÓN
+bool IsVirtualAddressMemoryEnabled() { return true; }
+
+// Como VammManager::GetVirtualAddressMemoryResourceUsage (sdk+0x146930): lo asignado es el system resource del
+// proceso (svcGetInfo 16) y lo usado, lo que el kernel lleva gastado de él (svcGetInfo 17) más 512 KB, con tope en lo
+// asignado. Aquí lo gastado se estima como las tablas de las páginas comprometidas (8 bytes por página de 4 KB).
+struct VirtualAddressMemoryResourceUsage {
+    size_t assignedSize;
+    size_t usedSize;
+};
+VirtualAddressMemoryResourceUsage GetVirtualAddressMemoryResourceUsage() {
+    const size_t used = (512u << 10) + g_va_committed.load(std::memory_order_relaxed) / 512;
+    return {kSystemResourceSize, std::min(used, kSystemResourceSize)};
+}
+
+// El pseudo-handle del proceso actual, como en el SDK (sdk+0x140e90).
+uint32_t GetCurrentProcessHandle() { return 0xFFFF8001; }
+
+enum MemoryPermission { MemoryPermission_None = 0, MemoryPermission_ReadOnly = 1, MemoryPermission_ReadWrite = 3 };
+void SetMemoryPermission(uintptr_t address, size_t size, MemoryPermission permission) {
+    const int prot = permission == MemoryPermission_ReadWrite ? PROT_READ | PROT_WRITE
+                     : permission == MemoryPermission_ReadOnly ? PROT_READ
+                                                               : PROT_NONE;
+    if (prot == PROT_NONE) {
+        // Dentro de una región que copy_readable da por legible: deja de serlo entera y para siempre (no se lleva la cuenta
+        // de qué páginas vuelven a tener permiso). Lo que se lea de ella vuelve a ir por el kernel.
+        std::lock_guard lock(g_regions_m);
+        if (unpublish_readable(address, size))
+            printf("[nnsdk] SetMemoryPermission 0x%lx +%zu KB sin lectura: su región ya no se copia sin el kernel\n", address,
+                   size / 1024);
+    }
+    mprotect(reinterpret_cast<void*>(address), size, prot);
+}
+namespace {
+// --- YieldThread sin quemar un núcleo ---
+// El hilo principal de Xenoblade 3 espera a que acaben sus trabajos dando vueltas (main+0x1280e74: mira las colas con
+// sus mutex, despierta a los workers y YieldThread; en el primer combate, casi todo el frame, mientras NvnSubmit
+// reproduce). sched_yield no duerme a nadie: con un núcleo para él solo vuelve al momento, y el hilo gastaba el
+// 91 % de un núcleo grande (calor: el SoC a 85 °C) y la mitad del tiempo el núcleo rápido de NvnSubmit. Cuando un
+// hilo lleva kSpinNs dando vueltas a ciegas, cada YieldThread duerme kSpinNapNs en vez de ceder: "a ciegas" es con
+// menos de kSpinGapNs de trabajo propio entre un YieldThread y el siguiente y sin que entre medias (SpinState::busy):
+// - haya leído el reloj. El limitador de frames del juego (main+0x124fb14) y su spinlock con plazo (main+0xe93888)
+//   también esperan con YieldThread, pero mirando GetSystemTick en cada vuelta (el limitador, hasta el 99,7 % del
+//   periodo): esos no se frenan (siguen con sched_yield), así que el instante en que acaba cada frame no cambia.
+// - haya señalado un evento que no lo estaba ya (o una variable de condición, un semáforo o una cola). El bucle de
+//   espera del juego despierta en cada vuelta a los workers con trabajo; si un worker consume esos avisos, el que
+//   espera lo está moviendo y sigue a toda velocidad. Si nadie los consume (el worker está ocupado o bloqueado: en la
+//   espera larga del combate ningún worker corre), el evento sigue señalado mientras se duerme.
+// Lo peor que añade el freno: una espera que ya llevaba kSpinNs sin que pasara nada se entera de su final (o da su
+// siguiente aviso) una siesta tarde: 30 µs más la holgura del temporizador de Linux, 50 µs para un hilo en primer
+// plano, ~0,1 ms; una vez por espera, no por vuelta. Interruptor sin_freno_yield: siempre sched_yield, como antes.
+constexpr int64_t kSpinGapNs = 20'000, kSpinNs = 500'000, kSpinNapNs = 30'000;
+constexpr int64_t kSpinApartNs = 2'000'000;  // girando (a ciegas o no) este rato seguido: note_spinning_thread
+
+// El contador de GetSystemTick, sin barrera (aquí solo se miden ratos de decenas de microsegundos).
+uint64_t spin_ticks() {
+    uint64_t v;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+}
+uint64_t spin_ticks_of(int64_t ns) {
+    uint64_t f;
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(f));
+    return f * static_cast<uint64_t>(ns) / 1'000'000'000;
+}
+}  // namespace
+
+void YieldThread() {
+    SpinState& s = t_spin;
+    const uint64_t now = spin_ticks();
+    const bool tight = s.last_end != 0 && now - s.last_end < spin_ticks_of(kSpinGapNs);
+    if (!tight) s.tight_since = now;
+    if (!tight || s.busy) s.blind_since = now;
+    s.busy = false;
+    if (++s.calls == 256) {
+        g_yield_calls.fetch_add(256, std::memory_order_relaxed);
+        s.calls = 0;
+    }
+    if (now - s.tight_since >= spin_ticks_of(kSpinApartNs) && now >= s.next_note) {
+        s.next_note = now + spin_ticks_of(1'000'000'000);
+        note_spinning_thread();
+    }
+    if (now - s.blind_since >= spin_ticks_of(kSpinNs) && !NVN_FLAG("sin_freno_yield")) {
+        g_yield_naps.fetch_add(1, std::memory_order_relaxed);
+        const timespec nap{0, static_cast<long>(kSpinNapNs)};
+        nanosleep(&nap, nullptr);
+    } else {
+        sched_yield();
+    }
+    s.last_end = spin_ticks();
+}
 void SleepThread(TimeSpan t) {
     // DEPURACIÓN (registro): quién duerme 20 ms o más de una vez.
     if (t.ns >= 20'000'000 && NVN_FLAG("registro")) {
@@ -1249,6 +1769,8 @@ void GetThreadCoreMask(int* ideal_core, uint64_t* mask, const ThreadType* type) 
     if (mask) *mask = t.core_mask ? t.core_mask : t.ideal_core >= 0 ? uint64_t{1} << t.ideal_core : 0b111;
 }
 uint64_t GetThreadAvailableCoreMask() { return 0b111; }  // las aplicaciones de Switch usan los núcleos 0-2
+// Hilos que aún puede crear el proceso (la aplicación tiene ~96 en la consola); aquí no hay tope real.
+int GetFreeThreadCount() { return 64; }
 int GetCurrentCoreNumber() { return current_core(g_threads.get(current_thread())); }
 uint64_t GetThreadId(const ThreadType* type) { return g_threads.get(type).tid; }
 
@@ -1293,12 +1815,14 @@ void SetTlsValue(TlsSlot slot, uintptr_t value) {
 Tick GetSystemTick() {
     uint64_t v;
     asm volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
+    t_spin.busy = true;  // quien espera mirando el reloj no espera a ciegas (ver YieldThread)
     return Tick{static_cast<int64_t>(v)};
 }
 // El SDK lee CNTPCT_EL0 entre barreras; en Android EL0 solo puede leer el virtual (mismo ritmo).
 Tick GetSystemTickOrdered() {
     uint64_t v;
     asm volatile("dsb ish; isb; mrs %0, cntvct_el0; isb" : "=r"(v)::"memory");
+    t_spin.busy = true;
     return Tick{static_cast<int64_t>(v)};
 }
 int64_t GetSystemTickFrequency() {
@@ -1323,32 +1847,132 @@ Tick ConvertToTick(TimeSpan t) {
 
 // --- Memoria virtual ---
 
+// La región se mapea ya legible y escribible, sin reservar memoria (MAP_NORESERVE): comprometer páginas no cuesta
+// nada y soltarlas es un MADV_DONTNEED (vuelven a cero al tocarlas, como las páginas nuevas de la consola). Con
+// PROT_NONE y un mprotect por llamada, el allocator de Unreal (miles de bloques de 64 KB que van y vienen) partiría
+// la región en decenas de miles de VMA y Linux deja 65 530 por proceso.
+// Alineada como en la consola (VammManager::AllocateAddressRegion, sdk+0x145e00): a 2 MB las regiones de 2 MB o más y
+// a 64 KB las menores. Unreal reparte su región en bloques cuya alineación da por hecha (MallocBinned3: "alignment was
+// too large for OS" si un bloque no sale alineado). Se mapea de más y se devuelve la primera dirección alineada.
 Result AllocateAddressRegion(uintptr_t* out, size_t size) {
-    void* p = mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (p == MAP_FAILED) return Result{0x1801};
+    const size_t align = size >= (size_t{2} << 20) ? size_t{2} << 20 : size_t{64} << 10;
+    const size_t mapped = size + align;
+    bool rw = true;
+    void* p = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) {
+        rw = false;
+        p = mmap(nullptr, mapped, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    }
+    if (p == MAP_FAILED) {
+        printf("[nnsdk] AllocateAddressRegion +%zu MB: %s\n", size >> 20, strerror(errno));
+        return Result{0x1003};
+    }
+    const uintptr_t base = (reinterpret_cast<uintptr_t>(p) + align - 1) & ~(align - 1);
     std::lock_guard lock(g_regions_m);
-    g_regions[reinterpret_cast<uintptr_t>(p)] = size;
-    *out = reinterpret_cast<uintptr_t>(p);
-    printf("[nnsdk] AllocateAddressRegion %p +%zu KB\n", p, size / 1024);
+    g_regions[base] = size;
+    g_regions_map[base] = {reinterpret_cast<uintptr_t>(p), mapped};
+    if (rw) g_regions_rw[base] = size;
+    if (rw) publish_readable(base, size);  // para copy_readable
+    *out = base;
+    printf("[nnsdk] AllocateAddressRegion 0x%lx +%zu MB%s\n", base, size >> 20,
+           rw ? "" : " (PROT_NONE: se compromete con mprotect)");
     return ResultSuccess;
 }
 Result FreeAddressRegion(uintptr_t address) {
     std::lock_guard lock(g_regions_m);
     auto it = g_regions.find(address);
     if (it == g_regions.end()) return Result{0x1801};
-    munmap(reinterpret_cast<void*>(address), it->second);
+    const auto map = g_regions_map[address];
+    unpublish_readable(address, it->second);  // antes de desmapear: que nadie esté copiando de ella (copy_readable)
+    munmap(reinterpret_cast<void*>(map.first), map.second);
     g_regions.erase(it);
+    g_regions_map.erase(address);
+    g_regions_rw.erase(address);
     return ResultSuccess;
 }
+namespace {
+// ¿Cae la dirección en una región mapeada ya escribible? (pocas regiones: Unreal reserva una).
+bool region_rw(uintptr_t address) {
+    std::lock_guard lock(g_regions_m);
+    for (const auto& [base, size] : g_regions_rw)
+        if (address >= base && address < base + size) return true;
+    return false;
+}
+std::atomic<uint32_t> g_va_calls{0};
+}  // namespace
+// os_memory.cpp (mismo layout).
+struct MemoryInfo {
+    size_t total_available_memory_size;
+    size_t total_used_memory_size;
+    size_t total_memory_heap_size;
+    size_t allocated_memory_heap_size;
+    size_t program_size;
+    size_t total_thread_stack_size;
+    int thread_count;
+};
+void QueryMemoryInfo(MemoryInfo* info);
+
 Result AllocateMemoryPages(uintptr_t address, size_t size) {
-    printf("[nnsdk] AllocateMemoryPages 0x%lx +%zu KB\n", address, size / 1024);
-    return mprotect(reinterpret_cast<void*>(address), size, PROT_READ | PROT_WRITE) == 0 ? ResultSuccess
-                                                                                         : Result{0x1801};
+    if (g_va_calls.fetch_add(1, std::memory_order_relaxed) < 8)
+        printf("[nnsdk] AllocateMemoryPages 0x%lx +%zu KB\n", address, size / 1024);
+    // Como en la consola, no se compromete más memoria física de la que tiene la aplicación (QueryMemoryInfo: total
+    // disponible menos lo usado). Xenoblade 3 mide así su presupuesto al arrancar (main+0x12434b0): compromete de MB en
+    // MB hasta que falla, apunta cuánto consiguió y lo suelta. Sin límite se llevaba los 60 GB de su región y se quedaba
+    // sin presupuesto apuntado. <datos>/sin_limite_va: como antes.
+    {
+        MemoryInfo info{};
+        QueryMemoryInfo(&info);
+        static const bool sin_limite = NVN_FLAG("sin_limite_va");
+        if (!sin_limite && info.total_used_memory_size + size > info.total_available_memory_size) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                printf("[nnsdk] AllocateMemoryPages 0x%lx +%zu KB: sin memoria (usados %zu MB de %zu MB)\n", address,
+                       size / 1024, info.total_used_memory_size >> 20, info.total_available_memory_size >> 20);
+            return Result{0x1003};
+        }
+    }
+    if (!region_rw(address) && mprotect(reinterpret_cast<void*>(address), size, PROT_READ | PROT_WRITE) != 0) {
+        printf("[nnsdk] AllocateMemoryPages 0x%lx +%zu KB: %s\n", address, size / 1024, strerror(errno));
+        return Result{0x1003};  // os, 8: sin memoria (Unreal lo trata como tal, main+0x27f0c)
+    }
+    const size_t now = g_va_committed.fetch_add(size, std::memory_order_relaxed) + size;
+    g_va_allocated_total.fetch_add(size, std::memory_order_relaxed);
+    // DEPURACIÓN: cada 128 MB más que el máximo anterior, y en cada petición de 8 MB o más (las 40 primeras), quién
+    // compromete la memoria (pila por los frame pointers del juego). Unreal lleva su propia cuenta contra lo que
+    // dio QueryMemoryInfo al arrancar y aborta cuando se le acaba.
+    static std::atomic<size_t> mark{0};
+    static std::atomic<int> big{0};
+    size_t m = mark.load(std::memory_order_relaxed);
+    const bool crossed = now >= m + (128u << 20) && mark.compare_exchange_strong(m, now & ~size_t{(128u << 20) - 1});
+    if (crossed || (size >= (8u << 20) && big.fetch_add(1, std::memory_order_relaxed) < 40)) {
+        char bt[320];
+        int n = 0;
+        const auto& h = nnsdk::host();
+        const auto base = reinterpret_cast<uintptr_t>(h.main_base);
+        auto* fp = static_cast<uintptr_t*>(__builtin_frame_address(0));
+        for (int i = 0; i < 20 && fp && n < 290; i++) {
+            const uintptr_t ret = fp[1];
+            if (ret >= base && ret < base + h.main_size)
+                n += snprintf(bt + n, sizeof bt - n, " %llx", static_cast<unsigned long long>(ret - base));
+            auto* next = reinterpret_cast<uintptr_t*>(fp[0]);
+            if (next <= fp || reinterpret_cast<uintptr_t>(next) - reinterpret_cast<uintptr_t>(fp) > (8u << 20)) break;
+            fp = next;
+        }
+        bt[n] = 0;
+        char name[32] = "?";
+        pthread_getname_np(pthread_self(), name, sizeof name);
+        printf("[nnsdk] memoria virtual: %zu MB comprometidos (pedidos %zu MB, soltados %zu MB en total); ahora +%zu KB en "
+               "'%s'; pila%s\n",
+               now >> 20, g_va_allocated_total.load() >> 20, g_va_freed_total.load() >> 20, size >> 10, name, bt);
+    }
+    return ResultSuccess;
 }
 Result FreeMemoryPages(uintptr_t address, size_t size) {
-    printf("[nnsdk] FreeMemoryPages 0x%lx +%zu KB\n", address, size / 1024);
+    g_va_freed_total.fetch_add(size, std::memory_order_relaxed);
     madvise(reinterpret_cast<void*>(address), size, MADV_DONTNEED);
-    mprotect(reinterpret_cast<void*>(address), size, PROT_NONE);
+    if (!region_rw(address)) mprotect(reinterpret_cast<void*>(address), size, PROT_NONE);
+    size_t before = g_va_committed.load(std::memory_order_relaxed);
+    while (!g_va_committed.compare_exchange_weak(before, before > size ? before - size : 0, std::memory_order_relaxed)) {}
     return ResultSuccess;
 }
 
@@ -1358,10 +1982,39 @@ void GenerateRandomBytes(void* out, size_t size) { arc4random_buf(out, size); }
 
 void nnsdk::signal_system_event(SystemEventType* event) { g_events.get(event).signal(); }
 
+// El AudioRenderer señala el evento del juego cada 5 ms desde un hilo suyo, y el reproductor de vídeo de Unity lo
+// destruye con el renderer aún en marcha (main+0x397c70, DestroySystemEvent antes de StopAudioRenderer). Con
+// signal_system_event se podía señalar un HostEvent a medio destruir, y si no, dejarlo creado otra vez en esa dirección.
+bool nnsdk::signal_system_event_if_alive(SystemEventType* event) {
+    if (!g_events.with_existing(event, [](HostEvent& ev) { ev.set(); })) return false;
+    notify_any();
+    return true;
+}
+bool nnsdk::clear_system_event_if_alive(SystemEventType* event) {
+    return g_events.with_existing(event, [](HostEvent& ev) { ev.clear(); });
+}
+
 void nnsdk::create_system_event(SystemEventType* event, bool auto_clear, bool signaled) {
     HostEvent& ev = g_events.reset(event);
     ev.auto_clear = auto_clear;
     ev.signaled = signaled;
+}
+
+size_t nnsdk::va_committed() { return nn::os::g_va_committed.load(std::memory_order_relaxed); }
+
+bool nnsdk::copy_readable(void* dst, const void* src, size_t size) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(src);
+    g_readable_readers.fetch_add(1);  // antes de mirar los huecos (ver g_readable_base)
+    bool ok = false;
+    for (int k = 0; k < kReadableRegions && !ok; k++) {
+        const uintptr_t base = g_readable_base[k].load();
+        if (!base || a < base) continue;
+        const uintptr_t end = g_readable_end[k].load();
+        ok = a < end && size <= end - a;
+    }
+    if (ok) memcpy(dst, src, size);
+    g_readable_readers.fetch_sub(1);
+    return ok;
 }
 
 void nnsdk::thread_totals(size_t* stack_bytes, int* count) {
@@ -1397,6 +2050,8 @@ void refresh_critical_threads() {
     if (now < next.load(std::memory_order_relaxed)) return;
     next.store(now + 1'000'000'000, std::memory_order_relaxed);
     const CpuMasks& m = cpu_masks();
+    log_thread_stats(now);
+    refresh_spinning_threads(m, now);  // los hilos que giran en YieldThread: su máscara y sus interruptores
     if (!m.usable || !g_any_critical) return;
     const bool off = affinity_off();
     static bool applied_off = false;  // con g_critical_m

@@ -278,8 +278,8 @@ bool Chain::create(const Pipelines& pipelines, VkExtent2D extent, VkFormat forma
     flow_ = flow;
 
     // Entradas: copia exacta de la textura de la ventana, en su formato (si es sRGB, leída por una vista UNORM).
-    // Salida: si la ventana es sRGB, la imagen también (con vista UNORM para escribirla) para que el blit al
-    // swapchain convierta el frame generado igual que convierte hoy el real.
+    // Salida: siempre UNORM, con los valores codificados que escribe la cadena: el frame real de una ventana sRGB llega
+    // ahora al swapchain con sus bytes tal cual (Executor::blit), y el generado igual, con FSR o con el blit.
     const VkFormat input_view = unorm_of(format);
     const bool srgb = input_view != format;
     for (Image& f : frames_)
@@ -321,11 +321,7 @@ bool Chain::create(const Pipelines& pipelines, VkExtent2D extent, VkFormat forma
         add(d.out1, e, kMotion, kMotion, kChainUsage);
         add(d.out2, e, kMotion, kMotion, kChainUsage);
     }
-    if (srgb)
-        add(output_, extent, VK_FORMAT_R8G8B8A8_SRGB, kColor, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-            VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
-    else
-        add(output_, extent, kColor, kColor, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);  // muestreada: FSR al presentar
+    add(output_, extent, kColor, kColor, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);  // muestreada: FSR al presentar
     add(dummy_, {1, 1}, kMotion, kMotion, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
     if (!build_images(why) || !build_descriptors(why)) {

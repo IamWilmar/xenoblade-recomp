@@ -152,6 +152,17 @@ int nngame_pthread_cond_timedwait(pthread_cond_t* c, pthread_mutex_t* m, const t
     auto status = os::TimedWaitConditionVariable(cond(c), mutex(m), TimeSpan{left});
     return status == os::ConditionVariableStatus_NoTimeout ? 0 : ETIMEDOUT;
 }
+// Con el reloj dicho: el plazo es absoluto en ese reloj (libc++ nueva espera así con steady_clock).
+int nngame_pthread_cond_clockwait(pthread_cond_t* c, pthread_mutex_t* m, clockid_t clock, const timespec* deadline) {
+    int64_t left = 0;
+    if (deadline) {
+        timespec now;
+        clock_gettime(clock == CLOCK_REALTIME ? CLOCK_REALTIME : CLOCK_MONOTONIC, &now);
+        left = std::clamp<int64_t>(ns(*deadline) - ns(now), 0, kMaxWaitNs);
+    }
+    auto status = os::TimedWaitConditionVariable(cond(c), mutex(m), TimeSpan{left});
+    return status == os::ConditionVariableStatus_NoTimeout ? 0 : ETIMEDOUT;
+}
 
 // --- RW locks ---
 

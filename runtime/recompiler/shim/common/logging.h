@@ -22,10 +22,16 @@ namespace ShimLog {
 
 // Barreras de grupo que Eden quitó por estar dentro de control de flujo condicional (en el shader que se traduce).
 inline thread_local int conditional_barriers = 0;
+// Las que se dejaron porque su flujo es uniforme en el grupo (UniformBarrierPass).
+inline thread_local int uniform_barriers = 0;
 
 template <typename... Args>
 void Write(const char* level, fmt::format_string<Args...> format, Args&&... args) {
     if (format.get().starts_with("Barrier within conditional")) conditional_barriers++;
+    if (format.get().starts_with("Uniform barrier within conditional")) {
+        uniform_barriers++;
+        return;  // no es un aviso: se cuenta y ya
+    }
     std::fprintf(stderr, "[recompilador %s] %s\n", level, fmt::format(format, std::forward<Args>(args)...).c_str());
 }
 

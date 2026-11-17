@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "nnsdk/nvn/formats.h"
 #include "nnsdk/nvn/nvn.h"
 #include "nnsdk/nvn/vk.h"
 
@@ -37,6 +38,25 @@ int device_info(int id) {
     switch (id) {
         case 0: return 53;          // API_MAJOR_VERSION
         case 1: return 311;         // API_MINOR_VERSION
+        // Unity (Disco Elysium) deduce de estos sus capacidades: con 0 en SSBO y compute bajaba el nivel de shader y
+        // todos sus materiales caían al shader de error (magenta). Los de la Switch (Maxwell GM20B).
+        case 2: return 14;          // UNIFORM_BUFFER_BINDINGS_PER_STAGE
+        case 3: return 65536;       // MAX_UNIFORM_BUFFER_SIZE
+        case 5: return 8;           // COLOR_BUFFER_BINDINGS
+        case 6: return 16;          // VERTEX_BUFFER_BINDINGS
+        case 7: return 4;           // TRANSFORM_FEEDBACK_BUFFER_BINDINGS
+        case 8: return 16;          // SHADER_STORAGE_BUFFER_BINDINGS_PER_STAGE
+        case 9: return 32;          // TEXTURE_BINDINGS_PER_STAGE
+        case 14: return 16;         // VERTEX_ATTRIBUTES
+        case 27: return 16;         // MAX_TEXTURE_ANISOTROPY
+        case 28: return 1536;       // MAX_COMPUTE_WORK_GROUP_SIZE_X
+        case 29: return 1024;       // MAX_COMPUTE_WORK_GROUP_SIZE_Y
+        case 30: return 64;         // MAX_COMPUTE_WORK_GROUP_SIZE_Z
+        case 31: return 1536;       // MAX_COMPUTE_WORK_GROUP_SIZE_THREADS
+        case 32: case 33: case 34: return 65535;  // MAX_COMPUTE_DISPATCH_WORK_GROUPS_X/Y/Z
+        case 35: return 8;          // IMAGE_BINDINGS_PER_STAGE
+        case 38: return 16;         // MAX_VIEWPORTS
+        case 94: return 16384;      // tamaño máximo de textura: Unity lo guarda como maxTextureSize (main+0x945124)
         case 4: return 256;         // UNIFORM_BUFFER_ALIGNMENT (NieR: alineación del código de shaders, main+0x9c8834)
         case 10: return 16;         // COUNTER_ALIGNMENT (= tamaño de NVNcounterData)
         case 13: return 4;          // INDIRECT_DRAW_ALIGNMENT
@@ -46,15 +66,54 @@ int device_info(int id) {
         case 18: return 256;        // RESERVED_SAMPLER_DESCRIPTORS
         case 19: return 4096;       // COMMAND_BUFFER_COMMAND_ALIGNMENT
         case 20: return 4096;       // COMMAND_BUFFER_CONTROL_ALIGNMENT (NieR redondea con esto un bloque de 512 KB)
+        // MAX_TEXTURE_POOL_SIZE y MAX_SAMPLER_POOL_SIZE: Unity (Disco Elysium) reserva el pool con max − reservados; con
+        // 0 salía negativo y su bitmap de libres se pedía con tamaño −28 (memset en 0, main+0x3e50b0).
+        case 36: return 1 << 20;
+        case 37: return 4096;
         case 40: return 1;          // SUPPORTS_MIN_MAX_FILTERING (VK_EXT_sampler_filter_minmax)
         case 41: return 0;          // SUPPORTS_STENCIL8_FORMAT
         case 42: return 1;          // SUPPORTS_ASTC_FORMATS
         case 50: return 0;          // SUPPORTS_CONSERVATIVE_RASTER: el Adreno no la tiene
+        // Versiones del código de GPU que acepta el driver para lo que compile glslc (GLSLC_MAX/MIN_SUPPORTED_GPU_CODE_
+        // MAJOR/MINOR_VERSION). Catherine: Full Body compara con ellas el glslcGetVersion de su subsdk0 (1.15) antes
+        // de compilar sus shaders GLSL incrustados (main+0x330cd0) y, fuera de rango, no crea el programa. Aquí el código
+        // de GPU se traduce a SPIR-V: vale cualquier 1.x.
+        case 46: return 1;          // GLSLC_MAX_SUPPORTED_GPU_CODE_MAJOR_VERSION
+        case 47: return 1;          // GLSLC_MIN_SUPPORTED_GPU_CODE_MAJOR_VERSION
+        case 48: return 31;         // GLSLC_MAX_SUPPORTED_GPU_CODE_MINOR_VERSION
+        case 49: return 0;          // GLSLC_MIN_SUPPORTED_GPU_CODE_MINOR_VERSION
         case 56: return 32;         // LINEAR_TEXTURE_STRIDE_ALIGNMENT: el juego usa max(ancho·bpp, esto) (NieR main+0x9c6014)
         case 59: return 1;          // SUPPORTS_ZERO_FROM_UNMAPPED_VIRTUAL_POOL_PAGES (memory.cpp: lo no mapeado lee ceros)
         case 68: return 1;          // SUPPORTS_SPARSE_TILED_PACKAGED_TEXTURES (texturas por teselas de 64 KB, como MH Rise)
         case 78: return 1024;       // SHADER_CODE_MEMORY_POOL_PADDING_SIZE: relleno detrás del código de shaders
         case 81: return 0x10000;    // QUEUE_COMMAND_MEMORY_MIN_SIZE: Xenoblade pide el doble para su cola
+        // Unreal Engine 5 (Final Fantasy Resonance) pone con estos sus límites globales (main+0x143dc00): con 0 en el
+        // tamaño máximo de textura, la validación de cualquier textura falla (main+0x14827e8) y el primer render target
+        // del arranque ("HairLUT0") sale nulo. Los de la consola (Maxwell GM20B).
+        case 44: return 15;         // MAX_TEXTURE_LEVELS
+        case 45: return 2048;       // MAX_TEXTURE_LAYERS
+        case 61: return 16384;      // MAX_TEXTURE_SIZE
+        case 62: return 134217728;  // MAX_BUFFER_TEXTURE_SIZE
+        case 63: return 2048;       // MAX_3D_TEXTURE_SIZE
+        case 64: return 16384;      // MAX_CUBE_MAP_TEXTURE_SIZE
+        case 65: return 16384;      // MAX_RECTANGLE_TEXTURE_SIZE
+        // Alineaciones que usa para sus buffers de argumentos de compute indirecto y de guardado del ZCull (main+0x1435324).
+        case 53: return 4;          // INDIRECT_DISPATCH_ALIGNMENT
+        case 54: return 32;         // ZCULL_SAVE_RESTORE_ALIGNMENT
+        // La memoria de trabajo de los shaders en la GPU (SetShaderScratchMemory): tamaño = requisito × factor, redondeado
+        // a la granularidad (main+0x142c168). Aquí no hace falta ninguna: lo mínimo, para que el juego no reserve de más.
+        case 23: return 1;          // SHADER_SCRATCH_MEMORY_SCALE_FACTOR_MINIMUM
+        case 24: return 1;          // SHADER_SCRATCH_MEMORY_SCALE_FACTOR_RECOMMENDED
+        case 25: return 4096;       // SHADER_SCRATCH_MEMORY_ALIGNMENT
+        case 26: return 4096;       // SHADER_SCRATCH_MEMORY_GRANULARITY
+        // Memoria de la cola: umbral de vaciado y memoria de control (main+0x1434f40); aquí la cola no usa la del juego.
+        case 80: return 4096;       // QUEUE_COMMAND_MEMORY_GRANULARITY
+        case 82: return 0x10000;    // QUEUE_COMMAND_MEMORY_DEFAULT_SIZE
+        case 86: return 4096;       // QUEUE_COMMAND_MEMORY_MIN_FLUSH_THRESHOLD
+        case 91: return 4096;       // QUEUE_CONTROL_MEMORY_MIN_SIZE
+        case 92: return 0x4000;     // QUEUE_CONTROL_MEMORY_DEFAULT_SIZE
+        case 93: return 4096;       // QUEUE_CONTROL_MEMORY_GRANULARITY
+        case 70: return 5;          // MAX_PRESENT_INTERVAL
         default: return 0;          // 66 67 69 71-76 87 90 (passthrough GS, swizzle de viewport, blend avanzado, DrawTexture…)
     }
 }
@@ -75,6 +134,8 @@ void nvnDeviceBuilderSetFlags(DeviceBuilder* b, int flags) { b->flags = flags; }
 
 nvn::Boolean nvnDeviceInitialize(void* device, const DeviceBuilder* b) {
     if (!nvn::vk()) return 0;
+    static std::once_flag formats_once;
+    std::call_once(formats_once, [] { nvn::adapt_formats_to_gpu(nvn::vk()->gpu); });
     g_devices.create(device).flags = b->flags;
     NVN_LOG("dispositivo %p listo (flags 0x%x)\n", device, b->flags);
     return 1;

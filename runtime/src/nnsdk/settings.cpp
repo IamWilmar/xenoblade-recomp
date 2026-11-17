@@ -37,6 +37,7 @@ struct LanguageCode {
 
 bool operator==(const LanguageCode& code, const Language& language);
 bool operator==(const Language& language, const LanguageCode& code);
+bool operator==(const LanguageCode& a, const LanguageCode& b);
 
 namespace {
 
@@ -56,6 +57,8 @@ bool operator==(const LanguageCode& code, const Language& language) {
     return language >= 0 && language < Language_Count && strncmp(code.string, kCodes[language], 8) == 0;
 }
 bool operator==(const Language& language, const LanguageCode& code) { return code == language; }
+// Las dos cadenas enteras (8 bytes, terminadas en 0), como strncmp en el SDK.
+bool operator==(const LanguageCode& a, const LanguageCode& b) { return strncmp(a.string, b.string, sizeof a.string) == 0; }
 
 // Todos los idiomas que sabe la consola, en el orden del enum (el juego elige entre ellos los que tiene).
 int GetAvailableLanguageCodeCount() { return Language_Count; }

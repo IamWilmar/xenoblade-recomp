@@ -1,0 +1,350 @@
+diff --git a/src/shader_recompiler/frontend/maxwell/translate_program.cpp b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+index 0cc4b3b..f57f65a 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate_program.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+@@ -383,10 +383,16 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
+     if (!normalized_host_info.support_int64) {
+         Optimization::LowerInt64ToInt32(program);
+     }
+-    if (!normalized_host_info.support_conditional_barrier) {
++    const bool uniform_barriers{!normalized_host_info.support_conditional_barrier &&
++                                normalized_host_info.keep_uniform_barriers &&
++                                program.stage == Stage::Compute};
++    if (!normalized_host_info.support_conditional_barrier && !uniform_barriers) {
+         Optimization::ConditionalBarrierPass(program);
+     }
+     Optimization::SsaRewritePass(program);
++    if (uniform_barriers) {
++        Optimization::UniformBarrierPass(program);
++    }
+ 
+     Optimization::ConstantPropagationPass(env, program);
+ 
+diff --git a/src/shader_recompiler/host_translate_info.h b/src/shader_recompiler/host_translate_info.h
+index 17d93d4..229113e 100644
+--- a/src/shader_recompiler/host_translate_info.h
++++ b/src/shader_recompiler/host_translate_info.h
+@@ -39,6 +39,8 @@ struct HostTranslateInfo {
+                                                 ///< passthrough shaders
+     bool support_conditional_barrier{}; ///< True when the device supports barriers in conditional
+                                         ///< control flow
++    bool keep_uniform_barriers{}; ///< Keep the conditional barriers that every invocation of a
++                                  ///< workgroup reaches together (see UniformBarrierPass)
+     bool single_lane_geometry_subgroups{};
+     bool support_attribute_texture_handle{}; ///< True when the host binds texture handles that
+                                              ///< arrive as vertex attributes
+diff --git a/src/shader_recompiler/ir_opt/conditional_barrier_pass.cpp b/src/shader_recompiler/ir_opt/conditional_barrier_pass.cpp
+index c3ed27f..dccf03f 100644
+--- a/src/shader_recompiler/ir_opt/conditional_barrier_pass.cpp
++++ b/src/shader_recompiler/ir_opt/conditional_barrier_pass.cpp
+@@ -1,6 +1,15 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <string_view>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++
+ #include "shader_recompiler/frontend/ir/program.h"
+ #include "shader_recompiler/ir_opt/passes.h"
+ 
+@@ -41,4 +50,282 @@ void ConditionalBarrierPass(IR::Program& program) {
+     ASSERT(conditional_control_flow_count == 0);
+ }
+ 
++namespace {
++// Opcodes whose result may differ between the invocations of a workgroup (anything read from memory, images or
++// per-invocation built-ins). Everything else is a pure function of its arguments.
++bool IsVaryingSource(IR::Opcode op) {
++    switch (op) {
++    case IR::Opcode::LocalInvocationId:
++    case IR::Opcode::InvocationId:
++    case IR::Opcode::InvocationInfo:
++    case IR::Opcode::SampleId:
++    case IR::Opcode::IsHelperInvocation:
++    case IR::Opcode::LaneId:
++    case IR::Opcode::LoadLocal:
++        return true;
++    default:
++        break;
++    }
++    const std::string_view name{IR::NameOf(op)};
++    for (const std::string_view prefix :
++         {"LoadGlobal", "LoadStorage", "LoadShared", "GetRegister", "GetPred", "GetGoto",
++          "GetIndirect", "GetZFlag", "GetSFlag", "GetCFlag", "GetOFlag", "GetAttribute", "GetPatch",
++          "Image", "BoundImage", "BindlessImage", "IsTextureScaled", "IsImageScaled", "Vote",
++          "Subgroup", "Shuffle", "Quad", "FSwizzle", "DPd"}) {
++        if (name.starts_with(prefix)) {
++            return true;
++        }
++    }
++    return name.find("Atomic") != std::string_view::npos;
++}
++
++struct Region {
++    bool is_loop{};
++    bool varying{};
++    std::vector<IR::U1> conds;                           // If: its condition; Loop: Repeat and Break conditions
++    std::vector<std::vector<size_t>> cond_stacks;        // regions between a Break and its loop
++};
++} // Anonymous namespace
++
++// Barriers inside ifs and loops are only a problem when the invocations of a workgroup do not reach them together.
++// A parallel prefix sum (the radix sort of Unreal Engine's GPU sort manager) keeps its barriers inside loops with a
++// constant trip count: every invocation runs the same iterations. Without them the shared memory races and each
++// invocation reads what the previous dispatch left there. This pass runs after the SSA rewrite, proves which
++// conditional barriers sit under conditions that are the same for the whole workgroup (constants, uniforms, the
++// workgroup id and loop counters built from them) and removes only the others.
++void UniformBarrierPass(IR::Program& program) {
++    std::vector<Region> regions;
++    std::unordered_map<const IR::Block*, std::vector<size_t>> block_regions;
++    struct Exit {
++        std::vector<size_t> stack;
++        size_t order;
++    };
++    std::vector<Exit> exits;
++    struct Site {
++        IR::Inst* inst;
++        std::vector<size_t> stack;
++        size_t order;
++    };
++    std::vector<Site> barriers;
++    std::vector<size_t> stack;
++    size_t order{};
++    for (IR::AbstractSyntaxNode& node : program.syntax_list) {
++        order++;
++        switch (node.type) {
++        case IR::AbstractSyntaxNode::Type::If:
++            regions.push_back({.is_loop = false, .varying = false, .conds = {node.data.if_node.cond},
++                               .cond_stacks = {{}}});
++            stack.push_back(regions.size() - 1);
++            break;
++        case IR::AbstractSyntaxNode::Type::Loop:
++            regions.push_back({.is_loop = true, .varying = false, .conds = {}, .cond_stacks = {}});
++            stack.push_back(regions.size() - 1);
++            break;
++        case IR::AbstractSyntaxNode::Type::Repeat:
++            if (!stack.empty()) {
++                regions[stack.back()].conds.push_back(node.data.repeat.cond);
++                regions[stack.back()].cond_stacks.push_back({});
++                stack.pop_back();
++            }
++            break;
++        case IR::AbstractSyntaxNode::Type::EndIf:
++            if (!stack.empty()) {
++                stack.pop_back();
++            }
++            break;
++        case IR::AbstractSyntaxNode::Type::Break: {
++            // Leaves the innermost loop: that loop is uniform only if this break is taken by everyone or no one.
++            size_t at{stack.size()};
++            while (at > 0 && !regions[stack[at - 1]].is_loop) {
++                at--;
++            }
++            if (at == 0) {
++                exits.push_back({stack, order});
++                break;
++            }
++            Region& loop{regions[stack[at - 1]]};
++            loop.conds.push_back(node.data.break_node.cond);
++            loop.cond_stacks.emplace_back(stack.begin() + static_cast<std::ptrdiff_t>(at), stack.end());
++            break;
++        }
++        case IR::AbstractSyntaxNode::Type::Unreachable:
++        case IR::AbstractSyntaxNode::Type::Return:
++            if (!stack.empty()) {
++                exits.push_back({stack, order});
++            }
++            break;
++        case IR::AbstractSyntaxNode::Type::Block:
++            block_regions[node.data.block] = stack;
++            for (IR::Inst& inst : node.data.block->Instructions()) {
++                if (inst.GetOpcode() == IR::Opcode::Barrier) {
++                    barriers.push_back({&inst, stack, order});
++                }
++            }
++            break;
++        default:
++            break;
++        }
++    }
++    const bool any_conditional{std::ranges::any_of(
++        barriers, [&](const Site& site) { return !site.stack.empty() || !exits.empty(); })};
++    if (!any_conditional) {
++        return;
++    }
++    // A load from buffer memory at an address every invocation shares gives them all the same value, as long as the
++    // shader itself never writes buffer memory.
++    bool writes_memory{};
++    for (IR::Block* const block : program.blocks) {
++        for (IR::Inst& inst : block->Instructions()) {
++            const std::string_view name{IR::NameOf(inst.GetOpcode())};
++            writes_memory |= name.starts_with("WriteGlobal") || name.starts_with("WriteStorage") ||
++                             name.starts_with("GlobalAtomic") || name.starts_with("StorageAtomic");
++        }
++    }
++    // Taint propagation to a fixed point: values that may differ between invocations and the regions they control.
++    std::unordered_set<const IR::Inst*> varying;
++    const auto is_varying{[&](const IR::Value& value) {
++        if (value.IsEmpty() || value.IsImmediate()) {
++            return false;
++        }
++        return varying.contains(value.InstRecursive());
++    }};
++    const auto has_varying_region{[&](const std::vector<size_t>& list, size_t from) {
++        for (size_t i = from; i < list.size(); ++i) {
++            if (regions[list[i]].varying) {
++                return true;
++            }
++        }
++        return false;
++    }};
++    for (bool changed = true; changed;) {
++        changed = false;
++        for (IR::Block* const block : program.blocks) {
++            const std::vector<size_t>& own{block_regions[block]};
++            for (IR::Inst& inst : block->Instructions()) {
++                if (varying.contains(&inst)) {
++                    continue;
++                }
++                bool tainted{IsVaryingSource(inst.GetOpcode())};
++                // The zero register and the always-true predicate are constants the SSA rewrite leaves in place.
++                if (inst.GetOpcode() == IR::Opcode::GetRegister && inst.Arg(0).Reg() == IR::Reg::RZ) {
++                    tainted = false;
++                }
++                if (inst.GetOpcode() == IR::Opcode::GetPred && inst.Arg(0).Pred() == IR::Pred::PT) {
++                    tainted = false;
++                }
++                if (!writes_memory) {
++                    const std::string_view name{IR::NameOf(inst.GetOpcode())};
++                    if (name.starts_with("LoadGlobal") || name.starts_with("LoadStorage")) {
++                        tainted = false;  // decided by its address, below
++                    }
++                }
++                const size_t num_args{inst.NumArgs()};
++                for (size_t i = 0; i < num_args && !tainted; ++i) {
++                    tainted = is_varying(inst.Arg(i));
++                    if (!tainted && inst.GetOpcode() == IR::Opcode::Phi) {
++                        // Which predecessor ran is decided by the regions it sits in and this block does not.
++                        const auto it{block_regions.find(inst.PhiBlock(i))};
++                        if (it == block_regions.end()) {
++                            tainted = true;
++                            break;
++                        }
++                        size_t common{};
++                        while (common < own.size() && common < it->second.size() &&
++                               own[common] == it->second[common]) {
++                            common++;
++                        }
++                        tainted = has_varying_region(it->second, common);
++                    }
++                }
++                if (tainted) {
++                    varying.insert(&inst);
++                    changed = true;
++                }
++            }
++        }
++        for (Region& region : regions) {
++            if (region.varying) {
++                continue;
++            }
++            for (size_t i = 0; i < region.conds.size() && !region.varying; ++i) {
++                region.varying = is_varying(IR::Value{region.conds[i]}) ||
++                                 has_varying_region(region.cond_stacks[i], 0);
++            }
++            changed |= region.varying;
++        }
++        // An exit some invocations take inside a loop leaves the rest alone in its next iterations.
++        for (const Exit& exit : exits) {
++            if (!has_varying_region(exit.stack, 0)) {
++                continue;
++            }
++            for (const size_t index : exit.stack) {
++                if (regions[index].is_loop && !regions[index].varying) {
++                    regions[index].varying = true;
++                    changed = true;
++                }
++            }
++        }
++    }
++    for (const Site& site : barriers) {
++        const bool conditional{!site.stack.empty() ||
++                               std::ranges::any_of(exits, [&](const Exit& exit) { return exit.order < site.order; })};
++        if (!conditional) {
++            continue;
++        }
++        const bool uniform{!has_varying_region(site.stack, 0) &&
++                           std::ranges::none_of(exits, [&](const Exit& exit) {
++                               return exit.order < site.order && has_varying_region(exit.stack, 0);
++                           })};
++        if (uniform) {
++            LOG_WARNING(Shader, "Uniform barrier within conditional control flow, kept");
++        } else {
++            if (std::getenv("BARRERAS_DEPURAR")) {  // why: the chain from the condition down to its varying source
++                std::string why;
++                std::vector<size_t> suspects{site.stack};
++                for (const Exit& exit : exits) {
++                    if (exit.order < site.order && has_varying_region(exit.stack, 0)) {
++                        why += " (exit before it)";
++                        suspects.insert(suspects.end(), exit.stack.begin(), exit.stack.end());
++                    }
++                }
++                for (const size_t index : suspects) {
++                    const Region& region{regions[index]};
++                    if (!region.varying) {
++                        continue;
++                    }
++                    why += region.is_loop ? " loop:" : " if:";
++                    for (size_t i = 0; i < region.conds.size(); ++i) {
++                        const IR::Value cond{region.conds[i]};
++                        if (has_varying_region(region.cond_stacks[i], 0)) {
++                            why += " (break under a varying region)";
++                        }
++                        if (!is_varying(cond)) {
++                            continue;
++                        }
++                        const IR::Inst* at{cond.InstRecursive()};
++                        for (int depth = 0; at && depth < 24; ++depth) {
++                            why += ' ';
++                            why += IR::NameOf(at->GetOpcode());
++                            const IR::Inst* next{};
++                            for (size_t a = 0; a < at->NumArgs() && !next; ++a) {
++                                if (is_varying(at->Arg(a))) {
++                                    next = at->Arg(a).InstRecursive();
++                                }
++                            }
++                            if (!next && at->GetOpcode() == IR::Opcode::Phi) {
++                                why += " (phi: predecessor under a varying region)";
++                            }
++                            at = next;
++                        }
++                        why += ';';
++                    }
++                }
++                std::fprintf(stderr, "barrier removed:%s\n", why.c_str());
++            }
++            LOG_WARNING(Shader, "Barrier within conditional control flow");
++            site.inst->Invalidate();
++        }
++    }
++}
++
+ } // namespace Shader::Optimization
+diff --git a/src/shader_recompiler/ir_opt/passes.h b/src/shader_recompiler/ir_opt/passes.h
+index bf325a4..97785e9 100644
+--- a/src/shader_recompiler/ir_opt/passes.h
++++ b/src/shader_recompiler/ir_opt/passes.h
+@@ -17,6 +17,7 @@ namespace Shader::Optimization {
+ 
+ void CollectShaderInfoPass(Environment& env, IR::Program& program);
+ void ConditionalBarrierPass(IR::Program& program);
++void UniformBarrierPass(IR::Program& program);
+ void ConstantPropagationPass(Environment& env, IR::Program& program);
+ void DeadCodeEliminationPass(IR::Program& program);
+ void GeometryCompactionPass(IR::Program& program, const HostTranslateInfo& host_info);

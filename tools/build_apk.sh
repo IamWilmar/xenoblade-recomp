@@ -38,7 +38,13 @@ mkdir -p "$STAGE/lib/arm64-v8a" "$STAGE/classes"
 # Start screen (SetupActivity: find the user's game files, then start): javac + d8 into classes.dex.
 javac -Xlint:-options --release 11 -classpath "$JAR" -d "$STAGE/classes" $(find "$ROOT/android/java" -name '*.java')
 "$BT/d8" --release --min-api 30 --lib "$JAR" --output "$STAGE" $(find "$STAGE/classes" -name '*.class')
-cp "$BUILD/libnier.so" "$BUILD/libnnsdk.so" "$STAGE/lib/arm64-v8a/"
+# cat instead of cp: on macOS, cp (a file clone) of what the linker has just written can come out as zeros when the
+# disk is nearly full (an APK that fails with "bad ELF magic"). Each copy is then compared with the original.
+for so in libnier.so libnnsdk.so; do
+  cat "$BUILD/$so" > "$STAGE/lib/arm64-v8a/$so"
+  cmp -s "$BUILD/$so" "$STAGE/lib/arm64-v8a/$so" ||
+    { echo "$so was not copied correctly: free some disk space and try again" >&2; exit 1; }
+done
 "$BT/aapt2" compile --dir "$ROOT/android/res" -o "$STAGE/res.zip"
 "$BT/aapt2" link --manifest "$ROOT/android/AndroidManifest.xml" -I "$JAR" -R "$STAGE/res.zip" --auto-add-overlay \
   --debug-mode -o "$STAGE/base.apk"

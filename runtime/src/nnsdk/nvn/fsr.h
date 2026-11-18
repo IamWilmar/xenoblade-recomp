@@ -17,6 +17,14 @@ namespace nvn::fsr {
 bool record(VkCommandBuffer cmd, VkImageView src, VkExtent2D src_extent, VkExtent2D viewport, VkImage dst,
             VkFormat dst_format, VkExtent2D dst_extent, bool easu = true);
 
+// FSR de la escena (Xenoblade DE, ver Executor::scene_fsr): EASU de src (vista muestreable en GENERAL, src_extent; se
+// escala la textura entera) a dst, una vista de almacenamiento RGBA8 UNORM de una imagen en GENERAL de tamaño dst_extent.
+// rcas: además RCAS (EASU a una imagen intermedia propia y RCAS de ella a dst). Deja dst en GENERAL y la barrera hecha para
+// que la lea un pixel shader. Sus imágenes y pipelines son otros que los de record (otro tamaño de salida: las de record
+// no pueden cambiar). false si no puede: quien llama deja el draw del juego como estaba.
+bool record_scene(VkCommandBuffer cmd, VkImageView src, VkExtent2D src_extent, VkImageView dst, VkExtent2D dst_extent,
+                  bool rcas);
+
 // El blit lineal de siempre para una textura de ventana sRGB, sin perder su codificación. vkCmdBlitImage desde la imagen
 // sRGB la decodifica al leerla y un swapchain UNORM no vuelve a codificar (la pantalla recibía valores lineales). Aquí se
 // copian sus bytes tal cual (vkCmdCopyImage no convierte entre formatos compatibles) a una imagen propia del tamaño de la

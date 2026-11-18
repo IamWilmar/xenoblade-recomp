@@ -12,9 +12,10 @@ own ARM64 code runs directly on the device's CPU, while this project reimplement
 
 ## Status
 
-**Version 0.13 — playable.** Colony 9, the open field, the main menus and battles run at 30 fps on the Flip 2.
-The game's own dynamic resolution renders the 3D between 640×360 and 960×540, and the image is upscaled to 1080p with
-AMD FSR 1 when that fits in the frame, with 16x anisotropic filtering on the textures.
+**Version 0.14 — playable.** Colony 9, the open field, the main menus and battles run at 30 fps on the Flip 2.
+The game's own dynamic resolution renders the 3D between 640×360 and 960×540. AMD FSR 1 now upscales the 3D itself to
+the game's 720p window before the game adds its interface, and the 720p image is sharpened on its way to the 1080p
+screen; textures get 16x anisotropic filtering.
 
 - The graphics layer now draws the game's G-buffer in far fewer GPU passes, which leaves room in the frame: in the
   prologue battle the GPU needs about 26 ms of the 33 ms budget (it was at the limit before).

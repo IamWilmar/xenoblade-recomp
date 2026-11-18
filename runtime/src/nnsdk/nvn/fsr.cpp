@@ -28,6 +28,8 @@ uint32_t find_memory(uint32_t bits, VkMemoryPropertyFlags props) {
 
 class Fsr {
 public:
+    explicit Fsr(const char* who) : who_(who) {}
+
     bool record(VkCommandBuffer cmd, VkImageView src, VkExtent2D in, VkExtent2D viewport, VkImage dst, VkFormat format,
                 VkExtent2D out, bool easu) {
         if (failed_ || !src || format != VK_FORMAT_R8G8B8A8_UNORM || NVN_FLAG("sin_fsr")) return false;
@@ -41,15 +43,12 @@ public:
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0,
                              nullptr, 0, nullptr);
 
-        // EASU: de src (in) a mid_ (out). Las constantes, como FsrEasuCon de ffx_fsr1.h.
-        // con0 va con la zona que se escala (viewport) y el resto con el tamaño de la textura, como en FsrEasuCon.
+        // EASU: de src (in) a mid_ (out).
         const float iw = static_cast<float>(in.width), ih = static_cast<float>(in.height);
         const float vw = static_cast<float>(viewport.width), vh = static_cast<float>(viewport.height);
         const float ow = static_cast<float>(out.width), oh = static_cast<float>(out.height);
-        const uint32_t easu_con[16] = {as_uint(vw / ow), as_uint(vh / oh), as_uint(0.5f * vw / ow - 0.5f), as_uint(0.5f * vh / oh - 0.5f),
-                                       as_uint(1.0f / iw), as_uint(1.0f / ih), as_uint(1.0f / iw), as_uint(-1.0f / ih),
-                                       as_uint(-1.0f / iw), as_uint(2.0f / ih), as_uint(1.0f / iw), as_uint(2.0f / ih),
-                                       as_uint(0.0f), as_uint(4.0f / ih), 0, 0};
+        uint32_t easu_con[16];
+        easu_constants(in, viewport, out, easu_con);
         VkMemoryBarrier rw{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         rw.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         // La nitidez de RCAS en "stops" (0 = la máxima; 0,25 un poco menos, sin halos).
@@ -76,6 +75,37 @@ public:
         region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.extent = {out.width, out.height, 1};
         vkCmdCopyImage(cmd, out_.image, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        return true;
+    }
+
+    // Ver fsr.h (record_scene). Solo mid_ (si rcas), del tamaño de dst; dst es del ejecutor (una Texture suya).
+    bool scene(VkCommandBuffer cmd, VkImageView src, VkExtent2D in, VkImageView dst, VkExtent2D out, bool rcas) {
+        if (failed_ || !src || !dst || !in.width || !in.height || !out.width || !out.height) return false;
+        if (!setup()) return false;
+        if (rcas && !mid_image(out)) rcas = false;  // sin su intermedia: solo EASU
+        VkMemoryBarrier mb{};  // lo que pintó src y lo que leía dst (el frame anterior)
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0,
+                             nullptr, 0, nullptr);
+        uint32_t easu_con[16];
+        easu_constants(in, in, out, easu_con);  // la textura entera: el juego la estira con uv de 0 a 1
+        dispatch(cmd, easu_, src, rcas ? mid_.view : dst, easu_con, sizeof easu_con, out);
+        VkMemoryBarrier rw{};
+        rw.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        rw.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        if (rcas) {
+            rw.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &rw, 0,
+                                 nullptr, 0, nullptr);
+            const uint32_t con[4] = {as_uint(std::exp2(-0.25f)), 0, 0, 0};
+            dispatch(cmd, rcas_, mid_.view, dst, con, sizeof con, out);
+        }
+        // Lo escrito, antes del draw que lo muestrea (y de cualquier otra cosa que venga detrás).
+        rw.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &rw, 0, nullptr,
+                             0, nullptr);
         return true;
     }
 
@@ -139,6 +169,35 @@ public:
     }
 
 private:
+    // Las constantes de EASU, como FsrEasuCon de ffx_fsr1.h: con0 va con la zona que se escala (viewport) y el resto con
+    // el tamaño de la textura (in).
+    static void easu_constants(VkExtent2D in, VkExtent2D viewport, VkExtent2D out, uint32_t con[16]) {
+        const float iw = static_cast<float>(in.width), ih = static_cast<float>(in.height);
+        const float vw = static_cast<float>(viewport.width), vh = static_cast<float>(viewport.height);
+        const float ow = static_cast<float>(out.width), oh = static_cast<float>(out.height);
+        const uint32_t c[16] = {as_uint(vw / ow), as_uint(vh / oh), as_uint(0.5f * vw / ow - 0.5f), as_uint(0.5f * vh / oh - 0.5f),
+                                as_uint(1.0f / iw), as_uint(1.0f / ih), as_uint(1.0f / iw), as_uint(-1.0f / ih),
+                                as_uint(-1.0f / iw), as_uint(2.0f / ih), as_uint(1.0f / iw), as_uint(2.0f / ih),
+                                as_uint(0.0f), as_uint(4.0f / ih), 0, 0};
+        memcpy(con, c, sizeof c);
+    }
+
+    bool is_scene() const { return strcmp(who_, "fsr") != 0; }
+
+    // FSR de la escena: la intermedia de EASU a RCAS, del tamaño de la salida. Si la salida cambia de tamaño no se
+    // rehace (la de antes puede estar aún en la GPU): ese draw va sin RCAS.
+    bool mid_image(VkExtent2D out) {
+        if (mid_.image) return extent_.width == out.width && extent_.height == out.height;
+        if (!image(mid_, out, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) {
+            NVN_LOG("%s: no se creó su imagen intermedia %ux%u; sin RCAS\n", who_, out.width, out.height);
+            mid_ = Image{};
+            return false;
+        }
+        extent_ = out;
+        pending_layout_ = true;
+        return true;
+    }
+
     struct Image {
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -149,7 +208,7 @@ private:
     };
 
     bool fail(const char* why) {
-        NVN_LOG("fsr: %s; se escala con el blit de siempre\n", why);
+        NVN_LOG("%s: %s; %s\n", who_, why, is_scene() ? "el juego estira la escena como siempre" : "se escala con el blit de siempre");
         failed_ = true;
         return false;
     }
@@ -193,7 +252,7 @@ private:
         if (!pipeline(rcas_up_, half ? k_fsr_rcas_up_h_spv : k_fsr_rcas_up_spv,
                       half ? sizeof k_fsr_rcas_up_h_spv : sizeof k_fsr_rcas_up_spv))
             rcas_up_.pipeline = VK_NULL_HANDLE;
-        NVN_LOG("fsr: listo (EASU + RCAS, %s%s)\n", half ? "FP16" : "FP32", rcas_up_.pipeline ? "; con la pasada única de RCAS" : "");
+        NVN_LOG("%s: listo (EASU + RCAS, %s%s)\n", who_, half ? "FP16" : "FP32", rcas_up_.pipeline ? "; con la pasada única de RCAS" : "");
         return true;
     }
 
@@ -259,17 +318,22 @@ private:
                   uint32_t size, VkExtent2D out) {
         if (pending_layout_) {  // la primera vez: de UNDEFINED a GENERAL
             pending_layout_ = false;
+            // (las que haya: la del FSR de la escena solo tiene mid_)
             VkImageMemoryBarrier b[2] = {{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}, {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}};
-            for (int k = 0; k < 2; k++) {
-                b[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
-                b[k].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                b[k].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                b[k].srcQueueFamilyIndex = b[k].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                b[k].image = k ? out_.image : mid_.image;
-                b[k].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            uint32_t n = 0;
+            for (VkImage img : {mid_.image, out_.image}) {
+                if (!img) continue;
+                b[n].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+                b[n].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                b[n].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                b[n].srcQueueFamilyIndex = b[n].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b[n].image = img;
+                b[n].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                n++;
             }
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
-                                 nullptr, 2, b);
+            if (n)
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+                                     0, nullptr, n, b);
         }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pass.pipeline);
         VkDescriptorImageInfo in{sampler_, src, VK_IMAGE_LAYOUT_GENERAL}, store{VK_NULL_HANDLE, dst, VK_IMAGE_LAYOUT_GENERAL};
@@ -287,6 +351,7 @@ private:
         vkCmdDispatch(cmd, (out.width + 15) / 16, (out.height + 15) / 16, 1);  // 64 hilos, 16x16 píxeles cada grupo
     }
 
+    const char* who_;
     bool failed_ = false, pending_layout_ = false;
     PFN_vkCmdPushDescriptorSetKHR push_ = nullptr;
     VkSampler sampler_ = VK_NULL_HANDLE;
@@ -302,13 +367,19 @@ private:
     bool raw_failed_ = false, raw_new_ = false;
 };
 
-Fsr g_fsr;
+Fsr g_fsr("fsr");
+Fsr g_scene("fsr de la escena");  // el de la escena: otro tamaño de salida (ver record_scene)
 
 }  // namespace
 
 bool record(VkCommandBuffer cmd, VkImageView src, VkExtent2D src_extent, VkExtent2D viewport, VkImage dst,
             VkFormat dst_format, VkExtent2D dst_extent, bool easu) {
     return g_fsr.record(cmd, src, src_extent, viewport, dst, dst_format, dst_extent, easu);
+}
+
+bool record_scene(VkCommandBuffer cmd, VkImageView src, VkExtent2D src_extent, VkImageView dst, VkExtent2D dst_extent,
+                  bool rcas) {
+    return g_scene.scene(cmd, src, src_extent, dst, dst_extent, rcas);
 }
 
 bool blit_encoded(VkCommandBuffer cmd, VkImage src, VkFormat raw_format, VkExtent2D src_extent, VkRect2D rect, VkImage dst,

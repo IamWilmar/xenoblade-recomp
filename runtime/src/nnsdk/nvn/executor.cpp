@@ -2303,6 +2303,26 @@ private:
     bool fsr_guard_off_ = false;
     int fsr_guard_frames_ = 0;
     uint64_t prof_fsr_guard_frames_ = 0;  // perfil: frames presentados con el blit por la guarda
+    // FSR de la escena (ver scene_fsr): su imagen (del tamaño de la ventana), su guarda y sus cuentas. La guarda va con la
+    // GPU ocupada del frame del juego (busy_last_ns_; sin medida, el tramo): fuera con más de kSceneFsrOffNs en 3 frames
+    // seguidos (ya con el EASU dentro), vuelve tras 60 seguidos por debajo de kSceneFsrOnNs (sin él: ~1,5 ms menos).
+    // Medido en la Flip (17-11-2026, 'perfil GPU'): el EASU cuesta 2,7-2,8 ms, no ~1,5. Con fuera a 27 y vuelta a 25 el
+    // modo TV (ocupada 23 de media, picos de 30) entraba y salía a cada rato (67 de 300 frames sin él): fuera a 30 (con
+    // el EASU dentro y el lineal + RCAS del present aún caben los 33,3) y vuelta a 26,5 (26,5 + 2,8 < 30: no rebota).
+    static constexpr int64_t kSceneFsrOffNs = 30'000'000, kSceneFsrOnNs = 26'500'000;
+    std::unique_ptr<Texture> scene_fsr_tex_;
+    bool scene_fsr_on_ = true;
+    int scene_fsr_count_ = 0;
+    uint64_t scene_fsr_frame_ = 0;  // frame_ + 1 del último draw con el FSR de la escena (0: ninguno)
+    // Perfil (una línea cada 300 presentaciones, ver blit): frames con el FSR de la escena, con el estiramiento del juego
+    // por la guarda, sin poder (imagen, vistas, FSR), presentados con lineal + RCAS por él; los últimos tamaños.
+    uint64_t prof_scene_fsr_ = 0, prof_scene_fsr_guard_ = 0, prof_scene_fsr_failed_ = 0, prof_scene_rcas_present_ = 0;
+    uint64_t prof_scene_presents_ = 0;
+    int prof_scene_src_w_ = 0, prof_scene_src_h_ = 0, prof_scene_dst_w_ = 0, prof_scene_dst_h_ = 0;
+    bool prof_scene_rcas_ = false;
+    bool scene_fsr_fits();
+    bool scene_fsr(const ProgramStage* vs, const ProgramStage* ps, Stage stage, const Resource& r, Texture*& tex,
+                   TextureViewDesc& view);
     bool gpu_stamps_ = true;     // interruptor ts_cpu: los de antes (reloj de la CPU al reproducir)
     bool skip_compaction_gs_ = true;  // interruptor sin_salto_gs
     int64_t stamp_extra_ = 0;    // lo que se suma al final del frame en este envío del juego
@@ -11915,6 +11935,143 @@ static bool absurd_draw(uint32_t count, uint32_t instances) {
     return count > (1u << 24) || instances > (1u << 20) || uint64_t{count} * instances > (1ull << 28);
 }
 
+// --- FSR de la escena (Xenoblade DE) ---
+// El juego pinta la escena 3D a su resolución dinámica y la estira a la ventana de 1280x720 con un solo draw: un triángulo
+// que cubre la ventana (vs e5c3e0d812c06104, ps 3ebc141ba3c3144e, viewport y scissor de la ventana entera, sin mezcla) y
+// que muestrea la escena entera (uv de 0 a 1) en c2[0x20], RGBA8 con sampler lineal. En modo TV la ventana también es de
+// 1280x720 (el present la escala a la pantalla igual que en portátil): la escena era de 440x504 (la X a 0,34 de 1280, la Y
+// con su propia escala) y en portátil de 640x376 (trazas_fsr_2012, log_tv.txt 166355 y log_portatil.txt 81126; antes
+// 960x544 y 672x376 en analisis_hierba y analisis_lote6/arco). Ese pixel shader no es un estiramiento sin más: el
+// captura de la ventana (f3391_ventana) contra la de la escena (f3391_rt5) se ajusta con una cruz de 5 muestras lineales
+// a ±0,99 texels de la escena (su uniform 0 trae 0,99/ancho y 0,99/alto) con pesos 3,44 en el centro y -0,54/-0,68 a los
+// lados: su propia nitidez. Sin cambio de color (diferencia media -0,1 de 255) y la escena trae alfa 1, como el EASU.
+// Aquí, si el draw es ese y la escena es más pequeña que la ventana, antes del draw EASU escala la escena entera al
+// tamaño de la ventana en una imagen propia (scene_fsr_tex_) y el draw la muestrea en su lugar, con su sampler y sus uv:
+// la cruz del juego sigue en el mismo sitio de la imagen, ahora sobre una reconstrucción y no sobre el filtro lineal de
+// la escena. La interfaz, que el juego pinta después en la ventana, no cambia. Sin RCAS por defecto: la cruz ya es un
+// realce fuerte y los dos juntos harían halos; <datos>/fsr_escena_rcas (en vivo): con RCAS. <datos>/sin_fsr_escena (en
+// vivo): como antes. <datos>/fsr_escena_siempre (en vivo): sin la guarda.
+// Guarda propia (scene_fsr_fits), no la del present: esa mira el tramo del frame del juego, con los huecos en los que la
+// GPU espera al envío (27,5 ms en modo TV y 28,5 en portátil, ocupada 23,1 y 23,6-25,5), y en las dos trazas bajó al blit
+// en la carga y ya no volvió (pide 60 frames por debajo de 25 ms). El EASU a 1280x720 (~1,5 ms, lo que da el FSR entero de
+// 1080p, ~4,4 ms, por píxeles y sin su RCAS) va dentro del frame del juego, entre sus timestamps: su resolución dinámica
+// ya lo cuenta (no hace falta reservar_fsr para esto).
+bool Executor::scene_fsr_fits() {
+    if (NVN_FLAG("fsr_escena_siempre")) return true;
+    const int64_t busy = busy_frames_.load(std::memory_order_relaxed) ? busy_last_ns_.load(std::memory_order_relaxed)
+                                                                      : frame_gpu_ns_.load(std::memory_order_relaxed);
+    const bool off = scene_fsr_on_ && busy > kSceneFsrOffNs;
+    const bool on = !scene_fsr_on_ && busy > 0 && busy < kSceneFsrOnNs;
+    scene_fsr_count_ = off || on ? scene_fsr_count_ + 1 : 0;
+    if ((off && scene_fsr_count_ >= 3) || (on && scene_fsr_count_ >= 60)) {
+        scene_fsr_on_ = on;
+        scene_fsr_count_ = 0;
+        static int logged = 0;
+        if (nvn::first_times(logged, 40))
+            NVN_LOG("fsr de la escena: %s (GPU %s del frame del juego %.1f ms)\n", on ? "vuelve" : "fuera por la guarda",
+                    busy_frames_.load(std::memory_order_relaxed) ? "ocupada" : "en el tramo", busy / 1e6);
+    }
+    return scene_fsr_on_;
+}
+
+// Ver arriba. vs/ps: los del juego (antes de cualquier variante); r, tex y view: la única textura del draw, ya resuelta.
+// true si el draw muestrea ya la imagen escalada (tex y view cambiados).
+bool Executor::scene_fsr(const ProgramStage* vs, const ProgramStage* ps, Stage stage, const Resource& r, Texture*& tex,
+                         TextureViewDesc& view) {
+    constexpr uint64_t kStretchVs = 0xe5c3e0d812c06104ull, kStretchPs = 0x3ebc141ba3c3144eull;
+    if (!ps || ps->print != kStretchPs || !vs || vs->print != kStretchVs || NVN_FLAG("sin_fsr_escena")) return false;
+    // Los programas son los del estiramiento pero el draw no: se dice por qué (las primeras veces), para verlo en la Flip.
+    auto no = [&](const char* why) {
+        static int logged = 0;
+        if (nvn::first_times(logged, 8))
+            NVN_LOG("fsr de la escena: el draw del estiramiento no vale (%s): textura %dx%d formato 0x%x, ventana %dx%d, "
+                    "viewport %.0f,%.0f %.0fx%.0f\n", why, tex ? tex->desc.width : 0, tex ? tex->desc.height : 0,
+                    tex ? tex->desc.format : 0, st_.rt.count > 0 && st_.rt.colors[0] ? st_.rt.colors[0]->desc.width : 0,
+                    st_.rt.count > 0 && st_.rt.colors[0] ? st_.rt.colors[0]->desc.height : 0, st_.viewport.x, st_.viewport.y,
+                    st_.viewport.width, st_.viewport.height);
+        return false;
+    };
+    if (stage != Stage::Fragment || r.kind != Resource::Texture || r.set || r.count != 1 || r.cbuf_offset != 0x20 || !tex ||
+        !tex->image)
+        return no("textura");
+    Texture* rt = st_.rt.count == 1 ? st_.rt.colors[0] : nullptr;
+    // Las vistas de render target llevan siempre kViewFormat | kViewTarget (0xc): vale cualquier vista que sea la textura
+    // entera (nivel 0, capa 0, su formato efectivo, 2D, sin swizzle ni profundidad). Con "sin marcas" no entraba nunca
+    // (en la Flip, 17-11-2026: "no vale (render target)" en todos los frames, portátil y TV).
+    const TextureViewDesc& rv = st_.rt.color_views[0];
+    const bool whole_view =
+        rt && !(rv.flags & (kViewSwizzle | kViewDepthStencil)) && (!(rv.flags & kViewLevels) || rv.base_level == 0) &&
+        (!(rv.flags & kViewLayers) || (rv.base_layer == 0 && rv.layers <= 1)) &&
+        (!(rv.flags & kViewTarget) || rv.target == kTarget2D) &&
+        effective_view_format(*rt, rv) == effective_view_format(*rt, TextureViewDesc{});
+    if (!rt || !whole_view || rt->desc.target != kTarget2D || std::max(rt->desc.samples, 1) != 1)
+        return no("render target");
+    const int w = rt->desc.width, h = rt->desc.height;
+    const VkViewport& v = st_.viewport;
+    if (v.x != 0 || v.y != 0 || v.width != static_cast<float>(w) || v.height != static_cast<float>(h)) return no("viewport");
+    if (st_.scissor_set && (st_.scissor.offset.x != 0 || st_.scissor.offset.y != 0 ||
+                            st_.scissor.extent.width < static_cast<uint32_t>(w) || st_.scissor.extent.height < static_cast<uint32_t>(h)))
+        return no("scissor");
+    // La escena: 2D RGBA8 de un nivel y una muestra, vista sin cambios, más pequeña que la ventana (igual: nada que escalar).
+    const Texture& src = *tex;
+    if (view.flags || src.desc.target != kTarget2D || src.desc.format != 0x25 || std::max(src.desc.levels, 1) != 1 ||
+        std::max(src.desc.samples, 1) != 1 || src.vk_format != VK_FORMAT_R8G8B8A8_UNORM || src.desc.width > w ||
+        src.desc.height > h || src.desc.width < 16 || src.desc.height < 16)
+        return no("escena");
+    if (src.desc.width == w && src.desc.height == h) return false;
+    if (!scene_fsr_fits()) {
+        prof_scene_fsr_guard_++;
+        return false;
+    }
+    // La imagen de destino: la de la ventana, sin datos del juego (nunca se sube) y con STORAGE (la escribe el EASU).
+    if (scene_fsr_tex_ && (scene_fsr_tex_->desc.width != w || scene_fsr_tex_->desc.height != h)) {
+        retire_texture(*scene_fsr_tex_);
+        scene_fsr_tex_.reset();
+    }
+    if (!scene_fsr_tex_) {
+        auto t = std::make_unique<Texture>();
+        t->desc = src.desc;
+        t->desc.width = w, t->desc.height = h, t->desc.depth = 1, t->desc.levels = 1;
+        t->desc.flags |= kTextureFlagImage;
+        t->desc.has_packaged_layout = 0;
+        t->desc.packaged_data = nullptr;
+        // Swizzle identidad: el EASU lee la escena con su vista muestreada (el swizzle de la textura ya aplicado) y deja
+        // los canales finales; con el de la escena copiado aquí, el draw lo aplicaría otra vez al muestrearla.
+        t->desc.swizzle[0] = 2, t->desc.swizzle[1] = 3, t->desc.swizzle[2] = 4, t->desc.swizzle[3] = 5;
+        t->gpu_written = true;
+        t->serial = next_texture_serial();
+        scene_fsr_tex_ = std::move(t);
+        NVN_LOG("fsr de la escena: imagen nueva de %dx%d (la escena, %dx%d)\n", w, h, src.desc.width, src.desc.height);
+    }
+    // Fuera de cualquier pase (compute); el draw abre el suyo después, como al cambiar de targets.
+    split_why_ = "FSR de la escena";
+    end_render_pass();
+    st_.rt_dirty = true;
+    Texture& dst = *scene_fsr_tex_;
+    VkImageView in = VK_NULL_HANDLE, out = VK_NULL_HANDLE;
+    if (ensure_image(dst, cmd_) && dst.storage_image) in = this->view(*tex, view, false), out = this->view(dst, {}, false, true);
+    const bool rcas = NVN_FLAG("fsr_escena_rcas");
+    prof_gpu_mark("c", "FSR de la escena");
+    note_gpu_work();
+    if (!in || !out ||
+        !fsr::record_scene(cmd_, in, VkExtent2D{static_cast<uint32_t>(src.desc.width), static_cast<uint32_t>(src.desc.height)}, out,
+                           VkExtent2D{static_cast<uint32_t>(w), static_cast<uint32_t>(h)}, rcas)) {
+        prof_scene_fsr_failed_++;
+        return false;
+    }
+    if (frame_ == trace_frame_)  // DEPURACIÓN (traza)
+        NVN_LOG("F   FSR de la escena: %dx%d (serial %llu) -> %dx%d (serial %llu)%s\n", src.desc.width, src.desc.height,
+                static_cast<unsigned long long>(src.serial), w, h, static_cast<unsigned long long>(dst.serial),
+                rcas ? ", con RCAS" : "");
+    prof_scene_fsr_++;
+    prof_scene_src_w_ = src.desc.width, prof_scene_src_h_ = src.desc.height, prof_scene_dst_w_ = w, prof_scene_dst_h_ = h;
+    prof_scene_rcas_ = rcas;
+    scene_fsr_frame_ = frame_ + 1;
+    tex = &dst;  // el descriptor, a la imagen escalada (mismo sampler)
+    view = {};
+    return true;
+}
+
 void Executor::draw(const cmd::Draw& in) {
     // Realimentación: la barrera TILED vale para el draw que la sigue y para ningún otro, se dibuje o no. Se gasta aquí,
     // antes de cualquier salida: gastada más abajo, un draw saltado (render apagado, programa aún traduciéndose, sin
@@ -12491,6 +12648,11 @@ void Executor::draw(const cmd::Draw& in) {
                 NVN_LOG("F   variante entera: salidas uint 0x%x int 0x%x, texturas 0x%llx: %s\n", uint_rts, sint_rts,
                         static_cast<unsigned long long>(int_textures), iv ? "sí" : "SIN variante (se queda la del juego)");
         }
+    }
+    // FSR de la escena (ver scene_fsr): el estiramiento de la escena de Xenoblade DE muestrea la escena ya escalada.
+    if (textures.size() == 1 && shadowed.empty() && !or_targets) {
+        Bound& b = textures[0];
+        scene_fsr(vertex_restore.saved, fragment_restore.saved, b.s, *b.r, b.tex, b.view);
     }
     prof_mark(0, prof_t);
     buffer_cache_.warm_index();  // la línea del índice ya ha llegado: ahora el nodo de los índices (ver begin_draw)
@@ -15722,6 +15884,24 @@ bool Executor::blit(Texture& presented, const VkRect2D& crop, VkImage dst, VkFor
     } else {
         fsr_level_ = 2, fsr_guard_off_ = false, fsr_guard_frames_ = 0;
     }
+    // Con el FSR de la escena (scene_fsr) en este frame o en el anterior y la guarda en el blit: lineal + RCAS (el nivel 1)
+    // en vez del blit. La escena ya viene reconstruida a 1280x720 y el 1,5x que queda hasta la pantalla con el filtro lineal
+    // se comía lo ganado; el EASU entero (~4,4 ms) no cabe en el hueco que deja el frame (5,8 ms en modo TV y 4,5 en
+    // portátil en las trazas, menos el ~1,5 ms del EASU de la escena) y la pasada única cuesta menos de la mitad. Su guarda
+    // ya contó este sitio (kSceneFsrOffNs). <datos>/sin_rcas_tras_escena (en vivo): el blit, como antes.
+    const bool scene_rcas = scene_fsr_frame_ && frame_ + 1 - scene_fsr_frame_ <= 1 && fsr_level_ == 0 &&
+                            !NVN_FLAG("sin_rcas_tras_escena");
+    if (scene_rcas) fsr_ok = true;
+    // Perfil del FSR de la escena: una línea cada 300 presentaciones (si lo hubo o se quedó fuera).
+    if (++prof_scene_presents_ % 300 == 0 && (prof_scene_fsr_ || prof_scene_fsr_guard_ || prof_scene_fsr_failed_)) {
+        NVN_LOG("fsr de la escena: %llu de 300 frames con FSR (%dx%d a %dx%d, EASU%s), %llu con el estiramiento del juego por "
+                "la guarda (%s), %llu sin poder; %llu presentados con lineal + RCAS por él\n",
+                static_cast<unsigned long long>(prof_scene_fsr_), prof_scene_src_w_, prof_scene_src_h_, prof_scene_dst_w_,
+                prof_scene_dst_h_, prof_scene_rcas_ ? " + RCAS" : "", static_cast<unsigned long long>(prof_scene_fsr_guard_),
+                scene_fsr_on_ ? "dentro" : "fuera", static_cast<unsigned long long>(prof_scene_fsr_failed_),
+                static_cast<unsigned long long>(prof_scene_rcas_present_));
+        prof_scene_fsr_ = prof_scene_fsr_guard_ = prof_scene_fsr_failed_ = prof_scene_rcas_present_ = 0;
+    }
     const bool easu = fsr_level_ == 2 && !NVN_FLAG("fsr_solo_rcas");
     const VkExtent2D size{static_cast<uint32_t>(t.desc.width), static_cast<uint32_t>(t.desc.height)};
     const VkExtent2D viewport{static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)};
@@ -15738,13 +15918,16 @@ bool Executor::blit(Texture& presented, const VkRect2D& crop, VkImage dst, VkFor
     const FormatInfo* raw_info = raw ? format_info(raw) : nullptr;
     TextureViewDesc present_view{};
     if (raw_info) present_view.flags = kViewFormat, present_view.format = raw;
-    // Modo TV: la ventana del juego ya es de 1920x1080 y no hay nada que escalar; el EASU a 1:1 solo gastaría GPU. Va
-    // el blit de abajo, que a 1:1 es una copia.
+    // Modo TV: con la ventana del juego ya de 1920x1080 no hay nada que escalar; el EASU a 1:1 solo gastaría GPU. Va
+    // el blit de abajo, que a 1:1 es una copia. (En las trazas del 17-11 en modo TV la ventana seguía siendo de 1280x720:
+    // ahí se escala como en portátil.)
     const bool same_size = viewport.width == extent.width && viewport.height == extent.height;
     fsr_scaling_.store(!same_size, std::memory_order_relaxed);
     if (fsr_ok && !same_size && x0 == 0 && y0 == 0 &&
-        fsr::record(cmd, view(t, present_view, false), size, viewport, dst, format, extent, easu))
+        fsr::record(cmd, view(t, present_view, false), size, viewport, dst, format, extent, easu)) {
+        prof_scene_rcas_present_ += scene_rcas && !easu;
         return true;
+    }
     if (raw_info && fsr::blit_encoded(cmd, t.image, raw_info->vk, size, VkRect2D{{x0, y0}, viewport}, dst, extent)) return true;
     VkImageBlit b{};
     b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};

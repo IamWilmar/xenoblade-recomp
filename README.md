@@ -12,7 +12,7 @@ own ARM64 code runs directly on the device's CPU, while this project reimplement
 
 ## Status
 
-**Version 0.12 — playable.** Colony 9, the open field, the main menus and battles run at 30 fps on the Flip 2.
+**Version 0.13 — playable.** Colony 9, the open field, the main menus and battles run at 30 fps on the Flip 2.
 The game's own dynamic resolution renders the 3D between 640×360 and 960×540, and the image is upscaled to 1080p with
 AMD FSR 1 when that fits in the frame, with 16x anisotropic filtering on the textures.
 
@@ -98,6 +98,7 @@ at start-up.
 | `modo_tv` | TV mode (the same switch as in the settings panel): the game runs its TV profile. Read at start-up. |
 | `sombras_2x` | 1024×1024 shadow cascades instead of the handheld 512×512 (sharper, slower). |
 | `sin_fps` | Hides the FPS counter (the same switch as in the settings panel). |
+| `con_barras_sistema` | Keeps Android's navigation and status bars on screen. By default the app hides them while the game runs (swipe in from an edge to bring them up for a moment). Read when the game window gets focus. |
 | `botones_xbox`, `botones_retro` | Force the face buttons to be read by position (`botones_xbox`) or by name (`botones_retro`) if a controller comes out swapped. |
 | `registro` | Verbose log (line by line) plus a watchdog that prints the game's stack if it hangs. Slower: for debugging. |
 

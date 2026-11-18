@@ -717,7 +717,49 @@ void on_cmd(android_app* app, int32_t cmd) {
 
 }  // namespace
 
+// Pantalla completa de verdad: el tema Fullscreen solo quita la barra de estado. Con la navegación de tres botones (o la
+// barra de gestos visible) la de abajo se quedaba encima del juego (lo reportó un jugador con una Retroid Pocket 5).
+// Modo inmersivo "sticky": barras ocultas y el contenido por debajo de ellas; deslizando desde el borde salen un momento
+// y se vuelven a esconder. Tiene que pedirse en el hilo de la interfaz, así que va en el aviso de foco de la actividad
+// (que el pegamento de NDK recibe en ese hilo), envuelto: cada vez que la ventana gana el foco (al abrir y al volver de
+// otra app). <datos>/con_barras_sistema (al ganar el foco): como antes.
+void (*g_glue_focus)(ANativeActivity*, int) = nullptr;
+void hide_system_bars(ANativeActivity* activity) {
+    if (!g_data.empty() && access((g_data + "/con_barras_sistema").c_str(), F_OK) == 0) return;
+    JNIEnv* env = activity->env;
+    if (!env) return;
+    // View.SYSTEM_UI_FLAG_*: LAYOUT_STABLE 0x100, LAYOUT_HIDE_NAVIGATION 0x200, LAYOUT_FULLSCREEN 0x400,
+    // HIDE_NAVIGATION 0x2, FULLSCREEN 0x4, IMMERSIVE_STICKY 0x1000.
+    constexpr jint kFlags = 0x100 | 0x200 | 0x400 | 0x2 | 0x4 | 0x1000;
+    jclass activity_class = env->GetObjectClass(activity->clazz);
+    jmethodID get_window = activity_class ? env->GetMethodID(activity_class, "getWindow", "()Landroid/view/Window;") : nullptr;
+    jobject window = get_window ? env->CallObjectMethod(activity->clazz, get_window) : nullptr;
+    jclass window_class = window ? env->GetObjectClass(window) : nullptr;
+    jmethodID get_decor = window_class ? env->GetMethodID(window_class, "getDecorView", "()Landroid/view/View;") : nullptr;
+    jobject decor = get_decor ? env->CallObjectMethod(window, get_decor) : nullptr;
+    jclass view_class = decor ? env->GetObjectClass(decor) : nullptr;
+    jmethodID set_ui = view_class ? env->GetMethodID(view_class, "setSystemUiVisibility", "(I)V") : nullptr;
+    if (set_ui) env->CallVoidMethod(decor, set_ui, kFlags);
+    const bool failed = env->ExceptionCheck();
+    if (failed) env->ExceptionClear();
+    static bool logged = false;
+    if (!logged || failed) printf("[pantalla] barras del sistema ocultas (modo inmersivo): %s\n", set_ui && !failed ? "sí" : "no se pudo");
+    logged = true;
+    for (jobject o : {static_cast<jobject>(activity_class), window, static_cast<jobject>(window_class), decor,
+                      static_cast<jobject>(view_class)})
+        if (o) env->DeleteLocalRef(o);
+}
+void on_window_focus(ANativeActivity* activity, int focused) {
+    if (focused) hide_system_bars(activity);
+    if (g_glue_focus) g_glue_focus(activity, focused);
+}
+
 void android_main(android_app* app) {
+    // Lo primero: el hilo principal sigue con onCreate/onResume mientras tanto y el foco llega mucho después.
+    if (!g_glue_focus) {
+        g_glue_focus = app->activity->callbacks->onWindowFocusChanged;
+        app->activity->callbacks->onWindowFocusChanged = on_window_focus;
+    }
     if (FILE* f = fopen((std::string(app->activity->internalDataPath) + "/carpeta.txt").c_str(), "r")) {
         char line[4096] = {};
         if (fgets(line, sizeof line, f)) g_data.assign(line, strcspn(line, "\r\n"));

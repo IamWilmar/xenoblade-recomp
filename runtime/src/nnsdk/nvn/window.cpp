@@ -174,6 +174,9 @@ bool create_swapchain(nvn::Window& w) {
     info.imageExtent = w.extent;
     info.imageArrayLayers = 1;
     info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    // También origen de copias si el surface lo deja: el reporte del panel copia el frame (hud.cpp).
+    info.imageUsage |= caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    nvn::hud::swapchain_usage(info.imageUsage);
     info.preTransform = transform;
     info.compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
     if (!(caps.supportedCompositeAlpha & info.compositeAlpha)) info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;

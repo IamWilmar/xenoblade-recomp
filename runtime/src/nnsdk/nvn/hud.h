@@ -12,6 +12,11 @@
 // vuelve a salir la próxima vez que se abra.
 // En los ports con modo TV (NIER_TV_MODE en el entorno) hay otra, "Modo TV" (el fichero <datos>/modo_tv): el juego cree
 // estar en la base (más resolución, mando Pro) desde la próxima vez que se abra.
+// En las APKs publicadas (paquete io.github.iamwilmar.*) hay además "Guardar reporte" (log, captura del frame en que
+// se abrió el panel e info del aparato en <datos>/reports/<fecha>/, para adjuntarlo a mano en un issue; no se manda a
+// ningún sitio) y "Avisos de versión" (al abrir, una consulta sin clave a la API pública de GitHub por la última
+// release; si hay una más nueva sale un aviso y la fila "Descargar", que abre su página; <datos>/sin_avisos_version
+// lo apaga).
 
 #include <cstdint>
 
@@ -26,5 +31,7 @@ void generated_frame();
 // Copia el HUD sobre la imagen del swapchain, que está en TRANSFER_DST_OPTIMAL (entre el blit y la barrera a
 // PRESENT_SRC). format es el del swapchain: solo se dibuja si es RGBA8 o BGRA8.
 void record(VkCommandBuffer cmd, VkImage image, VkExtent2D extent, VkFormat format);
+// window.cpp: los usos con los que se creó el swapchain (la captura del reporte necesita TRANSFER_SRC).
+void swapchain_usage(uint32_t usage);
 
 }  // namespace nvn::hud

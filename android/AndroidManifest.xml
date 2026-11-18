@@ -3,14 +3,16 @@
      the game. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.iamwilmar.xenobladeport"
-    android:versionCode="6"
-    android:versionName="0.14.0">
+    android:versionCode="7"
+    android:versionName="0.15.0">
 
     <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="33" />
     <!-- Reads the game files wherever the user put them: SetupActivity asks for it (or adb appops, tools/apk.sh). -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <!-- Controller rumble (nn::hid vibration). -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Update notices: one request to the public GitHub API at start-up (switch in the settings panel). -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:label="Xenoblade DE port"

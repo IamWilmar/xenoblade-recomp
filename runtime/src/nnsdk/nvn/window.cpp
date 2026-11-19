@@ -1529,6 +1529,7 @@ void log_pace(const nvn::Window& w) {
     const uint64_t run = take(d.run_ns), run_max = take(d.run_max_ns), wait = take(d.wait_ns);
     const uint64_t live = take(d.pipelines_live), live_ns = take(d.pipelines_live_ns);
     const uint64_t async = take(d.pipelines_async), skipped = take(d.draws_skipped);
+    const uint64_t known = take(d.pipelines_known), known_ns = take(d.pipelines_known_ns);
     const uint64_t translated = take(d.translated_live), translated_ns = take(d.translated_live_ns);
     const uint64_t prefetched = take(d.prefetched), prefetch_ns = take(d.prefetch_ns);
     std::string slowest;
@@ -1547,15 +1548,15 @@ void log_pace(const nvn::Window& w) {
                 "GPU del juego %.1f ms (peor "
                 "%.1f, hueco hasta el siguiente %.1f)%s; ejecutor %.1f ms/frame (peor %.1f, %.1f esperando a la GPU); "
                 "pipelines en NvnSubmit %llu (%.0f ms), "
-                "en segundo plano %llu (%llu draws esperándolas); traducciones en NvnSubmit %llu (%.0f ms), precargadas %llu "
-                "(%.0f ms)\n",
+                "en segundo plano %llu (%llu draws esperándolas), ya apuntadas sin esperar %llu (%.0f ms); "
+                "traducciones en NvnSubmit %llu (%.0f ms), precargadas %llu (%.0f ms)\n",
                 frames / secs, static_cast<unsigned long long>(slow), worst_ns / 1e6, w.present_interval, resolution,
                 gpu_frames ? gpu_sum / 1e6 / gpu_frames : 0.0, gpu_max / 1e6, gap_frames ? gap_sum / 1e6 / gap_frames : 0.0,
                 busy_text,
                 run / 1e6 / std::max<uint64_t>(frames, 1),
                 run_max / 1e6, wait / 1e6 / std::max<uint64_t>(frames, 1), static_cast<unsigned long long>(live), live_ns / 1e6,
                 static_cast<unsigned long long>(async), static_cast<unsigned long long>(skipped),
-                static_cast<unsigned long long>(translated), translated_ns / 1e6, static_cast<unsigned long long>(prefetched),
+                static_cast<unsigned long long>(known), known_ns / 1e6, static_cast<unsigned long long>(translated), translated_ns / 1e6, static_cast<unsigned long long>(prefetched),
                 prefetch_ns / 1e6);
         if (slowest_ns) NVN_LOG("ritmo: el envío más lento, %.0f ms: %s\n", slowest_ns / 1e6, slowest.c_str());
         fflush(stdout);

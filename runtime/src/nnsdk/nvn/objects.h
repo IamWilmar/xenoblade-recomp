@@ -359,6 +359,7 @@ struct DropStats {
     std::atomic<uint64_t> run_ns{0}, run_max_ns{0}, wait_ns{0};  // run_max: el peor frame (suma de sus envíos)
     std::atomic<uint64_t> pipelines_live{0}, pipelines_live_ns{0};   // creadas en NvnSubmit con el frame parado
     std::atomic<uint64_t> pipelines_async{0}, draws_skipped{0};     // mandadas al hilo y draws sin dibujar esperándolas
+    std::atomic<uint64_t> pipelines_known{0}, pipelines_known_ns{0};  // ya apuntadas: en NvnSubmit en vez de al hilo
     std::atomic<uint64_t> translated_live{0}, translated_live_ns{0};  // traducciones (no de la caché) en NvnSubmit
     std::atomic<uint64_t> prefetched{0}, prefetch_ns{0};             // las del hilo de la precarga
     std::mutex slow_mutex;      // el envío más lento del tramo (de 40 ms o más) y en qué se le fue el tiempo

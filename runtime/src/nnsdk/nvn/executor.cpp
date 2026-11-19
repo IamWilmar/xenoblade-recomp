@@ -3789,6 +3789,29 @@ private:
     bool records_writing_ = false;
     void record_pipeline(const PipelineRecord& r);
     void save_pipeline_records();
+    // Las ya apuntadas (records_known_) que el precalentado no creó (solo hace kWarmMax, en orden de aparición) iban al
+    // hilo como si fueran nuevas y su draw salía sin dibujar 2-4 frames aunque el driver la tuviera en pipelines.bin
+    // (~0,25 ms): objetos que parpadeaban al llegar a una zona o cargar la partida (Xenoblade DE, 18-11-2026: 751
+    // pipelines y 2130 draws sin dibujar en los 20 s tras cargar, sin que la caché del driver creciera). Ahora se crean
+    // en NvnSubmit, hasta kKnownSyncBudgetUs por frame (lo que pase de eso, al hilo, como antes). Si alguna tarda como una
+    // compilación (el driver no la tenía), cuenta; a la tercera se deja de hacer en esta sesión.
+    // <datos>/conocidas_al_hilo (en vivo): como antes.
+    static constexpr uint64_t kKnownSyncBudgetUs = 8000;
+    static constexpr uint64_t kKnownSlowUs = 20000;
+    uint64_t known_sync_frame_ = UINT64_MAX, known_sync_us_ = 0;  // solo el hilo del ejecutor
+    int known_sync_slow_ = 0;
+    bool known_sync_off_ = false;
+    bool pipeline_known(uint64_t h) {
+        std::lock_guard lock(records_mutex_);
+        return records_loaded_ && records_known_.count(h) != 0;
+    }
+    // Las pipelines que usó la última sesión (sus claves), para que el precalentado empiece por ellas en vez de por las
+    // del título y las primeras zonas: <datos>/pipelines_recientes.bin, reescrito cuando hay nuevas (save_pipeline_records).
+    size_t recent_written_ = 0;  // cuántas había en pipelines_ la última vez
+    std::atomic<bool> recent_writing_{false};
+    std::vector<uint64_t> recent_prev_;  // las del fichero al arrancar (records_mutex_): van detrás de las de esta sesión
+    void save_recent_pipelines();
+    std::vector<uint64_t> load_recent_pipelines();
     // Lo que comparte el hilo del precalentado con el ejecutor: layouts (y los del set 1) y render passes.
     std::mutex objects_mutex_;
     // vkMergePipelineCaches pide acceso exclusivo a la caché de destino; crear pipelines y leerla para guardarla, el
@@ -11299,7 +11322,7 @@ VkPipeline Executor::pipeline(const cmd::Draw& d, VkRenderPass rp, Layout& l, ui
     const bool particle_capture = gs_now && gs_now->xfb_gs_capture && key.rasterizer_discard;
     const bool screen_draw = !key.depth_stencil.depth_test && !key.depth_stencil.depth_write && !key.rasterizer_discard;
     const bool async_on = async_pipelines_ && !per_stage_keys_ && !key.skip_gs;
-    const bool async = async_on && (rp_recurring_ || particle_capture) &&
+    bool async = async_on && (rp_recurring_ || particle_capture) &&
                        !(screen_draw && !NVN_FLAG("saltar_pases_de_pantalla"));
     // Registro de los draws que se quedan sin dibujar esperando su pipeline (uno por pipeline, 300 como mucho): para
     // ver qué falta en un frame roto con la caché fría.
@@ -11337,6 +11360,18 @@ VkPipeline Executor::pipeline(const cmd::Draw& d, VkRenderPass rp, Layout& l, ui
             retry = true;
         } else {
             retry = async_retry_.erase(h) != 0;
+        }
+    }
+    // Ya apuntada en pipelines_estado.bin (el driver la tiene): aquí, sin dejar su draw sin dibujar (kKnownSyncBudgetUs).
+    bool known_sync = false;
+    if (async && !retry && !particle_capture && !known_sync_off_ && !NVN_FLAG("conocidas_al_hilo")) {
+        if (known_sync_frame_ != frame_) {
+            known_sync_frame_ = frame_;
+            known_sync_us_ = 0;
+        }
+        if (known_sync_us_ < kKnownSyncBudgetUs && pipeline_known(h)) {
+            known_sync = true;
+            async = false;
         }
     }
     // Un atributo que no cabe en la zancada de su stream (offset + tamaño > stride) lee parte del vértice siguiente. En
@@ -11489,7 +11524,8 @@ VkPipeline Executor::pipeline(const cmd::Draw& d, VkRenderPass rp, Layout& l, ui
             const ProgramStage* ps = st_.stages[static_cast<int>(Stage::Fragment)];
             NVN_LOG("pipeline en NvnSubmit, %llu ms: %s; rt %u, prof t%d w%d, descarte %d, prim %d n %d, vs %016llx gs %016llx "
                     "ps %016llx\n", static_cast<unsigned long long>(created_us / 1000),
-                    !async_on ? "sin segundo plano" : retry ? "reintento o pase de una vez" : !recordable ? "no apuntable"
+                    known_sync ? "ya apuntada (el driver no la tenía)"
+                    : !async_on ? "sin segundo plano" : retry ? "reintento o pase de una vez" : !recordable ? "no apuntable"
                     : screen_draw ? "de pantalla" : !rp_recurring_ ? "pase no recurrente" : "?",
                     static_cast<unsigned>(st_.rt.count), int(key.depth_stencil.depth_test), int(key.depth_stencil.depth_write),
                     int(key.rasterizer_discard), d.primitive, d.count, static_cast<unsigned long long>(vs ? vs->print : 0),
@@ -11497,8 +11533,19 @@ VkPipeline Executor::pipeline(const cmd::Draw& d, VkRenderPass rp, Layout& l, ui
                     static_cast<unsigned long long>(ps ? ps->print : 0));
         }
     }
-    g_drop_stats.pipelines_live.fetch_add(1, std::memory_order_relaxed);
-    g_drop_stats.pipelines_live_ns.fetch_add(created_us * 1000, std::memory_order_relaxed);
+    if (known_sync) {
+        known_sync_us_ += created_us;
+        g_drop_stats.pipelines_known.fetch_add(1, std::memory_order_relaxed);
+        g_drop_stats.pipelines_known_ns.fetch_add(created_us * 1000, std::memory_order_relaxed);
+        if (created_us > kKnownSlowUs && ++known_sync_slow_ >= 3) {
+            known_sync_off_ = true;
+            NVN_LOG("pipelines ya apuntadas: 3 tardaron como una compilación (la última %llu ms; ¿pipelines.bin sin "
+                    "ellas?): en esta sesión vuelven al hilo\n", static_cast<unsigned long long>(created_us / 1000));
+        }
+    } else {
+        g_drop_stats.pipelines_live.fetch_add(1, std::memory_order_relaxed);
+        g_drop_stats.pipelines_live_ns.fetch_add(created_us * 1000, std::memory_order_relaxed);
+    }
     if (during_save || cache_reading_.load(std::memory_order_relaxed)) note_pipeline_during_save(created_us);
     if (VkResult r = created; r != VK_SUCCESS)
     {
@@ -16717,6 +16764,7 @@ void Executor::record_pipeline(const PipelineRecord& r) {
 // Desde profile_frame (cada 30 o 300 frames): lo apuntado se añade al final del fichero en otro hilo. Son ~600 bytes por
 // pipeline nueva: nada que ver con reescribir pipelines.bin entero.
 void Executor::save_pipeline_records() {
+    save_recent_pipelines();
     {
         std::lock_guard lock(records_mutex_);
         if (!records_loaded_ || records_writing_ || records_pending_.empty()) return;
@@ -16752,6 +16800,69 @@ void Executor::save_pipeline_records() {
         }
         records_writing_ = false;
     }).detach();
+}
+
+// <datos>/pipelines_recientes.bin: cabecera (magia, huella del traductor) y las claves de las pipelines de la última
+// sesión, primero las de esta y detrás las del fichero anterior que esta no usó (como mucho kRecentMax). Se reescribe
+// entero (unos 30 KB, a un .tmp y rename) cuando el ejecutor tiene pipelines nuevas; el precalentado empieza por ellas.
+namespace {
+constexpr uint64_t kRecentMagic = 0x31544e4543455256ull;  // "VRECENT1"
+constexpr size_t kRecentMax = 8000;
+std::string recent_pipelines_path() {
+    const char* data = getenv("NIER_DATA");
+    return std::string(data ? data : "/sdcard/NieR") + "/pipelines_recientes.bin";
+}
+}  // namespace
+
+void Executor::save_recent_pipelines() {
+    if (pipelines_.size() == recent_written_ || recent_writing_.load(std::memory_order_relaxed)) return;
+    std::vector<uint64_t> hashes;
+    hashes.reserve(pipelines_.size());
+    for (const auto& [h, p] : pipelines_)
+        if (p) hashes.push_back(h);
+    recent_written_ = pipelines_.size();
+    recent_writing_.store(true, std::memory_order_relaxed);
+    std::thread([this, hashes = std::move(hashes)]() mutable {
+        setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 19);
+        {
+            std::lock_guard lock(records_mutex_);
+            std::unordered_set<uint64_t> seen(hashes.begin(), hashes.end());
+            for (uint64_t h : recent_prev_)
+                if (hashes.size() < kRecentMax && seen.insert(h).second) hashes.push_back(h);
+        }
+        if (hashes.size() > kRecentMax) hashes.resize(kRecentMax);
+        const std::string path = recent_pipelines_path(), tmp = path + ".tmp";
+        bool ok = false;
+        if (FILE* f = fopen(tmp.c_str(), "wb")) {
+            const uint64_t header[2] = {kRecentMagic, static_cast<uint64_t>(NVN_TRADUCTOR_HUELLA)};
+            ok = fwrite(header, sizeof header, 1, f) == 1 &&
+                 (hashes.empty() || fwrite(hashes.data(), sizeof(uint64_t), hashes.size(), f) == hashes.size());
+            ok = fclose(f) == 0 && ok;
+        }
+        if (ok) ok = rename(tmp.c_str(), path.c_str()) == 0;
+        if (!ok) {
+            unlink(tmp.c_str());
+            static std::atomic<int> logged{0};
+            if (nvn::first_times(logged, 3)) NVN_LOG("precalentado: no se pudo escribir %s\n", path.c_str());
+        }
+        recent_writing_.store(false, std::memory_order_relaxed);
+    }).detach();
+}
+
+std::vector<uint64_t> Executor::load_recent_pipelines() {
+    std::vector<uint64_t> hashes;
+    if (FILE* f = fopen(recent_pipelines_path().c_str(), "rb")) {
+        uint64_t header[2] = {};
+        if (fread(header, sizeof header, 1, f) == 1 && header[0] == kRecentMagic &&
+            header[1] == static_cast<uint64_t>(NVN_TRADUCTOR_HUELLA)) {
+            uint64_t h;
+            while (hashes.size() < kRecentMax && fread(&h, sizeof h, 1, f) == 1) hashes.push_back(h);
+        }
+        fclose(f);
+    }
+    std::lock_guard lock(records_mutex_);
+    recent_prev_ = hashes;
+    return hashes;
 }
 
 // Lee los registros válidos (cabecera de este formato y de este traductor; se para en el primero roto) y deja el fichero
@@ -16793,6 +16904,17 @@ void Executor::warm_up() {
     const auto start = std::chrono::steady_clock::now();
     std::vector<PipelineRecord> records = load_pipeline_records();
     std::vector<uint8_t> initial = std::move(warm_cache_data_);
+    // Primero las de la última sesión (pipelines_recientes.bin), en su orden de siempre; luego el resto. Antes solo las
+    // kWarmMax primeras en aparecer (el principio del juego): a mitad de partida, lo de la zona donde se carga no estaba.
+    // <datos>/precalentado_en_orden: como antes.
+    if (const std::vector<uint64_t> recent = load_recent_pipelines(); !recent.empty() && !NVN_FLAG("precalentado_en_orden")) {
+        const std::unordered_set<uint64_t> set(recent.begin(), recent.end());
+        const auto mid = std::stable_partition(records.begin(), records.end(), [&](const PipelineRecord& r) {
+            return set.count(hash_bytes(&r.key, sizeof r.key)) != 0;
+        });
+        NVN_LOG("precalentado: %zu de las %zu de la última sesión van primero\n",
+                static_cast<size_t>(mid - records.begin()), recent.size());
+    }
     if (NVN_FLAG("sin_precalentado") || records.empty()) return;
     if (!shader_cache_ready(60000)) {
         NVN_LOG("precalentado: sin la caché de SPIR-V, no se crea nada\n");

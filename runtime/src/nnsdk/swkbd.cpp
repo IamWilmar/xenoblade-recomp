@@ -1,5 +1,8 @@
-// nn::swkbd: el teclado de software del sistema. No hay applet ni pantalla para él, así que cada teclado lo "rellena"
-// un jugador que siempre acepta lo propuesto:
+// nn::swkbd: el teclado de software del sistema. Si se puede, el jugador escribe en un cuadro de texto de Android con el
+// teclado del sistema (teclado_android.cpp): ShowKeyboard espera su respuesta (y lo vuelve a abrir con el aviso del juego
+// si este rechaza el texto) e InlineKeyboard lo abre en Appear y contesta en el Calc en que se cierra. Sin actividad de
+// Android, con <datos>/nombre.txt (las pruebas automáticas) o con <datos>/sin_teclado, cada teclado lo "rellena" un
+// jugador que siempre acepta lo propuesto:
 // - ShowKeyboard (nombre del cazador, del Felyne y del Canyne, main+0x6fa6984): si el juego trae texto inicial se
 //   devuelve tal cual (renombrar sin cambiar nada); si no, la siguiente línea de <datos>/nombre.txt (UTF-8, una por
 //   teclado, en orden; la última se repite) o "Flip". Se respetan la longitud máxima y mínima del config y, si el juego
@@ -23,6 +26,7 @@
 #include <string>
 #include <vector>
 
+#include "nnsdk/teclado_android.h"
 #include "nnsdk/types.h"
 
 namespace nn::swkbd {
@@ -428,13 +432,82 @@ void SetTextCheckCallback(ShowKeyboardArg* arg, TextCheckCallback callback) {
     if (callback) arg->keyboard_config.text_check_callback = callback;
 }
 
+namespace {
+
+// Lo que devuelve el text check del juego si rechaza el texto: el aviso (en el work buffer) o vacío si lo acepta.
+// out lleva durante la llamada el tamaño del texto con el 0, como con el applet.
+bool text_rejected(const ShowKeyboardArg& arg, String* out, size_t bytes, std::u16string* message) {
+    const KeyboardConfig& config = arg.keyboard_config;
+    if (!config.is_use_text_check || !config.text_check_callback) return false;
+    const size_t capacity = out->size;
+    out->size = bytes + (config.is_use_utf8 ? 1 : sizeof(char16_t));
+    size_t message_size = 0;
+    const TextCheckResult r = config.text_check_callback(arg.text_check_work_buf, &message_size, out);
+    out->size = capacity;
+    if (r != TextCheckResult_ShowFailureDialog) return false;
+    const auto* text = static_cast<const char16_t*>(arg.text_check_work_buf);
+    *message = text ? std::u16string(text, length16(text, 1001)) : std::u16string();
+    return true;
+}
+
+std::u16string too_short_message(int min) {
+    char text[96];
+    snprintf(text, sizeof text,
+             android_ui::en_espanol() ? "Escribe al menos %d caracteres." : "Enter at least %d characters.", min);
+    return utf8_to_utf16(text);
+}
+
+}  // namespace
+
 Result ShowKeyboard(String* out, const ShowKeyboardArg& arg) {
     const KeyboardConfig& config = arg.keyboard_config;
     printf("[swkbd] teclado: «%s» «%s» (de %d a %d caracteres)\n", utf16_to_utf8(config.header_text, 65).c_str(),
            utf16_to_utf8(config.guide_text, 257).c_str(), config.text_min_length, config.text_max_length);
+    const std::u16string initial = initial_text(arg);
+    if (g_initial_arg == &arg) g_initial_arg = nullptr;
+
+    // El jugador escribe en el cuadro de Android hasta que el juego acepta el texto o cancela.
+    if (android_ui::disponible()) {
+        android_ui::Pedido p;
+        const std::u16string header(config.header_text, length16(config.header_text, 65));
+        const std::u16string guide(config.guide_text, length16(config.guide_text, 257));
+        p.titulo = header.empty() ? guide : header;
+        p.guia = header.empty() ? std::u16string() : guide;
+        p.mensaje.assign(config.sub_text, length16(config.sub_text, 129));
+        p.inicial = initial;
+        p.ok.assign(config.ok_text, length16(config.ok_text, 9));
+        p.max = config.text_max_length > 0 ? std::min(config.text_max_length, 500) : 500;
+        p.clave = config.password_mode != 0;
+        p.lineas = config.is_use_new_line;
+        const int min = std::max(config.text_min_length, 0);
+        for (;;) {
+            std::u16string text;
+            const android_ui::Estado e = android_ui::preguntar(p, &text);
+            if (e == android_ui::Fallo) break;  // no se pudo mostrar: como siempre
+            if (e == android_ui::Cancelado) {
+                write_result(out, {}, config.is_use_utf8);
+                printf("[swkbd] cancelado por el jugador\n");
+                return kResultCanceled;
+            }
+            p.inicial = text;
+            if (text.size() < size_t(min)) {
+                p.mensaje = too_short_message(min);
+                continue;
+            }
+            const size_t bytes = write_result(out, text, config.is_use_utf8);
+            if (std::u16string message; text_rejected(arg, out, bytes, &message)) {
+                printf("[swkbd] el juego rechaza «%s»: %s\n", utf16_to_utf8(text.data(), text.size()).c_str(),
+                       utf16_to_utf8(message.data(), message.size()).c_str());
+                p.mensaje = message;
+                continue;
+            }
+            printf("[swkbd] nombre: %s\n", utf16_to_utf8(text.data(), text.size()).c_str());
+            return ResultSuccess;
+        }
+    }
 
     std::vector<std::u16string> candidates;
-    if (std::u16string initial = initial_text(arg); !initial.empty()) {
+    if (!initial.empty()) {
         candidates.push_back(initial);
     } else {
         std::vector<std::string> names = configured_names();
@@ -444,27 +517,17 @@ Result ShowKeyboard(String* out, const ShowKeyboardArg& arg) {
         }
     }
     candidates.push_back(utf8_to_utf16(kDefaultName));
-    if (g_initial_arg == &arg) g_initial_arg = nullptr;
 
     for (std::u16string& text : candidates) {
         if (config.text_max_length > 0 && text.size() > size_t(config.text_max_length))
             text.resize(config.text_max_length);
         if (text.size() < size_t(std::max(config.text_min_length, 0))) continue;
+        // Como el applet: el mensaje de error que deje el juego va al work buffer de comprobación.
         const size_t bytes = write_result(out, text, config.is_use_utf8);
-        // Como el applet: el String lleva durante la llamada el tamaño del texto (con el 0), y el mensaje de error que
-        // deje el juego va al work buffer de comprobación.
-        if (config.is_use_text_check && config.text_check_callback) {
-            const size_t capacity = out->size;
-            out->size = bytes + (config.is_use_utf8 ? 1 : sizeof(char16_t));
-            size_t message_size = 0;
-            const TextCheckResult r = config.text_check_callback(arg.text_check_work_buf, &message_size, out);
-            out->size = capacity;
-            if (r == TextCheckResult_ShowFailureDialog) {
-                const auto* message = static_cast<const char16_t*>(arg.text_check_work_buf);
-                printf("[swkbd] el juego rechaza «%s»: %s\n", utf16_to_utf8(text.data(), text.size()).c_str(),
-                       message ? utf16_to_utf8(message, 1002).c_str() : "");
-                continue;
-            }
+        if (std::u16string message; text_rejected(arg, out, bytes, &message)) {
+            printf("[swkbd] el juego rechaza «%s»: %s\n", utf16_to_utf8(text.data(), text.size()).c_str(),
+                   utf16_to_utf8(message.data(), message.size()).c_str());
+            continue;
         }
         printf("[swkbd] nombre: %s\n", utf16_to_utf8(text.data(), text.size()).c_str());
         return ResultSuccess;
@@ -487,11 +550,28 @@ void InputText::Set(const char16_t* text) {
 
 // --- InlineKeyboard: el estado vive en el work buffer del juego (0x6e0 bytes), como el del SDK ---
 
+// Lo que se usa del AppearArg (0x48 bytes, como el del applet): el texto del botón de aceptar y las longitudes.
+struct AppearArg {
+    uint32_t type;
+    char16_t ok_text[9];  // 0x4
+    char16_t left_optional_symbol_key;
+    char16_t right_optional_symbol_key;
+    uint8_t is_use_dictionary;
+    uint8_t reserved;
+    uint32_t key_set_disable_bitmask;
+    int32_t text_max_length;  // 0x20
+    int32_t text_min_length;  // 0x24
+};
+static_assert(offsetof(AppearArg, ok_text) == 0x4);
+static_assert(offsetof(AppearArg, text_max_length) == 0x20);
+
 struct InlineKeyboard::Impl {
     State state = State_None;
     bool initialize_pending = true;
     bool decision_pending = false;
     bool released_user_word_pending = false;
+    bool dialog_open = false;  // el cuadro de Android está a la vista: la respuesta llega cuando se cierra
+    int32_t min_length = 0;
     int32_t cursor_pos = 0;
     void (*finished_initialize)() = nullptr;
     void (*finished_keyboard)() = nullptr;
@@ -517,6 +597,7 @@ bool InlineKeyboard::Initialize(void* work_buffer) {
 
 void InlineKeyboard::Finalize() {
     if (!impl_) return;
+    if (impl_->dialog_open) android_ui::cerrar();
     impl_->~Impl();
     impl_ = nullptr;
 }
@@ -527,10 +608,33 @@ void InlineKeyboard::Finalize() {
 State InlineKeyboard::Calc() {
     if (!impl_) return State_None;
     Impl& k = *impl_;
+    auto decide = [](Impl& k, const std::u16string& text) {
+        DecidedEnterArg arg{};
+        const size_t n = std::min<size_t>(text.size(), 501);
+        memcpy(arg.text, text.data(), n * sizeof(char16_t));
+        arg.length = static_cast<int32_t>(n);
+        printf("[swkbd] teclado en línea: «%s»\n", utf16_to_utf8(arg.text, n).c_str());
+        if (k.decided_enter) k.decided_enter(&arg);
+    };
     if (k.initialize_pending) {
         k.initialize_pending = false;
         k.state = State_Hidden;
         if (k.finished_initialize) k.finished_initialize();
+    } else if (k.dialog_open) {
+        std::u16string text;
+        const android_ui::Estado e = android_ui::estado(&text);
+        if (e != android_ui::Abierto) k.dialog_open = false;
+        if (e == android_ui::Aceptado && !text.empty() && text.size() >= size_t(k.min_length)) {
+            k.state = State_Hidden;
+            decide(k, text);
+        } else if (e == android_ui::Aceptado || e == android_ui::Cancelado) {
+            // Vacío o corto también es cancelar: el juego se queda con el nombre que tenía.
+            k.state = State_Hidden;
+            printf("[swkbd] teclado en línea: cancelado por el jugador\n");
+            if (k.decided_cancel) k.decided_cancel();
+        } else if (e == android_ui::Fallo) {
+            k.decision_pending = true;  // no se pudo mostrar: en el Calc siguiente, como siempre
+        }
     } else if (k.decision_pending) {
         k.decision_pending = false;
         k.state = State_Hidden;
@@ -541,12 +645,7 @@ State InlineKeyboard::Calc() {
                 text = utf8_to_utf16(names.empty() ? kDefaultName : names[std::min(g_names_used, names.size() - 1)]);
                 g_names_used++;
             }
-            DecidedEnterArg arg{};
-            const size_t n = std::min<size_t>(text.size(), 501);
-            memcpy(arg.text, text.data(), n * sizeof(char16_t));
-            arg.length = static_cast<int32_t>(n);
-            printf("[swkbd] teclado en línea: «%s»\n", utf16_to_utf8(arg.text, n).c_str());
-            k.decided_enter(&arg);
+            decide(k, text);
         } else {
             printf("[swkbd] teclado en línea: cancelado\n");
             if (k.decided_cancel) k.decided_cancel();
@@ -559,14 +658,35 @@ State InlineKeyboard::Calc() {
     return k.state;
 }
 
-void InlineKeyboard::Appear(const AppearArg&) {
+void InlineKeyboard::Appear(const AppearArg& arg) {
     if (!impl_) return;
-    impl_->state = State_Shown;
-    impl_->decision_pending = true;
+    Impl& k = *impl_;
+    k.state = State_Shown;
+    // Longitudes fuera de lo razonable (otro formato de AppearArg): sin límite, el juego valida al recibir el texto.
+    const bool sane = arg.text_max_length > 0 && arg.text_max_length <= 500;
+    k.min_length = sane && arg.text_min_length > 0 && arg.text_min_length <= arg.text_max_length ? arg.text_min_length : 0;
+    printf("[swkbd] teclado en línea: Appear (de %d a %d caracteres)\n", arg.text_min_length, arg.text_max_length);
+    if (k.dialog_open) return;  // el que ya está abierto sigue valiendo
+    if (android_ui::disponible()) {
+        android_ui::Pedido p;
+        p.inicial.assign(k.text.text, length16(k.text.text, 501));
+        p.ok.assign(arg.ok_text, length16(arg.ok_text, 9));
+        p.max = sane ? arg.text_max_length : 500;
+        if (android_ui::abrir(p)) {
+            k.dialog_open = true;
+            k.decision_pending = false;
+            return;
+        }
+    }
+    k.decision_pending = true;
 }
 
 void InlineKeyboard::Disappear() {
     if (!impl_) return;
+    if (impl_->dialog_open) {
+        android_ui::cerrar();
+        impl_->dialog_open = false;
+    }
     impl_->decision_pending = false;
     if (impl_->state != State_None) impl_->state = State_Hidden;
 }

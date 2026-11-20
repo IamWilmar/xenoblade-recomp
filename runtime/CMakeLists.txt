@@ -26,6 +26,7 @@ add_library(nnsdk SHARED
   src/nnsdk/movie.cpp
   src/nnsdk/oe.cpp
   src/nnsdk/swkbd.cpp
+  src/nnsdk/teclado_android.cpp
   src/nnsdk/time.cpp
   src/nnsdk/nvn/buffer.cpp
   src/nnsdk/nvn/device.cpp

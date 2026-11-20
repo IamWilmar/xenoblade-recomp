@@ -771,6 +771,12 @@ void android_main(android_app* app) {
         pump(app);
     }
     setenv("NIER_DATA", g_data.c_str(), 1);
+    // Para el teclado de nnsdk (teclado_android.cpp): la VM y la actividad, que es una referencia global mientras vive.
+    char puntero[32];
+    snprintf(puntero, sizeof puntero, "%p", static_cast<void*>(app->activity->vm));
+    setenv("NIER_JAVA_VM", puntero, 1);
+    snprintf(puntero, sizeof puntero, "%p", static_cast<void*>(app->activity->clazz));
+    setenv("NIER_ACTIVIDAD", puntero, 1);
     setenv("NIER_SETUP", "1", 1);  // la carpeta sale de la pantalla de inicio: el panel del HUD ofrece cambiarla
     setenv("NIER_TV_MODE", "1", 1);  // este port tiene modo TV (nnsdk::tv_mode): el panel del HUD lo ofrece
     setenv("NIER_TRAZA_DESDE", "94", 1);  // DEPURACIÓN: también vuelca los shaders de los draws trazados desde aquí

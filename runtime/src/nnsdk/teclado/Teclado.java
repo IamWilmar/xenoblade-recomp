@@ -56,8 +56,10 @@ public final class Teclado {
         if (clave) tipo |= InputType.TYPE_TEXT_VARIATION_PASSWORD;
         if (lineas) tipo |= InputType.TYPE_TEXT_FLAG_MULTI_LINE;
         campo.setInputType(tipo);
-        // En horizontal el teclado no tapa todo con su propio editor.
-        campo.setImeOptions(EditorInfo.IME_ACTION_DONE | EditorInfo.IME_FLAG_NO_FULLSCREEN);
+        // En horizontal el teclado no tapa todo con su propio editor: Gboard ignora NO_FULLSCREEN y abría su editor a
+        // pantalla completa, que escondía el título y el motivo cuando el juego rechaza el texto (visto en NieR).
+        campo.setImeOptions(EditorInfo.IME_ACTION_DONE | EditorInfo.IME_FLAG_NO_FULLSCREEN
+                            | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
         if (max > 0) campo.setFilters(new InputFilter[] {new InputFilter.LengthFilter(max)});
         campo.setText(inicial);
         campo.setSelection(campo.length());

@@ -746,7 +746,7 @@ int InlineKeyboard::GetTouchRectangles(Rect* first, Rect* second) const {
 }
 bool InlineKeyboard::GetImage(void*, size_t) { return false; }
 
-// La ventana del teclado es la pantalla de la Switch, y su imagen RGBA8 de 1280x720 como la pide vi: múltiplo de
+// La ventana del teclado es la pantalla de la consola, y su imagen RGBA8 de 1280x720 como la pide vi: múltiplo de
 // 128 KB alineado a 4 KB. El juego crea una textura con esto (main+0x6eff9cc) aunque nunca le llegue imagen.
 void InlineKeyboard::GetWindowSize(int* width, int* height) const {
     *width = 1280;

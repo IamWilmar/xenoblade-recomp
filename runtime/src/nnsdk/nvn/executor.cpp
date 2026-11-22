@@ -13377,7 +13377,21 @@ void Executor::draw(const cmd::Draw& in) {
                     memcpy(a.data, src, size);
                 else
                     memset(a.data, 0, size);
-                if (zero_pad) memset(a.data + size, 0, zero_pad);
+                if (zero_pad) {
+                    // Maxwell no comprueba límites: lo que se lee más allá del rango enlazado es la memoria de detrás. Si el
+                    // tamaño que da el juego no es múltiplo de 16, los bytes hasta el siguiente múltiplo son el resto de SU
+                    // estructura y se copian de la memoria (Catherine: un UBO de 28 con un shader que lee 32; con ceros su
+                    // último parámetro del desenfoque llegaba 0 y difuminaba la cinemática entera). De ahí en adelante es
+                    // memoria de al lado y se queda en ceros (aquí: el VS de la G-buffer de los personajes lee c3 hasta 368
+                    // con 256 enlazados, que ya es múltiplo de 16). <datos>/sin_ubo_detras: ceros del todo.
+                    VkDeviceSize resto = 0;
+                    if (range.size && src == reinterpret_cast<const void*>(range.address) && !NVN_FLAG("sin_ubo_detras"))
+                        resto = std::min<VkDeviceSize>(zero_pad, ((range.size + 15) & ~VkDeviceSize{15}) - range.size);
+                    if (resto && safe_read(a.data + size, static_cast<const uint8_t*>(src) + size, resto))
+                        memset(a.data + size + resto, 0, zero_pad - resto);
+                    else
+                        memset(a.data + size, 0, zero_pad);
+                }
                 prof_copied_bytes_ += size;
                 note_copy(range.address, size, r.kind == Resource::StorageBuffer, s);
                 if (from_game && !zero_pad) copied_.insert(range.address, size, a.buffer, a.offset);
